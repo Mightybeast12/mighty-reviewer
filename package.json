@@ -1,0 +1,30 @@
+{
+  "name": "mighty-reviewer",
+  "version": "0.1.0",
+  "description": "opencode plugin that runs an automatic background adversarial code review (risk critique + DRY/SOLID/design enforcement) whenever a turn writes code, with a SHIP / NO-SHIP verdict.",
+  "type": "module",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "code-review",
+    "adversarial-review",
+    "solid",
+    "dry"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Mightybeast12/mighty-reviewer.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Mightybeast12/mighty-reviewer/issues"
+  },
+  "homepage": "https://github.com/Mightybeast12/mighty-reviewer#readme",
+  "author": "Mightybeast12",
+  "license": "MIT"
+}

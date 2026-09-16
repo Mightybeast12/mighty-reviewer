@@ -2,14 +2,15 @@
 
 An [opencode](https://opencode.ai) plugin that runs an **automatic background adversarial code review** whenever a turn actually writes code, and reports a terse **SHIP / NO-SHIP** verdict via toast.
 
-Two critics are consulted in parallel:
+Mechanical gates (typecheck, lint, debug-output scan) run first, then three critics are consulted in parallel:
 
 | Critic | Focus |
 | --- | --- |
-| `adversarial-risk-critic` | Attacks risky surfaces: auth, data loss, concurrency, external I/O, error paths, gamed tests |
-| `design-principles-critic` | Enforces DRY, SOLID, separation of concerns, abstraction boundaries, systems-design choices |
+| `adversarial-risk-critic` | Attacks risky surfaces: auth, data loss, concurrency, external I/O, error paths, gamed tests, weakened lint/typecheck configs |
+| `design-principles-critic` | Enforces DRY, SOLID, separation of concerns, abstraction boundaries, size/complexity signals, systems-design choices |
+| `security-checklist-critic` | Walks an OWASP-style checklist: secrets, injection, XSS, path traversal, authz, input validation, dependencies |
 
-Both agents are registered by the plugin itself, so the package is fully self-contained: no agent files to copy.
+All agents are registered by the plugin itself, so the package is fully self-contained: no agent files to copy.
 
 ## Install
 
@@ -51,10 +52,12 @@ Or reference the clone directly from `opencode.json`:
 
 2. **Review**: a background **child session** is spawned (so the review never clutters your conversation). It:
    - runs `git diff` including untracked files,
-   - delegates to `adversarial-risk-critic` and `design-principles-critic` in parallel,
-   - merges both reports into one severity-ranked (P0-P3) list with file:line evidence,
+   - runs **mechanical gates** first: the project's own typecheck/lint (e.g. `tsc --noEmit`, `ruff check`, `go vet`, `cargo check`), a scan for leftover debug output, and a check for weakened linter/formatter/typechecker configs. Any failure is an automatic P1 finding,
+   - delegates to `adversarial-risk-critic`, `design-principles-critic`, and `security-checklist-critic` in parallel, passing the gate results as context,
+   - injects language-specific guidance (TypeScript, Go, Python, Rust, Java/Kotlin, SQL, shell) based on the extensions of the changed files,
+   - merges all reports into one severity-ranked (P0-P3) list with file:line evidence,
    - runs diagnostics on every changed file,
-   - issues a single verdict: **SHIP** or **NO-SHIP**. Any P0/P1 finding from either critic forces NO-SHIP, and the review session fixes those findings and re-verifies.
+   - issues a single verdict: **SHIP** or **NO-SHIP**. Any failed mechanical gate or P0/P1 finding from any critic forces NO-SHIP, and the review session fixes those findings and re-verifies.
 
 3. **Delivery**: toasts report when the review starts and the final verdict. Full findings live in the child session titled "Adversarial review".
 
@@ -79,7 +82,7 @@ Use the tuple form in `opencode.json`:
 
 ### Customize the critics
 
-The plugin registers its agents only if you have not defined agents with the same names. To override a critic, define your own agent named `adversarial-risk-critic` or `design-principles-critic` (in `opencode.json` or as `~/.config/opencode/agent/<name>.md`) and it takes precedence.
+The plugin registers its agents only if you have not defined agents with the same names. To override a critic, define your own agent named `adversarial-risk-critic`, `design-principles-critic`, or `security-checklist-critic` (in `opencode.json` or as `~/.config/opencode/agent/<name>.md`) and it takes precedence.
 
 ## Requirements
 

@@ -12,15 +12,24 @@
  *             Pre-existing dirty files from before the turn started do not,
  *             by themselves, trigger a review, and neither does a turn that
  *             only read files / ran commands / chatted without writing code.
- * Review:     Two subagents are consulted in parallel:
+ * Review:     Mechanical gates run first (project typecheck/lint, debug-output
+ *             scan, lint-config-weakening check); any failure is an automatic
+ *             P1. Then three subagents are consulted in parallel:
  *               - adversarial-risk-critic: attacks risky surfaces (auth,
- *                 data loss, concurrency, external I/O, error paths).
+ *                 data loss, concurrency, external I/O, error paths,
+ *                 weakened guardrails).
  *               - design-principles-critic: enforces DRY, SOLID, separation
- *                 of concerns, and sound systems-design choices.
- *             Both subagents are registered by this plugin via the `config`
+ *                 of concerns, size/complexity signals, and sound
+ *                 systems-design choices.
+ *               - security-checklist-critic: walks an OWASP-style checklist
+ *                 (secrets, injection, XSS, path traversal, authz,
+ *                 dependencies) over the diff.
+ *             Language-specific guidance (TS, Go, Python, Rust, etc.) is
+ *             injected based on the extensions of the changed files.
+ *             All subagents are registered by this plugin via the `config`
  *             hook, so the package is fully self-contained. Existing agents
  *             with the same names are never overwritten, which lets users
- *             customize either critic locally.
+ *             customize any critic locally.
  * Delivery:   Spawned as a background CHILD session (session.create with
  *             parentID) that runs its own review turn, instead of being
  *             injected into the current session. This keeps the review's
@@ -43,6 +52,7 @@ const CODE_WRITING_TOOLS = new Set(["edit", "write"]);
 
 const RISK_AGENT = "adversarial-risk-critic";
 const DESIGN_AGENT = "design-principles-critic";
+const SECURITY_AGENT = "security-checklist-critic";
 
 const AGENT_DEFINITIONS = {
   [RISK_AGENT]: {
@@ -59,6 +69,7 @@ const AGENT_DEFINITIONS = {
       "4. External I/O: network, filesystem, subprocess, third-party APIs, timeouts, retries.",
       "5. Error paths: swallowed errors, empty catch blocks, error states that leave the system inconsistent.",
       "6. Gamed changes: deleted or weakened tests, hardcoded values to satisfy tests, `as any` / `@ts-ignore` / lint suppressions, dead code left behind.",
+      "7. Weakened guardrails: edits to linter/formatter/typechecker configs (.eslintrc, biome.json, tsconfig, .prettierrc, ruff.toml, clippy.toml) that disable or relax rules instead of fixing the offending code, new lint-disable comments, loosened compiler strictness.",
       "",
       "Check the change against what it was clearly trying to do. If the implementation diverges from its evident intent, that is a finding.",
       "",
@@ -91,6 +102,7 @@ const AGENT_DEFINITIONS = {
       "3. Separation of concerns and layering: business logic in UI or transport layers, I/O tangled with pure logic, wrong dependency direction, circular dependencies.",
       "4. Abstraction quality: wrong or leaky boundaries, premature abstraction for a single caller, missing abstraction where call sites already diverge, helpers that obscure rather than clarify.",
       "5. Systems-design choices: data ownership and flow, state placement, synchronous versus asynchronous boundaries, whether the change fights or follows the existing architecture.",
+      "6. Size and complexity thresholds (treat as signals, not absolute rules): new or grown functions over ~50 lines, files over ~800 lines, nesting deeper than 4 levels. Flag only when the size reflects a real SRP or readability problem, and severity is at most P2 unless it compounds another finding.",
       "",
       "Respect the codebase's own conventions. If the surrounding code deliberately favors duplication over coupling, or a simple procedural style, do not impose textbook patterns against the grain. A principle violation only counts when it creates real maintenance cost.",
       "",
@@ -107,30 +119,118 @@ const AGENT_DEFINITIONS = {
       "Report ONLY material findings. If the change is structurally sound, say so in one sentence and stop. Do not pad the report with praise or restate the diff.",
     ].join("\n"),
   },
+  [SECURITY_AGENT]: {
+    description:
+      "Checklist-driven security review of a code change. Walks a fixed OWASP-style checklist (secrets, injection, XSS, path traversal, authz, input validation, dependencies) over the diff and reports only material findings with file:line evidence and P0-P3 severity.",
+    mode: "subagent",
+    prompt: [
+      "You are a security checklist reviewer. Unlike an adversarial reviewer who reasons about the worst attack, you mechanically walk a fixed checklist over the changed code. Review ONLY the diff plus enough surrounding context to judge exposure.",
+      "",
+      "Checklist, in order. For each item, actively look; do not assume absence:",
+      "1. Secrets: hardcoded API keys, passwords, tokens, connection strings, private keys. Includes test files and config.",
+      "2. Injection: SQL/NoSQL built by string concatenation or interpolation, shell commands from unsanitized input, eval/Function on dynamic strings.",
+      "3. XSS: unescaped user input reaching HTML, innerHTML/dangerouslySetInnerHTML, missing output encoding.",
+      "4. Path traversal: user-controlled paths in filesystem operations without normalization or allowlisting.",
+      "5. AuthN/AuthZ: new routes or handlers missing authorization checks, authentication logic weakened, session/token validation bypassed.",
+      "6. Input validation: external input (HTTP params, env, file contents, API responses) used without validation at the boundary.",
+      "7. Dependencies: newly added packages that are obscure, unpinned, or shadow well-known names; downgrades of security-relevant packages.",
+      "8. Unsafe deserialization or parsing of untrusted data.",
+      "9. Sensitive data exposure: PII or credentials written to logs, error messages leaking internals, secrets in error paths.",
+      "",
+      "For each finding provide:",
+      "- Severity P0-P3 (P0 = exploitable now, P1 = exploitable under realistic conditions, P2 = defense-in-depth gap, P3 = hardening suggestion).",
+      "- Exact location (file:line).",
+      "- The concrete attack or exposure scenario.",
+      "- The minimal fix.",
+      "",
+      "Report ONLY material findings. If nothing on the checklist fires, say so in one sentence and stop. Do not pad the report.",
+    ].join("\n"),
+  },
 };
 
-const REVIEW_PROMPT = [
-  REVIEW_MARKER,
-  "You are reviewing, in the background, a coding turn that just finished in another session. Run an ADVERSARIAL self-review of that work before it is considered done.",
-  "",
-  "Do this:",
-  "1. Run `git diff` (and include untracked files) to see exactly what changed.",
-  "2. Delegate the critique to TWO subagents IN PARALLEL (fire both task calls in the same message, then wait for both):",
-  `   a. \`${RISK_AGENT}\` - adversarial risk critique. Its job is to BREAK confidence, not validate:`,
-  "      - Attack the most expensive/risky surfaces first (auth, data loss, concurrency, external I/O, error paths).",
-  "      - Report ONLY material findings, each with concrete evidence (file:line) and a severity P0-P3.",
-  "      - Check the change against what it was clearly trying to do: nothing gamed, no deleted tests, no `as any`/`@ts-ignore`.",
-  `   b. \`${DESIGN_AGENT}\` - design and best-practice enforcement:`,
-  "      - Enforce DRY, SOLID, separation of concerns, abstraction boundaries, and sound systems-design choices in the changed code.",
-  "      - Report ONLY material findings, each with concrete evidence (file:line) and a severity P0-P3.",
-  "      - Structural debt that will force rework or drift (copy-paste destined to diverge, god functions, tangled coupling, wrong abstraction boundaries) is P1, not P3.",
-  "3. After BOTH subagents return, merge their findings into one severity-ranked list, then run diagnostics on every changed file and confirm they are clean.",
-  "4. Give ONE terse verdict covering BOTH reviews, stated as exactly the single word SHIP or the single word NO-SHIP on its own line:",
-  "   - If either reviewer produced a P0/P1 finding, the verdict is NO-SHIP: fix those findings now, then re-verify.",
-  "   - If SHIP: say so and stop. Do NOT start unrelated new work.",
-  "",
-  "Keep it tight. This is a review pass, not a rewrite.",
-].join("\n");
+// Extension patterns mapped to language-specific review guidance, injected
+// into the review prompt only when the diff actually touches that language.
+const LANGUAGE_HINTS = [
+  [
+    /\.(ts|tsx|mts|cts)$/,
+    "TypeScript: `as any` / `@ts-ignore` / `!` non-null assertions papering over real type errors, floating promises (missing await), and for .tsx: effects with missing dependencies, unstable references causing re-renders.",
+  ],
+  [
+    /\.(js|jsx|mjs|cjs)$/,
+    "JavaScript: implicit coercion bugs, callbacks with swallowed errors, prototype pollution via object merges.",
+  ],
+  [
+    /\.go$/,
+    "Go: unchecked error returns, goroutine leaks, data races on shared maps/slices, missing context propagation and cancellation.",
+  ],
+  [
+    /\.py$/,
+    "Python: mutable default arguments, bare or overly broad except clauses, subprocess or SQL built from f-strings, missing type hints on new public functions.",
+  ],
+  [
+    /\.rs$/,
+    "Rust: unwrap()/expect() on fallible paths, new unsafe blocks, blocking calls inside async fns.",
+  ],
+  [
+    /\.(java|kt|kts)$/,
+    "Java/Kotlin: nullability holes, JPA N+1 queries, thread and coroutine safety of shared state.",
+  ],
+  [
+    /\.(sql|prisma)$/,
+    "SQL/schema: destructive migrations (DROP/ALTER losing data), missing indexes for new query patterns, irreversible migrations without a backfill plan.",
+  ],
+  [
+    /\.(sh|bash|zsh)$/,
+    "Shell: unquoted variable expansion, missing `set -euo pipefail`, word-splitting on paths.",
+  ],
+];
+
+function languageHintsFor(files) {
+  const hints = [];
+  for (const [pattern, hint] of LANGUAGE_HINTS) {
+    if (files.some((f) => pattern.test(f)) && !hints.includes(hint)) hints.push(hint);
+  }
+  return hints;
+}
+
+function buildReviewPrompt(languageHints) {
+  return [
+    REVIEW_MARKER,
+    "You are reviewing, in the background, a coding turn that just finished in another session. Run an ADVERSARIAL self-review of that work before it is considered done.",
+    "",
+    "Do this:",
+    "1. Run `git diff` (and include untracked files) to see exactly what changed.",
+    "2. MECHANICAL GATES - run these BEFORE consulting any critic:",
+    "   - Detect the project's own typecheck/lint/build commands (package.json scripts, tsconfig.json, Makefile, pyproject.toml, go.mod, Cargo.toml) and run the cheapest applicable check (e.g. `tsc --noEmit`, `ruff check`, `go vet`, `cargo check`), scoped to changed files where the tool allows.",
+    "   - Scan the changed files for leftover debug output (console.log, print-debugging, debugger statements) and commented-out code blocks.",
+    "   - Check whether the diff touches linter/formatter/typechecker config (.eslintrc*, biome.json*, tsconfig*, .prettierrc*, ruff.toml, clippy.toml) in a way that WEAKENS rules.",
+    "   Every mechanical failure is an automatic P1 finding. Record them; do not fix anything yet.",
+    "3. Delegate the critique to THREE subagents IN PARALLEL (fire all three task calls in the same message, then wait for all). Give each the mechanical-gate results as context:",
+    `   a. \`${RISK_AGENT}\` - adversarial risk critique. Its job is to BREAK confidence, not validate:`,
+    "      - Attack the most expensive/risky surfaces first (auth, data loss, concurrency, external I/O, error paths).",
+    "      - Report ONLY material findings, each with concrete evidence (file:line) and a severity P0-P3.",
+    "      - Check the change against what it was clearly trying to do: nothing gamed, no deleted tests, no `as any`/`@ts-ignore`, no weakened lint/typecheck config.",
+    `   b. \`${DESIGN_AGENT}\` - design and best-practice enforcement:`,
+    "      - Enforce DRY, SOLID, separation of concerns, abstraction boundaries, and sound systems-design choices in the changed code.",
+    "      - Report ONLY material findings, each with concrete evidence (file:line) and a severity P0-P3.",
+    "      - Structural debt that will force rework or drift (copy-paste destined to diverge, god functions, tangled coupling, wrong abstraction boundaries) is P1, not P3.",
+    `   c. \`${SECURITY_AGENT}\` - checklist-driven security review:`,
+    "      - Walk the OWASP-style checklist (secrets, injection, XSS, path traversal, authz, input validation, dependencies) over the diff.",
+    "      - Report ONLY material findings, each with concrete evidence (file:line) and a severity P0-P3.",
+    ...(languageHints.length
+      ? [
+          "4. Language-specific attention for this diff (pass these to the relevant critics):",
+          ...languageHints.map((hint) => `   - ${hint}`),
+        ]
+      : []),
+    "5. After ALL subagents return, merge mechanical-gate findings and critic findings into one severity-ranked list, then run diagnostics on every changed file and confirm they are clean.",
+    "6. Give ONE terse verdict covering ALL reviews, stated as exactly the single word SHIP or the single word NO-SHIP on its own line:",
+    "   - If any mechanical gate failed, or any reviewer produced a P0/P1 finding, the verdict is NO-SHIP: fix those findings now, then re-verify.",
+    "   - If SHIP: say so and stop. Do NOT start unrelated new work.",
+    "",
+    "Keep it tight. This is a review pass, not a rewrite.",
+  ].join("\n");
+};
 
 // Sessions we have already spawned a review for since they last did new
 // work, so a single finished turn produces exactly one review.
@@ -170,6 +270,21 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
     } catch {
       // Not a git repo, or git unavailable -> no signal either way.
       return null;
+    }
+  }
+
+  async function changedFileNames() {
+    try {
+      const tracked = await $`git -C ${cwd} diff --name-only HEAD`.text().catch(() => "");
+      const untracked = await $`git -C ${cwd} ls-files --others --exclude-standard`
+        .text()
+        .catch(() => "");
+      return `${tracked}\n${untracked}`
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean);
+    } catch {
+      return [];
     }
   }
 
@@ -305,6 +420,9 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       let reviewSessionID;
       (async () => {
         try {
+          const files = await changedFileNames();
+          const reviewPrompt = buildReviewPrompt(languageHintsFor(files));
+
           const created = await client.session.create({
             body: { parentID: sessionID, title: "Adversarial review" },
           });
@@ -327,7 +445,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
           await client.session.prompt({
             path: { id: reviewSessionID },
             body: {
-              parts: [{ type: "text", text: REVIEW_PROMPT }],
+              parts: [{ type: "text", text: reviewPrompt }],
             },
           });
         } catch (err) {

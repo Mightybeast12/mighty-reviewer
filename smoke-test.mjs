@@ -13,18 +13,24 @@ for (const key of ["config", "tool.execute.after", "chat.message", "event"]) {
   assert.ok(typeof hooks[key] === "function", `hook ${key} registered`);
 }
 
-// 2. config hook injects both agents without clobbering existing ones.
+// 2. config hook injects all agents without clobbering existing ones.
 const cfg = { agent: { "design-principles-critic": { description: "user override", mode: "subagent", prompt: "mine" } } };
 hooks.config(cfg);
 assert.ok(cfg.agent["adversarial-risk-critic"], "risk critic injected");
 assert.equal(cfg.agent["adversarial-risk-critic"].mode, "subagent");
 assert.ok(cfg.agent["adversarial-risk-critic"].prompt.length > 100, "risk critic has prompt");
+assert.ok(cfg.agent["adversarial-risk-critic"].prompt.includes("Weakened guardrails"), "risk critic checks weakened guardrails");
+assert.ok(cfg.agent["security-checklist-critic"], "security critic injected");
+assert.ok(cfg.agent["security-checklist-critic"].prompt.includes("Path traversal"), "security critic has checklist");
 assert.equal(cfg.agent["design-principles-critic"].prompt, "mine", "user override preserved");
 
 // 3. config hook works when cfg.agent is absent.
 const cfg2 = {};
 hooks.config(cfg2);
-assert.ok(cfg2.agent["adversarial-risk-critic"] && cfg2.agent["design-principles-critic"], "agents injected into empty config");
+assert.ok(
+  cfg2.agent["adversarial-risk-critic"] && cfg2.agent["design-principles-critic"] && cfg2.agent["security-checklist-critic"],
+  "agents injected into empty config",
+);
 
 // 4. Options-based disable returns empty hooks.
 const disabled = await plugin({ client, directory: "/tmp", worktree: "/tmp", $ }, { disabled: true });

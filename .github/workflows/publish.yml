@@ -10,8 +10,46 @@ permissions:
   contents: read
   id-token: write
 
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      should_publish: ${{ steps.version.outputs.should_publish }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Verify plugin loads and smoke tests pass
+        run: node --check index.js && node smoke-test.mjs
+
+      - name: Check if version is already published
+        id: version
+        run: |
+          PKG_NAME=$(node -p "require('./package.json').name")
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if OUTPUT=$(npm view "$PKG_NAME@$PKG_VERSION" version 2>&1); then
+            echo "Version $PKG_VERSION already published, skipping."
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+          elif echo "$OUTPUT" | grep -q "E404"; then
+            echo "Version $PKG_VERSION not on npm yet, publishing."
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "npm view failed for a reason other than E404, refusing to guess:"
+            echo "$OUTPUT"
+            exit 1
+          fi
+
   publish:
+    needs: check
+    if: needs.check.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,28 +59,8 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
-      - name: Check if version is already published
-        id: version
-        run: |
-          PKG_NAME=$(node -p "require('./package.json').name")
-          PKG_VERSION=$(node -p "require('./package.json').version")
-          echo "version=$PKG_VERSION" >> "$GITHUB_OUTPUT"
-          if npm view "$PKG_NAME@$PKG_VERSION" version > /dev/null 2>&1; then
-            echo "Version $PKG_VERSION already published, skipping."
-            echo "should_publish=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "Version $PKG_VERSION not on npm yet, publishing."
-            echo "should_publish=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Verify plugin loads and smoke tests pass
-        if: steps.version.outputs.should_publish == 'true'
-        run: node --check index.js && node smoke-test.mjs
-
       - name: Update npm (trusted publishing needs npm >= 11.5.1)
-        if: steps.version.outputs.should_publish == 'true'
-        run: npm install -g npm@latest
+        run: npm install -g npm@11.5.1
 
       - name: Publish
-        if: steps.version.outputs.should_publish == 'true'
         run: npm publish

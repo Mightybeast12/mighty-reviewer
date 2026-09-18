@@ -57,11 +57,16 @@ Or reference the clone directly from `opencode.json`:
    - injects language-specific guidance (TypeScript, Go, Python, Rust, Java/Kotlin, SQL, shell) based on the extensions of the changed files,
    - merges all reports into one severity-ranked (P0-P3) list with file:line evidence,
    - runs diagnostics on every changed file,
-   - issues a single verdict: **SHIP** or **NO-SHIP**. Any failed mechanical gate or P0/P1 finding from any critic forces NO-SHIP, and the review session fixes those findings and re-verifies.
+   - outputs the **full findings report** (every finding with severity, file:line, what is wrong, and the suggested minimal fix),
+   - issues a single verdict: **SHIP** or **NO-SHIP**. Any failed mechanical gate or P0/P1 finding from any critic forces NO-SHIP.
+
+   The review is **read-only**, enforced by mechanism: the three critic agents are registered with `edit`/`write`/`patch`/`bash`/`task` disabled, and the orchestrating review session runs with `edit`/`write`/`patch` disabled (it keeps `bash` for the mechanical gates, constrained to read-only commands). It lists everything wrong; you decide what to act on.
 
 3. **Delivery**: toasts report when the review starts and the final verdict. Full findings live in the child session titled "Adversarial review".
 
-4. **Loop guard**: spawned review sessions are tracked so they never review themselves, and each finished turn produces exactly one review.
+4. **Feedback loop**: on **NO-SHIP**, the findings report is injected back into the parent session as a new prompt, so the coding agent wakes up and fixes the P0/P1 findings. The fix turn triggers a fresh review. This is capped at **2 re-review cycles** per user message; if the cap is hit, the toast tells you to check the review session yourself. On SHIP nothing is injected.
+
+5. **Loop guard**: spawned review sessions are tracked so they never review themselves, each finished turn produces exactly one review, and the re-review cycle cap keeps review -> fix -> re-review from looping forever.
 
 ## Configuration
 

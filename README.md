@@ -45,10 +45,12 @@ Or reference the clone directly from `opencode.json`:
 ## How it works
 
 1. **Trigger**: after a turn finishes (`session.idle`, debounced against duplicate events), the plugin checks that BOTH are true:
-   - an editing tool (`edit`/`write`/`patch`) actually ran during that turn, and
+   - an editing tool (`edit`, `write`, `patch`, `multiedit`, `apply_patch`) actually ran during that turn, and
    - the git diff (unstaged + staged + untracked) changed compared to a snapshot taken at the start of the turn.
 
    Pre-existing dirty files never trigger a review on their own, and neither do read-only or chat-only turns. You can also trigger a review on demand with the **`/mighty-review`** command.
+
+   Only root sessions are reviewed. Child sessions (subagents spawned via the `task` tool, background sessions from other plugins) are never reviewed on their own; edits they make are credited to their root session, so a turn that delegates all its editing to subagents still gets exactly one review, for the parent turn.
 
    Noise never reaches the critics: lockfiles, generated/minified output, and vendored code are excluded, and diffs larger than `maxDiffLines` (default 2000 changed lines) skip review entirely with a toast.
 
@@ -96,10 +98,13 @@ All options go in the plugin tuple form in `opencode.json`:
 | `disabled` | `false` | Turn the plugin off |
 | `model` | session default | `provider/model` used by the review orchestrator session |
 | `criticModel` | agent default | `provider/model` for the three critic subagents (route them to a cheaper model) |
+| `agent` | session default | Agent that orchestrates the review session. It needs the `task` tool. Set this if your default agent is pinned to a model your provider does not serve, or lacks `task` (common with agent packs) |
 | `maxDiffLines` | `2000` | Skip review when more changed lines than this (lockfiles/generated excluded from the count) |
 | `ignore` | `[]` | Extra regex patterns (strings) for files to exclude from review |
 | `idleDebounceMs` | `1000` | Debounce for `session.idle` before triggering a review |
 | `enforceNoShip` | `false` | Block `git commit` / `git push` in a session while a NO-SHIP verdict is unresolved (until a later review SHIPs, e.g. via `/mighty-review`) |
+| `updateCheck` | `true` | Check npm for a newer version a few seconds after startup |
+| `autoUpdate` | `true` | Install the newer version into opencode's plugin cache automatically (unpinned npm installs only); with `false` you get a notification toast instead |
 
 ### Project review rules (`.mighty-reviewer.md`)
 
@@ -114,6 +119,17 @@ Drop a `.mighty-reviewer.md` file in the project root to teach the reviewer your
 ### On-demand review
 
 Run `/mighty-review` in any session to review the current working-tree changes immediately, without waiting for a coding turn.
+
+### Updates
+
+opencode installs npm plugins into `~/.cache/opencode/packages/` once and never re-resolves `latest`, so an unpinned plugin would silently stay on whatever version was current at first install. To compensate, the plugin checks the npm registry a few seconds after startup:
+
+- **Unpinned install** (`"mighty-reviewer"`): a newer version is installed into the cache automatically and a toast asks you to restart opencode. Set `"autoUpdate": false` to get a notification toast instead.
+- **Pinned install** (`"mighty-reviewer@0.4.1"`, or any range spec like `"mighty-reviewer@^0.4.0"`): never auto-updated; a toast tells you a newer version exists.
+- **Prerelease channel** (`"mighty-reviewer@beta"`): updates follow that dist-tag.
+- **Local file install** (`file:` path or a copy in the plugin directory): the check is skipped entirely; you manage the checkout yourself.
+
+The check is best-effort: no registry access, no toast, and it can never break the review flow. A lock file keeps concurrent opencode instances from updating the same cache at once, and a failed install restores the original manifest. Set `"updateCheck": false` to disable it completely.
 
 ### Disable temporarily
 

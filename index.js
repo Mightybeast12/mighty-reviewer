@@ -71,13 +71,29 @@
  *             REVIEW_TIMEOUT_MS. With { enforceNoShip: true }, git commit
  *             and push are blocked in a session while a NO-SHIP verdict is
  *             unresolved.
- * Options:    { disabled, model, criticModel, maxDiffLines, ignore,
- *             idleDebounceMs, enforceNoShip } via the plugin tuple form.
+ * Updates:    opencode installs npm plugins into ~/.cache/opencode/packages
+ *             once and never re-resolves `latest`, so a few seconds after
+ *             startup the plugin checks the npm registry itself. If a newer
+ *             version exists it rewrites its own cache-workspace
+ *             package.json and runs `bun install` there, then toasts to
+ *             restart. Pinned installs (mighty-reviewer@x.y.z) and local
+ *             file installs are never auto-updated; pins get a toast only.
+ * Scope:      Only ROOT sessions are reviewed. Child sessions (subagents
+ *             spawned via the task tool, other plugins' background sessions)
+ *             are never reviewed on their own; edits they make are credited
+ *             to their root session, so a turn that fans out to N subagents
+ *             produces one review for the parent turn, not N+1 and not 0.
+ * Options:    { disabled, model, criticModel, agent, maxDiffLines, ignore,
+ *             idleDebounceMs, enforceNoShip, updateCheck, autoUpdate } via
+ *             the plugin tuple form.
  * Opt-out:    set MIGHTY_REVIEWER_DISABLE=1, or pass { disabled: true }
  *             via the plugin tuple form in opencode.json.
  */
 
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile, rename, rm, stat } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
 
 const REVIEW_MARKER = "<!--adversarial-review-auto-->";
 const FEEDBACK_MARKER = "<!--adversarial-review-feedback-->";
@@ -98,6 +114,17 @@ const RULES_FILE = ".mighty-reviewer.md";
 const MAX_RULES_CHARS = 4000;
 const COMMAND_NAME = "mighty-review";
 
+const PKG_NAME = "mighty-reviewer";
+const UPDATE_CHECK_DELAY_MS = 5000;
+const REGISTRY_TIMEOUT_MS = 5000;
+const BUN_INSTALL_TIMEOUT_MS = 120000;
+const KILL_GRACE_MS = 5000;
+const UPDATE_LOCK_STALE_MS = 10 * 60 * 1000;
+const EXACT_SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+// npm dist-tag names never contain range operators or whitespace; anything
+// else ("^0.4.0", "~1.x") must not be silently retargeted to latest.
+const DIST_TAG = /^[A-Za-z][0-9A-Za-z._-]*$/;
+
 // Lockfiles, generated output, and vendored code produce the worst
 // false positives and are never worth critic attention.
 const IGNORED_FILE_PATTERNS = [
@@ -108,7 +135,7 @@ const IGNORED_FILE_PATTERNS = [
 ];
 
 // Tool names that count as "wrote code" for the purpose of gating a review.
-const CODE_WRITING_TOOLS = new Set(["edit", "write", "patch"]);
+const CODE_WRITING_TOOLS = new Set(["edit", "write", "patch", "multiedit", "apply_patch"]);
 
 const RISK_AGENT = "adversarial-risk-critic";
 const DESIGN_AGENT = "design-principles-critic";
@@ -326,6 +353,7 @@ function buildReviewPrompt(languageHints, projectRules) {
     `   c. \`${SECURITY_AGENT}\` - checklist-driven security review:`,
     "      - Walk the OWASP-style checklist (secrets, injection, XSS, path traversal, authz, input validation, dependencies) over the diff.",
     "      - Report ONLY material findings, each with concrete evidence (file:line) and a severity P0-P3.",
+    "   Use the task tool with subagent_type set to those exact agent names. NEVER substitute a different agent (explore, librarian, general, ...) for a critic: they run with other rubrics. If you have no way to delegate to the critics at all, perform all three critiques yourself in this session, one after another, applying each rubric above.",
     ...(languageHints.length
       ? [
           "4. Language-specific attention for this diff (pass these to the relevant critics):",
@@ -370,6 +398,209 @@ export function extractVerdict(text) {
   return null;
 }
 
+// --- Self-update: opencode resolves an unpinned plugin spec against npm
+// exactly once and then serves the frozen cache forever, so the plugin has
+// to check the registry and refresh its own cache workspace itself.
+
+export function compareSemver(a, b) {
+  const parse = (v) => {
+    const [core, ...pre] = String(v).split("-");
+    const [major, minor, patch] = core.split(".").map((n) => parseInt(n, 10) || 0);
+    return { major, minor, patch, pre: pre.join("-") };
+  };
+  const x = parse(a);
+  const y = parse(b);
+  for (const key of ["major", "minor", "patch"]) {
+    if (x[key] !== y[key]) return x[key] - y[key];
+  }
+  if (!x.pre && y.pre) return 1;
+  if (x.pre && !y.pre) return -1;
+  if (!x.pre && !y.pre) return 0;
+  return comparePrerelease(x.pre, y.pre);
+}
+
+// Semver 11.4: dot-separated identifiers compared left to right, numeric
+// identifiers compared numerically and sorting below alphanumeric ones,
+// fewer identifiers sorting first when all shared ones are equal.
+function comparePrerelease(a, b) {
+  const as = a.split(".");
+  const bs = b.split(".");
+  for (let i = 0; i < Math.max(as.length, bs.length); i++) {
+    if (as[i] === undefined) return -1;
+    if (bs[i] === undefined) return 1;
+    const aNum = /^\d+$/.test(as[i]);
+    const bNum = /^\d+$/.test(bs[i]);
+    if (aNum && bNum) {
+      const diff = Number(as[i]) - Number(bs[i]);
+      if (diff !== 0) return diff;
+    } else if (aNum !== bNum) {
+      return aNum ? -1 : 1;
+    } else if (as[i] !== bs[i]) {
+      return as[i] < bs[i] ? -1 : 1;
+    }
+  }
+  return 0;
+}
+
+// opencode installs npm plugins into
+// <cache>/packages/<spec>/node_modules/mighty-reviewer/, so the <spec>
+// directory name carries the pin/channel signal ("mighty-reviewer",
+// "mighty-reviewer@1.2.3", "mighty-reviewer@beta"). Local file installs
+// return null; the user manages those.
+export function describeInstall(moduleUrl) {
+  let filePath;
+  try {
+    filePath = fileURLToPath(moduleUrl);
+  } catch {
+    return null;
+  }
+  const marker = `${path.sep}node_modules${path.sep}${PKG_NAME}${path.sep}`;
+  const idx = filePath.lastIndexOf(marker);
+  if (idx === -1) return null;
+  const workspaceDir = filePath.slice(0, idx);
+  const specDir = path.basename(workspaceDir);
+  // Only opencode's own cache workspaces are managed. A nested install
+  // (another package depending on us) has the parent package's name here,
+  // and rewriting that parent's manifest would override its constraints.
+  if (specDir !== PKG_NAME && !specDir.startsWith(`${PKG_NAME}@`)) return null;
+  let pinned = false;
+  let channel = "latest";
+  if (specDir.startsWith(`${PKG_NAME}@`)) {
+    const spec = specDir.slice(PKG_NAME.length + 1);
+    if (DIST_TAG.test(spec)) channel = spec;
+    else pinned = true;
+  }
+  return { workspaceDir, pinned, channel };
+}
+
+async function fetchLatestVersion(channel) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REGISTRY_TIMEOUT_MS);
+  try {
+    const res = await fetch(`https://registry.npmjs.org/-/package/${PKG_NAME}/dist-tags`, {
+      signal: controller.signal,
+      headers: { Accept: "application/json" },
+    });
+    if (!res.ok) return null;
+    const tags = await res.json();
+    // No fallback to latest: an unknown tag must mean "no update", never a
+    // silent retarget onto a different channel.
+    const version = tags?.[channel];
+    return typeof version === "string" && EXACT_SEMVER.test(version) ? version : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function runBunInstall(workspaceDir) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn("bun", ["install"], { cwd: workspaceDir, stdio: "ignore" });
+    } catch {
+      resolve(false);
+      return;
+    }
+    // Never hold the process open for an update, and never leave a wedged
+    // bun alive: SIGTERM on timeout, SIGKILL if it ignores that.
+    child.unref?.();
+    const timer = setTimeout(() => {
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        // Best-effort kill on timeout.
+      }
+      const hardKill = setTimeout(() => {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // Best-effort kill on timeout.
+        }
+      }, KILL_GRACE_MS);
+      hardKill.unref?.();
+      resolve(false);
+    }, BUN_INSTALL_TIMEOUT_MS);
+    timer.unref?.();
+    child.on("error", () => {
+      clearTimeout(timer);
+      resolve(false);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve(code === 0);
+    });
+  });
+}
+
+async function replaceFile(filePath, contents) {
+  const tmpPath = `${filePath}.${process.pid}.tmp`;
+  try {
+    await writeFile(tmpPath, contents);
+    await rename(tmpPath, filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// One updater per workspace across concurrent opencode instances; a stale
+// lock from a crashed process is reclaimed after UPDATE_LOCK_STALE_MS.
+async function acquireUpdateLock(lockPath) {
+  const tryCreate = () => writeFile(lockPath, String(process.pid), { flag: "wx" });
+  try {
+    await tryCreate();
+    return true;
+  } catch {
+    try {
+      const { mtimeMs } = await stat(lockPath);
+      if (Date.now() - mtimeMs < UPDATE_LOCK_STALE_MS) return false;
+      await rm(lockPath, { force: true });
+      await tryCreate();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+// Refuses to touch a manifest that does not already list us as a
+// dependency, so a foreign workspace is never rewritten. A failed install
+// restores the original manifest so it never disagrees with node_modules.
+async function updateCacheWorkspace(workspaceDir, version) {
+  const manifestPath = path.join(workspaceDir, "package.json");
+  const lockPath = path.join(workspaceDir, `.${PKG_NAME}-update.lock`);
+  if (!(await acquireUpdateLock(lockPath))) return false;
+  try {
+    let original;
+    let manifest;
+    try {
+      original = await readFile(manifestPath, "utf8");
+      manifest = JSON.parse(original);
+    } catch {
+      return false;
+    }
+    if (!manifest?.dependencies?.[PKG_NAME]) return false;
+    manifest.dependencies[PKG_NAME] = version;
+    if (!(await replaceFile(manifestPath, JSON.stringify(manifest, null, 2)))) return false;
+    if (await runBunInstall(workspaceDir)) return true;
+    await replaceFile(manifestPath, original);
+    return false;
+  } finally {
+    await rm(lockPath, { force: true }).catch(() => {});
+  }
+}
+
+async function installedVersion() {
+  try {
+    const manifest = JSON.parse(await readFile(new URL("./package.json", import.meta.url), "utf8"));
+    return typeof manifest?.version === "string" ? manifest.version : null;
+  } catch {
+    return null;
+  }
+}
+
 // Sessions we have already spawned a review for since they last did new
 // work, so a single finished turn produces exactly one review.
 const reviewedSessions = new Set();
@@ -406,6 +637,10 @@ const reviewWatchdogs = new Map();
 // Parent session IDs with a NO-SHIP verdict not yet superseded by a SHIP.
 const unresolvedNoShip = new Set();
 
+// The cache workspace is process-global, so multiple factory instances
+// (multiple projects/worktrees) must schedule at most one update check.
+let updateCheckScheduled = false;
+
 export const MightyReviewer = async ({ client, directory, worktree, $ }, options = {}) => {
   if (options.disabled || process.env.MIGHTY_REVIEWER_DISABLE === "1") {
     return {};
@@ -417,6 +652,52 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
   const enforceNoShip = options.enforceNoShip === true;
   const extraIgnore = (options.ignore ?? []).map((p) => new RegExp(p));
   const reviewModel = parseModel(options.model);
+  const reviewAgent = typeof options.agent === "string" && options.agent ? options.agent : null;
+
+  // sessionID -> parentID (or null for a root session). Asked of the server
+  // once per session; the parent link never changes.
+  const sessionParents = new Map();
+
+  async function parentOf(sessionID) {
+    if (sessionParents.has(sessionID)) return sessionParents.get(sessionID);
+    let parent = null;
+    try {
+      if (typeof client.session.get === "function") {
+        const res = await client.session.get({ path: { id: sessionID } });
+        const info = res?.data ?? res;
+        parent = info?.parentID || null;
+      }
+    } catch {
+      // Unknown -> treat as root so a lookup failure never disables reviews.
+    }
+    sessionParents.set(sessionID, parent);
+    return parent;
+  }
+
+  async function isChildSession(sessionID) {
+    return (await parentOf(sessionID)) !== null;
+  }
+
+  // Walk up to the root session. Returns null if the chain passes through
+  // one of our own review sessions, whose work must never count as a new
+  // turn to review.
+  async function rootOf(sessionID) {
+    let current = sessionID;
+    for (let depth = 0; depth < 16; depth++) {
+      if (spawnedReviewSessions.has(current)) return null;
+      const parent = await parentOf(current);
+      if (!parent) return current;
+      current = parent;
+    }
+    return current;
+  }
+
+  function forget(sessionID) {
+    sessionBaselines.delete(sessionID);
+    sessionWroteCode.delete(sessionID);
+  }
+  const updateCheck = options.updateCheck !== false;
+  const autoUpdate = options.autoUpdate !== false;
 
   function parseModel(spec) {
     if (typeof spec !== "string") return null;
@@ -610,6 +891,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
 
       await sendPrompt(reviewSessionID, reviewPrompt, {
         tools: { ...ORCHESTRATOR_TOOLS },
+        ...(reviewAgent ? { agent: reviewAgent } : {}),
         ...(reviewModel ? { model: reviewModel } : {}),
       });
     } catch (err) {
@@ -727,12 +1009,22 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
   }
 
   async function handleParentIdle(sessionID) {
+    if (await isChildSession(sessionID)) {
+      forget(sessionID);
+      return;
+    }
     if (reviewedSessions.has(sessionID)) return;
-    if (!sessionWroteCode.get(sessionID)) return;
+    if (!sessionWroteCode.get(sessionID)) {
+      // Drop the turn's baseline either way, so the NEXT turn snapshots a
+      // fresh one instead of comparing against a stale pre-turn diff.
+      forget(sessionID);
+      return;
+    }
 
     const hasBaseline = sessionBaselines.has(sessionID);
     const baseline = hasBaseline ? sessionBaselines.get(sessionID) : undefined;
     const current = await snapshotDiff();
+    forget(sessionID);
 
     if (current === null) return; // not a git repo, or git unavailable
 
@@ -743,10 +1035,44 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
     }
 
     reviewedSessions.add(sessionID);
-    sessionBaselines.delete(sessionID);
-    sessionWroteCode.delete(sessionID);
 
     void spawnReview(sessionID);
+  }
+
+  async function checkForUpdate() {
+    try {
+      const install = describeInstall(import.meta.url);
+      if (!install) return;
+      const current = await installedVersion();
+      if (!current) return;
+      const latest = await fetchLatestVersion(install.channel);
+      if (!latest || compareSemver(latest, current) <= 0) return;
+      if (install.pinned) {
+        await showToast(`Update available: ${latest} (pinned to ${current}, update the pin in opencode.json).`, "info");
+        return;
+      }
+      if (!autoUpdate) {
+        await showToast(`Update available: ${current} -> ${latest}.`, "info");
+        return;
+      }
+      const updated = await updateCacheWorkspace(install.workspaceDir, latest);
+      await showToast(
+        updated
+          ? `Updated ${current} -> ${latest}; restart opencode to apply.`
+          : `Update available: ${latest} (auto-install failed; delete ~/.cache/opencode/packages/${PKG_NAME}* to force a reinstall).`,
+        updated ? "success" : "warning",
+      );
+    } catch {
+      // Update checking is best-effort and must never break the plugin.
+    }
+  }
+
+  if (updateCheck && !updateCheckScheduled) {
+    updateCheckScheduled = true;
+    const updateTimer = setTimeout(() => {
+      void checkForUpdate();
+    }, UPDATE_CHECK_DELAY_MS);
+    updateTimer.unref?.();
   }
 
   return {
@@ -812,9 +1138,12 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       const sessionID = input?.sessionID;
       const toolName = input?.tool;
       if (!sessionID || !toolName) return;
-      if (CODE_WRITING_TOOLS.has(toolName)) {
-        sessionWroteCode.set(sessionID, true);
-      }
+      if (!CODE_WRITING_TOOLS.has(toolName)) return;
+      // Credit the write to the root session: when a turn delegates the
+      // actual editing to a subagent, the parent only ran `task`, but it is
+      // the parent's turn that needs reviewing.
+      const root = await rootOf(sessionID);
+      if (root) sessionWroteCode.set(root, true);
     },
     "chat.message": async (input, output) => {
       const sessionID = input?.sessionID;
@@ -833,6 +1162,9 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       const textOf = (p) => (p?.type === "text" && typeof p.text === "string" ? p.text : "");
       const isOwnInjection = parts.some((p) => textOf(p).includes(REVIEW_MARKER));
       if (isOwnInjection) return;
+      // Subagent / background child sessions are never reviewed on their
+      // own; their root's turn is reviewed once when it goes idle.
+      if (await isChildSession(sessionID)) return;
       const isFeedback = parts.some((p) => textOf(p).includes(FEEDBACK_MARKER));
       if (!isFeedback) feedbackCycles.delete(sessionID);
       // A genuine new message means fresh work -> allow it to be reviewed.

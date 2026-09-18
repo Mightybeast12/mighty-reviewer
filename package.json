@@ -1,6 +1,6 @@
 {
   "name": "mighty-reviewer",
-  "version": "0.3.3",
+  "version": "0.4.1",
   "description": "opencode plugin that runs an automatic background adversarial code review (mechanical gates + risk critique + DRY/SOLID/design enforcement + OWASP security checklist) whenever a turn writes code, with a SHIP / NO-SHIP verdict.",
   "type": "module",
   "main": "index.js",

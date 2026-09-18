@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import plugin, { MightyReviewer, extractVerdict } from "./index.js";
+import plugin, { MightyReviewer, extractVerdict, compareSemver, describeInstall } from "./index.js";
 
 assert.equal(plugin, MightyReviewer, "default export matches named export");
 
@@ -87,14 +87,16 @@ const makeHarness = async (report, { promptAsyncResult, options } = {}) => {
   const logs = [];
   const aborted = [];
   let childN = 0;
+  const sessionInfo = {};
   const fclient = {
     tui: { showToast: async ({ body }) => toasts.push(body) },
     session: {
+      get: async ({ path }) => ({ data: sessionInfo[path.id] ?? { id: path.id } }),
       create: async () => ({ data: { id: `child-${++childN}` } }),
       abort: async ({ path }) => aborted.push(path.id),
-      prompt: async ({ path, body }) => promptCalls.push({ id: path.id, text: body.parts[0].text }),
+      prompt: async ({ path, body }) => promptCalls.push({ id: path.id, text: body.parts[0].text, body }),
       promptAsync: async ({ path, body }) => {
-        promptCalls.push({ id: path.id, text: body.parts[0].text });
+        promptCalls.push({ id: path.id, text: body.parts[0].text, body });
         // The error stub only applies to feedback injections, so spawning
         // the review itself (also promptAsync now) still succeeds.
         if (body.parts[0].text.includes("<!--adversarial-review-feedback-->")) {
@@ -107,7 +109,8 @@ const makeHarness = async (report, { promptAsyncResult, options } = {}) => {
     app: { log: async ({ body }) => logs.push(body) },
   };
   let diffN = 0;
-  const f$ = () => ({ text: async () => `diff-${++diffN}` });
+  let fixedDiff = null;
+  const f$ = () => ({ text: async () => (fixedDiff !== null ? fixedDiff : `diff-${++diffN}`) });
   const fhooks = await plugin(
     { client: fclient, directory: "/tmp", worktree: "/tmp", $: f$ },
     { idleDebounceMs: 0, ...options },
@@ -120,6 +123,12 @@ const makeHarness = async (report, { promptAsyncResult, options } = {}) => {
     toasts,
     logs,
     aborted,
+    addChild: (id, parentID) => {
+      sessionInfo[id] = { id, parentID };
+    },
+    setDiff: (value) => {
+      fixedDiff = value;
+    },
     lastChild: () => `child-${childN}`,
     turn: async (parent, msgText) => {
       await fhooks["chat.message"]({ sessionID: parent }, { parts: [{ type: "text", text: msgText }] });
@@ -267,6 +276,132 @@ const makeHarness = async (report, { promptAsyncResult, options } = {}) => {
     { tool: "bash", sessionID: "enforce-parent" },
     { args: { command: "git push" } },
   );
+}
+
+// 13. Semver comparison used by the update checker.
+assert.ok(compareSemver("0.4.2", "0.4.1") > 0);
+assert.ok(compareSemver("0.4.1", "0.10.0") < 0, "numeric compare, not lexicographic");
+assert.equal(compareSemver("1.2.3", "1.2.3"), 0);
+assert.ok(compareSemver("1.0.0-beta.1", "1.0.0") < 0, "prerelease sorts below release");
+assert.ok(compareSemver("1.0.0", "1.0.0-beta.1") > 0);
+assert.ok(compareSemver("1.0.0-beta.10", "1.0.0-beta.9") > 0, "numeric prerelease identifiers, not lexicographic");
+assert.ok(compareSemver("1.0.0-alpha", "1.0.0-alpha.1") < 0, "fewer prerelease identifiers sort first");
+assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric identifiers sort below alphanumeric");
+
+// 14. Install-location detection drives pin/channel/auto-update decisions.
+{
+  const cache = "file:///home/u/.cache/opencode/packages";
+  const unpinned = describeInstall(`${cache}/mighty-reviewer/node_modules/mighty-reviewer/index.js`);
+  assert.equal(unpinned.pinned, false, "bare spec is unpinned");
+  assert.equal(unpinned.channel, "latest");
+  assert.ok(unpinned.workspaceDir.endsWith("packages/mighty-reviewer"), "workspace is the spec dir");
+
+  const latestTag = describeInstall(`${cache}/mighty-reviewer@latest/node_modules/mighty-reviewer/index.js`);
+  assert.equal(latestTag.pinned, false, "@latest is unpinned");
+  assert.equal(latestTag.channel, "latest");
+
+  const pinned = describeInstall(`${cache}/mighty-reviewer@0.4.1/node_modules/mighty-reviewer/index.js`);
+  assert.equal(pinned.pinned, true, "exact version spec is pinned");
+
+  const beta = describeInstall(`${cache}/mighty-reviewer@beta/node_modules/mighty-reviewer/index.js`);
+  assert.equal(beta.pinned, false, "dist-tag spec is unpinned");
+  assert.equal(beta.channel, "beta", "dist-tag spec sets the channel");
+
+  const range = describeInstall(`${cache}/mighty-reviewer@%5E0.4.0/node_modules/mighty-reviewer/index.js`);
+  assert.equal(range.pinned, true, "range spec is treated as pinned, never retargeted to latest");
+  assert.equal(range.channel, "latest");
+
+  assert.equal(
+    describeInstall(`${cache}/other-plugin/node_modules/mighty-reviewer/index.js`),
+    null,
+    "nested install under another package is not managed",
+  );
+
+  assert.equal(describeInstall("file:///home/u/dev/mighty-reviewer/index.js"), null, "dev checkout is not managed");
+  assert.equal(
+    describeInstall("file:///home/u/.config/opencode/plugin/mighty-reviewer.js"),
+    null,
+    "plugin-dir file copy is not managed",
+  );
+  assert.equal(describeInstall("not a url"), null, "malformed url is not managed");
+}
+
+// 15. Child sessions (subagents) are never reviewed on their own, but their
+//     edits count toward the root session's turn; edits by our own review
+//     sessions count toward nothing.
+{
+  const h = await makeHarness("clean\n\nSHIP");
+  h.addChild("sub", "parent15");
+  h.addChild("subsub", "sub");
+  h.setDiff("clean-tree");
+
+  await h.hooks["chat.message"]({ sessionID: "parent15" }, { parts: [{ type: "text", text: "go" }] });
+  await h.hooks["chat.message"]({ sessionID: "sub" }, { parts: [{ type: "text", text: "delegated" }] });
+  await h.hooks["tool.execute.after"]({ sessionID: "subsub", tool: "edit" });
+  h.setDiff("clean-tree\n+ subagent wrote this");
+
+  await h.hooks.event({ event: { type: "session.idle", properties: { sessionID: "subsub" } } });
+  await h.hooks.event({ event: { type: "session.idle", properties: { sessionID: "sub" } } });
+  await h.tick();
+  assert.equal(h.promptCalls.length, 0, "child sessions did not trigger a review");
+
+  await h.hooks.event({ event: { type: "session.idle", properties: { sessionID: "parent15" } } });
+  await h.tick();
+  assert.equal(h.promptCalls.length, 1, "root turn reviewed once, credited with the subagent's edit");
+  assert.equal(h.promptCalls[0].id, "child-1");
+
+  await h.hooks["chat.message"]({ sessionID: "parent15" }, { parts: [{ type: "text", text: "next" }] });
+  await h.hooks["tool.execute.after"]({ sessionID: "child-1", tool: "edit" });
+  await h.hooks.event({ event: { type: "session.idle", properties: { sessionID: "parent15" } } });
+  await h.tick();
+  assert.equal(h.promptCalls.length, 1, "review-session edits did not trigger another review");
+}
+
+// 16. Turns that do not trigger a review leave no stale baseline behind: the
+//     next turn compares against its own start, not a previous turn's.
+{
+  const h = await makeHarness("clean\n\nSHIP");
+  h.setDiff("");
+
+  await h.hooks["chat.message"]({ sessionID: "root16" }, { parts: [{ type: "text", text: "just chat" }] });
+  await h.hooks.event({ event: { type: "session.idle", properties: { sessionID: "root16" } } });
+  await h.tick();
+  assert.equal(h.promptCalls.length, 0, "read-only turn not reviewed");
+
+  h.setDiff("+ manual edit between turns");
+  await h.hooks["chat.message"]({ sessionID: "root16" }, { parts: [{ type: "text", text: "turn B" }] });
+  await h.hooks["tool.execute.after"]({ sessionID: "root16", tool: "edit" });
+  await h.hooks.event({ event: { type: "session.idle", properties: { sessionID: "root16" } } });
+  await h.tick();
+  assert.equal(h.promptCalls.length, 0, "no review when this turn's diff matches its own fresh baseline");
+
+  await h.hooks["chat.message"]({ sessionID: "root16" }, { parts: [{ type: "text", text: "turn C" }] });
+  await h.hooks["tool.execute.after"]({ sessionID: "root16", tool: "apply_patch" });
+  h.setDiff("+ manual edit between turns\n+ agent edit");
+  await h.hooks.event({ event: { type: "session.idle", properties: { sessionID: "root16" } } });
+  await h.tick();
+  assert.equal(h.promptCalls.length, 1, "review fires once the diff actually moves, apply_patch counts as writing");
+}
+
+// 17. agent option routes the review session's orchestrating agent.
+{
+  const h = await makeHarness("clean\n\nSHIP", { options: { agent: "build" } });
+  await h.hooks["command.execute.before"]({ command: "mighty-review", sessionID: "cmd17" }, { parts: [] });
+  await h.tick();
+  assert.equal(h.promptCalls[0].body.agent, "build", "review agent forwarded to prompt");
+
+  const h2 = await makeHarness("clean\n\nSHIP");
+  await h2.hooks["command.execute.before"]({ command: "mighty-review", sessionID: "cmd17b" }, { parts: [] });
+  await h2.tick();
+  assert.equal(h2.promptCalls[0].body.agent, undefined, "no agent forced by default");
+}
+
+// 18. Review prompt forbids substituting other agents for the critics.
+{
+  const h = await makeHarness("clean\n\nSHIP");
+  await h.hooks["command.execute.before"]({ command: "mighty-review", sessionID: "cmd18" }, { parts: [] });
+  await h.tick();
+  assert.match(h.promptCalls[0].text, /NEVER substitute a different agent/, "anti-substitution rule present");
 }
 
 console.log("ALL SMOKE TESTS PASSED");

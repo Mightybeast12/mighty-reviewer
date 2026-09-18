@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
-import plugin, { MightyReviewer, extractVerdict, compareSemver, describeInstall } from "./index.js";
+import plugin, { MightyReviewer } from "./index.js";
+import { extractVerdict, compareSemver, describeInstall } from "./internals.js";
 
 assert.equal(plugin, MightyReviewer, "default export matches named export");
+
+// opencode calls EVERY export of the plugin entry point as a plugin factory,
+// so any extra export (helpers returning null) bricks opencode at bootstrap.
+const entryExports = Object.keys(await import("./index.js")).sort();
+assert.deepEqual(entryExports, ["MightyReviewer", "default"], "index.js exposes only the plugin factory");
 
 // Stub $ template tag (never called at init time).
 const $ = () => ({ text: async () => "" });

@@ -43,6 +43,13 @@
  *             conversation the user is reading. A toast reports progress and
  *             the terse SHIP / NO-SHIP verdict once the child session
  *             finishes.
+ * Progress:   the review's phase is inferred from tool activity inside the
+ *             review session (bash -> mechanical gates, task dispatch ->
+ *             critics running N/M, all tasks returned -> verifying) and
+ *             surfaced three ways: the review_status tool reports the phase
+ *             and elapsed time while running, phase transitions emit toasts
+ *             (disable with { progressToasts: false }), and the review
+ *             child's session title is renamed live as phases advance.
  * Feedback:   On NO-SHIP, the findings report is injected back into the
  *             PARENT session as a new prompt, so the coding agent wakes up
  *             and fixes the findings. The fix turn is itself reviewed again,
@@ -54,6 +61,12 @@
  *             `spawnedReviewSessions`, so their own idle events are
  *             recognized as review completions and never mistaken for a
  *             turn that itself needs reviewing.
+ * Stall guard: a review session that goes idle WITHOUT a SHIP/NO-SHIP
+ *             verdict (e.g. the orchestrator launched the critics as
+ *             background tasks and ended its turn) is not finalized:
+ *             it is re-prompted to collect the critic results and emit
+ *             the verdict, capped at MAX_VERDICT_NUDGES, after which the
+ *             review is finalized as-is.
  * Noise:      lockfiles, generated/minified output, and vendored code are
  *             excluded; oversized diffs (maxDiffLines, default 2000) skip
  *             review entirely. Critics carry a confidence threshold, a
@@ -84,8 +97,8 @@
  *             to their root session, so a turn that fans out to N subagents
  *             produces one review for the parent turn, not N+1 and not 0.
  * Options:    { disabled, model, criticModel, agent, maxDiffLines, ignore,
- *             idleDebounceMs, enforceNoShip, updateCheck, autoUpdate } via
- *             the plugin tuple form.
+ *             idleDebounceMs, enforceNoShip, progressToasts, updateCheck,
+ *             autoUpdate } via the plugin tuple form.
  * Opt-out:    set MIGHTY_REVIEWER_DISABLE=1, or pass { disabled: true }
  *             via the plugin tuple form in opencode.json.
  */
@@ -107,6 +120,13 @@ const MAX_REREVIEW_CYCLES = 2;
 // send time, making "can never loop forever" true by mechanism.
 const MAX_TOTAL_INJECTIONS = 10;
 const MAX_FEEDBACK_CHARS = 8000;
+
+// A review session can go idle WITHOUT a verdict: some orchestrator agents
+// launch the critics as background tasks and end their turn immediately,
+// which used to be finalized as a verdict-less "done" with the launch
+// acknowledgment captured as the report. Verdict-less idles get nudged back
+// to work instead, capped so a hopeless orchestrator still terminates.
+const MAX_VERDICT_NUDGES = 2;
 
 const DEFAULT_MAX_DIFF_LINES = 2000;
 const DEFAULT_IDLE_DEBOUNCE_MS = 1000;
@@ -338,7 +358,7 @@ function buildReviewPrompt(languageHints, projectRules) {
     "   - Scan the changed files for leftover debug output (console.log, print-debugging, debugger statements) and commented-out code blocks.",
     "   - Check whether the diff touches linter/formatter/typechecker config (.eslintrc*, biome.json*, tsconfig*, .prettierrc*, ruff.toml, clippy.toml) in a way that WEAKENS rules.",
     "   Every mechanical failure is an automatic P1 finding. Record them; never fix anything.",
-    "3. Delegate the critique to THREE subagents IN PARALLEL (fire all three task calls in the same message, then wait for all). Give each: the mechanical-gate results as context, the project review rules above (if any), and these standing orders: it is strictly read-only, it must not report anything the mechanical gates already cover, and it must omit findings it is less than 70% confident are real and material:",
+    "3. Delegate the critique to THREE subagents IN PARALLEL (fire all three task calls in the same message, then wait for all). The critic tasks must run in the FOREGROUND: NEVER launch them as background tasks, and NEVER end your turn while any critique is still pending or the final verdict line is missing. Give each: the mechanical-gate results as context, the project review rules above (if any), and these standing orders: it is strictly read-only, it must not report anything the mechanical gates already cover, and it must omit findings it is less than 70% confident are real and material:",
     `   a. \`${RISK_AGENT}\` - adversarial risk critique. Its job is to BREAK confidence, not validate:`,
     "      - Attack the most expensive/risky surfaces first (auth, data loss, concurrency, external I/O, error paths).",
     "      - Report ONLY material findings, each with concrete evidence (file:line) and a severity P0-P3.",
@@ -374,6 +394,15 @@ function buildReviewPrompt(languageHints, projectRules) {
     "Keep it tight. This is a review pass that reports problems; it never rewrites code.",
   ].join("\n");
 };
+
+const VERDICT_NUDGE_PROMPT = [
+  REVIEW_MARKER,
+  "Your review turn ended WITHOUT the required verdict. Finish the review NOW, in this turn:",
+  "1. Collect the result of every critic subagent you launched. If you started them as background tasks, retrieve each one's output now; if a critique is missing and cannot be retrieved, perform that critique yourself in this session using its rubric.",
+  "2. Adversarially verify and deduplicate the findings as originally instructed.",
+  "3. Output the FULL findings report, then exactly the single word SHIP or NO-SHIP on its own line.",
+  "Do NOT launch new background work. Do NOT end your turn without the verdict line.",
+].join("\n");
 
 // --- Self-update: opencode resolves an unpinned plugin spec against npm
 // exactly once and then serves the frozen cache forever, so the plugin has
@@ -540,6 +569,10 @@ const pendingIdleTimers = new Map();
 
 const reviewWatchdogs = new Map();
 
+// Review session ID -> { count, lastReport } of verdict nudges sent after a
+// verdict-less idle.
+const reviewNudges = new Map();
+
 // Parent session IDs with a NO-SHIP verdict not yet superseded by a SHIP.
 const unresolvedNoShip = new Set();
 
@@ -556,6 +589,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
   const maxDiffLines = options.maxDiffLines ?? DEFAULT_MAX_DIFF_LINES;
   const idleDebounceMs = options.idleDebounceMs ?? DEFAULT_IDLE_DEBOUNCE_MS;
   const enforceNoShip = options.enforceNoShip === true;
+  const progressToasts = options.progressToasts !== false;
   const extraIgnore = (options.ignore ?? []).map((p) => new RegExp(p));
   const reviewModel = parseModel(options.model);
   const reviewAgent = typeof options.agent === "string" && options.agent ? options.agent : null;
@@ -726,12 +760,90 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
     }
   }
 
+  function formatElapsed(ms) {
+    const totalSec = Math.max(0, Math.round(ms / 1000));
+    const m = Math.floor(totalSec / 60);
+    const s = totalSec % 60;
+    return m ? `${m}m ${String(s).padStart(2, "0")}s` : `${s}s`;
+  }
+
+  // Live progress in the session list: rename the review child session as
+  // phases advance. Cosmetic and best-effort; older servers without
+  // session.update just keep the static title.
+  async function setReviewTitle(reviewSessionID, suffix) {
+    try {
+      if (typeof client.session.update !== "function") return;
+      await client.session.update({
+        path: { id: reviewSessionID },
+        body: { title: `Adversarial review - ${suffix}` },
+      });
+    } catch {
+      // Title updates are best-effort.
+    }
+  }
+
+  function describePhase(state) {
+    switch (state.phase) {
+      case "gates":
+        return "running mechanical gates";
+      case "critics":
+        return `waiting on critics (${state.criticsDone}/${state.criticsTotal} returned)`;
+      case "verifying":
+        return "critics done, verifying and merging findings";
+      case "collecting":
+        return "collecting critic results (nudged after an early idle)";
+      default:
+        return "starting up";
+    }
+  }
+
+  // Infer the review's phase from tool activity inside the review session:
+  // the first bash call is the git diff / mechanical gates, each task call
+  // dispatches a critic, and once every dispatched task returns the
+  // orchestrator is verifying findings. Approximate, but the orchestrator
+  // prompt drives exactly this sequence.
+  async function trackReviewProgress(reviewSessionID, toolName, stage) {
+    const parentSessionID = reviewParents.get(reviewSessionID);
+    if (!parentSessionID) return;
+    const state = reviewStates.get(parentSessionID);
+    if (state?.status !== "running") return;
+
+    let title = null;
+    let toast = null;
+    if (stage === "before" && toolName === "bash" && state.phase === "starting") {
+      state.phase = "gates";
+      title = "gates";
+    } else if (stage === "before" && toolName === "task") {
+      state.criticsTotal += 1;
+      if (state.phase !== "critics") {
+        state.phase = "critics";
+        toast = "Review progress: mechanical gates done, critics running.";
+      }
+      title = `critics ${state.criticsDone}/${state.criticsTotal}`;
+    } else if (stage === "after" && toolName === "task" && state.phase === "critics") {
+      state.criticsDone += 1;
+      if (state.criticsDone >= state.criticsTotal) {
+        state.phase = "verifying";
+        toast = "Review progress: critics done, verifying findings.";
+        title = "verifying";
+      } else {
+        title = `critics ${state.criticsDone}/${state.criticsTotal}`;
+      }
+    } else {
+      return;
+    }
+    state.updatedAt = Date.now();
+    if (toast && progressToasts) await showToast(toast, "info");
+    if (title) void setReviewTitle(reviewSessionID, title);
+  }
+
   function armWatchdog(reviewSessionID, parentSessionID) {
     const timer = setTimeout(async () => {
       reviewWatchdogs.delete(reviewSessionID);
       if (!spawnedReviewSessions.has(reviewSessionID)) return;
       spawnedReviewSessions.delete(reviewSessionID);
       reviewParents.delete(reviewSessionID);
+      reviewNudges.delete(reviewSessionID);
       reviewStates.set(parentSessionID, {
         status: "done",
         verdict: null,
@@ -743,6 +855,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       } catch {
         // Abort is best-effort.
       }
+      void setReviewTitle(reviewSessionID, "timed out");
       await showToast("Background review timed out and was aborted.", "warning");
     }, REVIEW_TIMEOUT_MS);
     timer.unref?.();
@@ -785,7 +898,15 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       if (!reviewSessionID) throw new Error("session.create returned no id");
       spawnedReviewSessions.add(reviewSessionID);
       reviewParents.set(reviewSessionID, sessionID);
-      reviewStates.set(sessionID, { status: "running", verdict: null, updatedAt: Date.now() });
+      reviewStates.set(sessionID, {
+        status: "running",
+        phase: "starting",
+        startedAt: Date.now(),
+        criticsTotal: 0,
+        criticsDone: 0,
+        verdict: null,
+        updatedAt: Date.now(),
+      });
       armWatchdog(reviewSessionID, sessionID);
 
       await showToast(
@@ -807,6 +928,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       if (reviewSessionID) {
         spawnedReviewSessions.delete(reviewSessionID);
         reviewParents.delete(reviewSessionID);
+        reviewNudges.delete(reviewSessionID);
         clearWatchdog(reviewSessionID);
       }
       try {
@@ -873,9 +995,8 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
     }
   }
 
-  async function reportReviewCompletion(reviewSessionID, parentSessionID) {
-    const report = await lastAssistantText(reviewSessionID);
-    const verdict = extractVerdict(report);
+  async function reportReviewCompletion(reviewSessionID, parentSessionID, report, verdict) {
+    void setReviewTitle(reviewSessionID, verdict ?? "done");
 
     if (parentSessionID) {
       reviewStates.set(parentSessionID, {
@@ -912,6 +1033,40 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
     }
 
     await showToast(message, variant);
+  }
+
+  // Returns true when the verdict-less review session was sent back to work
+  // (or a duplicate idle was absorbed), false when the nudge budget is
+  // exhausted or the prompt could not be delivered and the review must be
+  // finalized as-is. Duplicate idles are detected by content: if the last
+  // assistant message has not changed since the previous nudge, no new turn
+  // ran, so it is the same stale idle event and burns no budget.
+  async function nudgeForVerdict(reviewSessionID, report) {
+    const { count = 0, lastReport = null } = reviewNudges.get(reviewSessionID) ?? {};
+    if (count > 0 && report === lastReport) return true;
+    if (count >= MAX_VERDICT_NUDGES) return false;
+    try {
+      await sendPrompt(reviewSessionID, VERDICT_NUDGE_PROMPT, {
+        tools: { ...ORCHESTRATOR_TOOLS },
+        ...(reviewAgent ? { agent: reviewAgent } : {}),
+        ...(reviewModel ? { model: reviewModel } : {}),
+      });
+    } catch {
+      return false;
+    }
+    reviewNudges.set(reviewSessionID, { count: count + 1, lastReport: report });
+    const parentSessionID = reviewParents.get(reviewSessionID);
+    const state = parentSessionID ? reviewStates.get(parentSessionID) : undefined;
+    if (state?.status === "running") {
+      state.phase = "collecting";
+      state.updatedAt = Date.now();
+    }
+    void setReviewTitle(reviewSessionID, "collecting results");
+    await showToast(
+      `Review ended without a verdict; nudged it to collect critic results (${count + 1}/${MAX_VERDICT_NUDGES}).`,
+      "warning",
+    );
+    return true;
   }
 
   async function handleParentIdle(sessionID) {
@@ -1012,7 +1167,8 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
           const state = sessionID ? reviewStates.get(sessionID) : undefined;
           if (!state) return "No review has run for this session yet.";
           if (state.status === "running") {
-            return "Review still in progress; check again shortly.";
+            const elapsed = formatElapsed(Date.now() - (state.startedAt ?? state.updatedAt));
+            return `Review still in progress: ${describePhase(state)} (elapsed ${elapsed}; reviews are aborted after 10 minutes).`;
           }
           return [
             `verdict: ${state.verdict ?? "unknown (no verdict line found)"}`,
@@ -1029,9 +1185,14 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       void spawnReview(sessionID, { viaCommand: true });
     },
     "tool.execute.before": async (input, output) => {
-      if (!enforceNoShip) return;
       const sessionID = input?.sessionID;
-      if (!sessionID || !unresolvedNoShip.has(sessionID)) return;
+      if (!sessionID) return;
+      if (reviewParents.has(sessionID)) {
+        await trackReviewProgress(sessionID, input?.tool, "before");
+        return;
+      }
+      if (!enforceNoShip) return;
+      if (!unresolvedNoShip.has(sessionID)) return;
       if (input?.tool !== "bash") return;
       const command = String(output?.args?.command ?? "");
       if (/\bgit\b[\s\S]*\b(commit|push)\b/.test(command)) {
@@ -1044,6 +1205,10 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       const sessionID = input?.sessionID;
       const toolName = input?.tool;
       if (!sessionID || !toolName) return;
+      if (reviewParents.has(sessionID)) {
+        await trackReviewProgress(sessionID, toolName, "after");
+        return;
+      }
       if (!CODE_WRITING_TOOLS.has(toolName)) return;
       // Credit the write to the root session: when a turn delegates the
       // actual editing to a subagent, the parent only ran `task`, but it is
@@ -1092,13 +1257,21 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       // This is one of our own background review sessions finishing, not a
       // user turn -> report the verdict via toast and stop, do not recurse.
       if (spawnedReviewSessions.has(sessionID)) {
+        const report = await lastAssistantText(sessionID);
+        const verdict = extractVerdict(report);
+        // No verdict means the orchestrator ended its turn early (typically
+        // after launching the critics as background tasks): send it back to
+        // collect results instead of finalizing a fizzled review. The
+        // watchdog still bounds the session's total lifetime.
+        if (!verdict && (await nudgeForVerdict(sessionID, report))) return;
         spawnedReviewSessions.delete(sessionID);
         sessionBaselines.delete(sessionID);
         sessionWroteCode.delete(sessionID);
         clearWatchdog(sessionID);
         const parentSessionID = reviewParents.get(sessionID);
         reviewParents.delete(sessionID);
-        await reportReviewCompletion(sessionID, parentSessionID);
+        reviewNudges.delete(sessionID);
+        await reportReviewCompletion(sessionID, parentSessionID, report, verdict);
         return;
       }
 

@@ -88,10 +88,12 @@ assert.equal(extractVerdict(undefined), null);
 
 // Fake-client harness driving the hook choreography of one parent session.
 const makeHarness = async (report, { promptAsyncResult, options } = {}) => {
+  let currentReport = report;
   const promptCalls = [];
   const toasts = [];
   const logs = [];
   const aborted = [];
+  const titles = [];
   let childN = 0;
   const sessionInfo = {};
   const fclient = {
@@ -99,6 +101,7 @@ const makeHarness = async (report, { promptAsyncResult, options } = {}) => {
     session: {
       get: async ({ path }) => ({ data: sessionInfo[path.id] ?? { id: path.id } }),
       create: async () => ({ data: { id: `child-${++childN}` } }),
+      update: async ({ path, body }) => titles.push({ id: path.id, title: body.title }),
       abort: async ({ path }) => aborted.push(path.id),
       prompt: async ({ path, body }) => promptCalls.push({ id: path.id, text: body.parts[0].text, body }),
       promptAsync: async ({ path, body }) => {
@@ -110,7 +113,7 @@ const makeHarness = async (report, { promptAsyncResult, options } = {}) => {
         }
         return undefined;
       },
-      messages: async () => [{ info: { role: "assistant" }, parts: [{ type: "text", text: report }] }],
+      messages: async () => [{ info: { role: "assistant" }, parts: [{ type: "text", text: currentReport }] }],
     },
     app: { log: async ({ body }) => logs.push(body) },
   };
@@ -129,11 +132,15 @@ const makeHarness = async (report, { promptAsyncResult, options } = {}) => {
     toasts,
     logs,
     aborted,
+    titles,
     addChild: (id, parentID) => {
       sessionInfo[id] = { id, parentID };
     },
     setDiff: (value) => {
       fixedDiff = value;
+    },
+    setReport: (value) => {
+      currentReport = value;
     },
     lastChild: () => `child-${childN}`,
     turn: async (parent, msgText) => {
@@ -408,6 +415,107 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
   await h.hooks["command.execute.before"]({ command: "mighty-review", sessionID: "cmd18" }, { parts: [] });
   await h.tick();
   assert.match(h.promptCalls[0].text, /NEVER substitute a different agent/, "anti-substitution rule present");
+}
+
+// 19. Progress tracking: phases inferred from tool activity in the review
+//     session surface via review_status, phase-transition toasts, and live
+//     session titles; the verdict lands in the title on completion.
+{
+  const h = await makeHarness("clean\n\nSHIP");
+  const status = h.hooks.tool.review_status;
+  await h.hooks["command.execute.before"]({ command: "mighty-review", sessionID: "prog-parent" }, { parts: [] });
+  await h.tick();
+  assert.ok((await status.execute({}, { sessionID: "prog-parent" })).includes("starting up"), "initial phase reported");
+
+  await h.hooks["tool.execute.before"]({ sessionID: "child-1", tool: "bash" }, { args: { command: "git diff" } });
+  assert.ok((await status.execute({}, { sessionID: "prog-parent" })).includes("mechanical gates"), "gates phase reported");
+  assert.ok(h.titles.some((t) => t.id === "child-1" && t.title.includes("gates")), "gates title set");
+
+  for (let i = 0; i < 3; i++) {
+    await h.hooks["tool.execute.before"]({ sessionID: "child-1", tool: "task" }, { args: {} });
+  }
+  assert.ok((await status.execute({}, { sessionID: "prog-parent" })).includes("0/3"), "critic dispatch counted");
+  assert.ok(h.toasts.some((t) => t.message.includes("critics running")), "critic dispatch toast shown once");
+  assert.equal(h.toasts.filter((t) => t.message.includes("critics running")).length, 1, "dispatch toast not repeated");
+
+  await h.hooks["tool.execute.after"]({ sessionID: "child-1", tool: "task" });
+  assert.ok((await status.execute({}, { sessionID: "prog-parent" })).includes("1/3"), "critic completion counted");
+  await h.hooks["tool.execute.after"]({ sessionID: "child-1", tool: "task" });
+  await h.hooks["tool.execute.after"]({ sessionID: "child-1", tool: "task" });
+  assert.ok((await status.execute({}, { sessionID: "prog-parent" })).includes("verifying"), "verifying phase reported");
+  assert.ok(h.toasts.some((t) => t.message.includes("verifying findings")), "verifying toast shown");
+
+  await h.hooks["tool.execute.before"]({ sessionID: "not-a-review", tool: "task" }, { args: {} });
+  assert.ok((await status.execute({}, { sessionID: "prog-parent" })).includes("verifying"), "foreign sessions do not disturb phase");
+
+  await h.childIdle("child-1");
+  assert.ok(h.titles.at(-1).title.includes("SHIP"), "verdict lands in the title");
+  const done = await status.execute({}, { sessionID: "prog-parent" });
+  assert.ok(done.includes("verdict: SHIP"), "completion still reports the verdict");
+}
+
+// 20. progressToasts: false suppresses phase toasts but keeps phase state.
+{
+  const h = await makeHarness("clean\n\nSHIP", { options: { progressToasts: false } });
+  await h.hooks["command.execute.before"]({ command: "mighty-review", sessionID: "quiet-parent" }, { parts: [] });
+  await h.tick();
+  await h.hooks["tool.execute.before"]({ sessionID: "child-1", tool: "task" }, { args: {} });
+  await h.hooks["tool.execute.after"]({ sessionID: "child-1", tool: "task" });
+  assert.ok(!h.toasts.some((t) => t.message.includes("Review progress")), "no progress toasts when disabled");
+  assert.ok(
+    (await h.hooks.tool.review_status.execute({}, { sessionID: "quiet-parent" })).includes("verifying"),
+    "phase still tracked for review_status",
+  );
+}
+
+// 21. A review session that idles WITHOUT a verdict (orchestrator launched
+//     critics as background tasks and ended its turn) is nudged back to
+//     collect results instead of being finalized with the launch
+//     acknowledgment as the report.
+{
+  const h = await makeHarness("All three critics launched. Waiting for their completion notifications.");
+  const status = h.hooks.tool.review_status;
+  await h.hooks["command.execute.before"]({ command: "mighty-review", sessionID: "nudge-parent" }, { parts: [] });
+  await h.tick();
+  assert.equal(h.promptCalls.length, 1, "review spawned");
+
+  await h.childIdle("child-1");
+  assert.equal(h.promptCalls.length, 2, "verdict-less idle triggers a nudge prompt");
+  assert.equal(h.promptCalls[1].id, "child-1", "nudge goes to the review session");
+  assert.match(h.promptCalls[1].text, /WITHOUT the required verdict/, "nudge demands the verdict");
+  assert.ok(
+    (await status.execute({}, { sessionID: "nudge-parent" })).includes("still in progress"),
+    "review stays running after a nudge",
+  );
+  assert.ok((await status.execute({}, { sessionID: "nudge-parent" })).includes("collecting"), "collecting phase reported");
+  assert.ok(h.toasts.some((t) => t.message.includes("nudged")), "nudge toast shown");
+
+  await h.childIdle("child-1");
+  assert.equal(h.promptCalls.length, 2, "duplicate idle with unchanged output absorbs, no double nudge");
+
+  h.setReport("full findings collected\n\nSHIP");
+  await h.childIdle("child-1");
+  const done = await status.execute({}, { sessionID: "nudge-parent" });
+  assert.ok(done.includes("verdict: SHIP"), "nudged review finalizes with the real verdict");
+  assert.ok(h.titles.at(-1).title.includes("SHIP"), "verdict title set after nudge cycle");
+}
+
+// 22. The nudge budget is capped: a review that never produces a verdict is
+//     finalized as-is instead of being nudged forever.
+{
+  const h = await makeHarness("launch ack, attempt 1");
+  await h.hooks["command.execute.before"]({ command: "mighty-review", sessionID: "cap-parent" }, { parts: [] });
+  await h.tick();
+  await h.childIdle("child-1");
+  h.setReport("still waiting, attempt 2");
+  await h.childIdle("child-1");
+  h.setReport("still waiting, attempt 3");
+  await h.childIdle("child-1");
+  assert.equal(h.promptCalls.filter((c) => c.id === "child-1").length, 3, "spawn plus exactly 2 nudges");
+  const done = await h.hooks.tool.review_status.execute({}, { sessionID: "cap-parent" });
+  assert.ok(done.includes("unknown"), "finalized without a verdict once the cap is hit");
+  assert.ok(done.includes("still waiting, attempt 3"), "last report still captured");
+  assert.ok(h.toasts.some((t) => t.message.includes("Background review finished")), "generic completion toast shown");
 }
 
 console.log("ALL SMOKE TESTS PASSED");

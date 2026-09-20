@@ -72,9 +72,16 @@ Or reference the clone directly from `opencode.json`:
 
 3. **Delivery**: toasts report when the review starts and the final verdict. Full findings live in the child session titled "Adversarial review". The coding agent (and you) can also query the verdict via the **`review_status` tool**, which returns running/done, the verdict, and the findings report.
 
+   **Progress tracking**: while the review runs, its phase is inferred from tool activity in the review session and surfaced three ways:
+   - `review_status` reports the current phase and elapsed time (e.g. "waiting on critics (2/3 returned), elapsed 3m 40s") instead of a bare "in progress",
+   - phase transitions emit toasts ("mechanical gates done, critics running", "critics done, verifying findings"); disable with `"progressToasts": false`,
+   - the review child's session title is renamed live ("Adversarial review - critics 1/3", "... - verifying", and finally the verdict), so the session list itself shows where the review is.
+
 4. **Feedback loop**: on **NO-SHIP**, the findings report is injected back into the parent session as a new prompt (fenced and marked as untrusted data), so the coding agent wakes up and fixes the P0/P1 findings. The fix turn triggers a fresh review. This is capped at **2 re-review cycles** per user message, plus an absolute cap of **10 injections** per session; if a cap is hit, the toast tells you to check the review session yourself. On SHIP nothing is injected.
 
 5. **Loop guard**: spawned review sessions are tracked so they never review themselves, each finished turn produces exactly one review, and the re-review cycle cap keeps review -> fix -> re-review from looping forever.
+
+6. **Stall guard**: if the review session goes idle **without** a SHIP/NO-SHIP verdict (e.g. the orchestrating agent launched the critics as background tasks and ended its turn early), the review is not finalized as a fizzle. The plugin re-prompts the review session to collect the critic results and emit the verdict, capped at 2 nudges, after which the review finalizes with whatever it has. Duplicate idle events never burn the nudge budget.
 
 ## Configuration
 
@@ -103,6 +110,7 @@ All options go in the plugin tuple form in `opencode.json`:
 | `ignore` | `[]` | Extra regex patterns (strings) for files to exclude from review |
 | `idleDebounceMs` | `1000` | Debounce for `session.idle` before triggering a review |
 | `enforceNoShip` | `false` | Block `git commit` / `git push` in a session while a NO-SHIP verdict is unresolved (until a later review SHIPs, e.g. via `/mighty-review`) |
+| `progressToasts` | `true` | Toast on review phase transitions (gates done / critics done); `review_status` and live session titles report progress regardless |
 | `updateCheck` | `true` | Check npm for a newer version a few seconds after startup |
 | `autoUpdate` | `true` | Install the newer version into opencode's plugin cache automatically (unpinned npm installs only); with `false` you get a notification toast instead |
 

@@ -29,20 +29,25 @@ assert.ok(cfg.agent["adversarial-risk-critic"].prompt.length > 100, "risk critic
 assert.ok(cfg.agent["adversarial-risk-critic"].prompt.includes("Weakened guardrails"), "risk critic checks weakened guardrails");
 assert.ok(cfg.agent["security-checklist-critic"], "security critic injected");
 assert.ok(cfg.agent["security-checklist-critic"].prompt.includes("Path traversal"), "security critic has checklist");
+assert.ok(cfg.agent["ai-slop-critic"], "slop critic injected");
+assert.ok(cfg.agent["ai-slop-critic"].prompt.includes("Negative parallelisms"), "slop critic carries the AI-writing tells");
+assert.ok(cfg.agent["ai-slop-critic"].prompt.includes("Needless defensive code"), "slop critic carries the code-slop rules");
+assert.ok(cfg.agent["ai-slop-critic"].prompt.includes("never issues P0"), "slop critic cannot issue P0");
 assert.equal(cfg.agent["design-principles-critic"].prompt, "mine", "user override preserved");
 
 // 3. config hook works when cfg.agent is absent, and registers the command.
 const cfg2 = {};
 hooks.config(cfg2);
+const CRITICS = ["adversarial-risk-critic", "design-principles-critic", "security-checklist-critic", "ai-slop-critic"];
 assert.ok(
-  cfg2.agent["adversarial-risk-critic"] && cfg2.agent["design-principles-critic"] && cfg2.agent["security-checklist-critic"],
+  CRITICS.every((name) => cfg2.agent[name]),
   "agents injected into empty config",
 );
 assert.ok(cfg2.command["mighty-review"], "mighty-review command registered");
 assert.ok(cfg2.command["mighty-review"].template.length > 0, "command has template");
 
 // 3b. False-positive controls baked into every critic.
-for (const name of ["adversarial-risk-critic", "design-principles-critic", "security-checklist-critic"]) {
+for (const name of CRITICS) {
   assert.ok(cfg2.agent[name].prompt.includes("Confidence 0.0-1.0"), `${name} has confidence rule`);
   assert.ok(cfg2.agent[name].prompt.includes("deterministic tooling"), `${name} has CI-boundary rule`);
   assert.equal(cfg2.agent[name].temperature, 0.1, `${name} pins temperature`);
@@ -61,7 +66,7 @@ const disabled = await plugin({ client, directory: "/tmp", worktree: "/tmp", $ }
 assert.deepEqual(Object.keys(disabled), [], "disabled via options returns no hooks");
 
 // 5. Critic agents are mechanically read-only (no mutation tools, no shell, no delegation).
-for (const name of ["adversarial-risk-critic", "design-principles-critic", "security-checklist-critic"]) {
+for (const name of CRITICS) {
   const tools = cfg2.agent[name].tools;
   for (const denied of ["edit", "write", "patch", "bash", "task"]) {
     assert.equal(tools[denied], false, `${name} denies ${denied}`);
@@ -409,12 +414,17 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
   assert.equal(h2.promptCalls[0].body.agent, undefined, "no agent forced by default");
 }
 
-// 18. Review prompt forbids substituting other agents for the critics.
+// 18. Review prompt forbids substituting other agents for the critics, and
+//     dispatches every registered critic by its exact name.
 {
   const h = await makeHarness("clean\n\nSHIP");
   await h.hooks["command.execute.before"]({ command: "mighty-review", sessionID: "cmd18" }, { parts: [] });
   await h.tick();
   assert.match(h.promptCalls[0].text, /NEVER substitute a different agent/, "anti-substitution rule present");
+  assert.match(h.promptCalls[0].text, /FOUR subagents IN PARALLEL/, "orchestrator told to dispatch four critics");
+  for (const name of CRITICS) {
+    assert.ok(h.promptCalls[0].text.includes(`\`${name}\``), `review prompt dispatches ${name}`);
+  }
 }
 
 // 19. Progress tracking: phases inferred from tool activity in the review
@@ -431,16 +441,18 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
   assert.ok((await status.execute({}, { sessionID: "prog-parent" })).includes("mechanical gates"), "gates phase reported");
   assert.ok(h.titles.some((t) => t.id === "child-1" && t.title.includes("gates")), "gates title set");
 
-  for (let i = 0; i < 3; i++) {
+  for (let i = 0; i < CRITICS.length; i++) {
     await h.hooks["tool.execute.before"]({ sessionID: "child-1", tool: "task" }, { args: {} });
   }
-  assert.ok((await status.execute({}, { sessionID: "prog-parent" })).includes("0/3"), "critic dispatch counted");
+  assert.ok((await status.execute({}, { sessionID: "prog-parent" })).includes("0/4"), "critic dispatch counted");
   assert.ok(h.toasts.some((t) => t.message.includes("critics running")), "critic dispatch toast shown once");
   assert.equal(h.toasts.filter((t) => t.message.includes("critics running")).length, 1, "dispatch toast not repeated");
 
   await h.hooks["tool.execute.after"]({ sessionID: "child-1", tool: "task" });
-  assert.ok((await status.execute({}, { sessionID: "prog-parent" })).includes("1/3"), "critic completion counted");
+  assert.ok((await status.execute({}, { sessionID: "prog-parent" })).includes("1/4"), "critic completion counted");
   await h.hooks["tool.execute.after"]({ sessionID: "child-1", tool: "task" });
+  await h.hooks["tool.execute.after"]({ sessionID: "child-1", tool: "task" });
+  assert.ok((await status.execute({}, { sessionID: "prog-parent" })).includes("3/4"), "phase stays on critics until the last one returns");
   await h.hooks["tool.execute.after"]({ sessionID: "child-1", tool: "task" });
   assert.ok((await status.execute({}, { sessionID: "prog-parent" })).includes("verifying"), "verifying phase reported");
   assert.ok(h.toasts.some((t) => t.message.includes("verifying findings")), "verifying toast shown");
@@ -473,7 +485,7 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
 //     collect results instead of being finalized with the launch
 //     acknowledgment as the report.
 {
-  const h = await makeHarness("All three critics launched. Waiting for their completion notifications.");
+  const h = await makeHarness("All four critics launched. Waiting for their completion notifications.");
   const status = h.hooks.tool.review_status;
   await h.hooks["command.execute.before"]({ command: "mighty-review", sessionID: "nudge-parent" }, { parts: [] });
   await h.tick();

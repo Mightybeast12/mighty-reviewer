@@ -2,13 +2,14 @@
 
 An [opencode](https://opencode.ai) plugin that runs an **automatic background adversarial code review** whenever a turn actually writes code, and reports a terse **SHIP / NO-SHIP** verdict via toast.
 
-Mechanical gates (typecheck, lint, debug-output scan) run first, then three critics are consulted in parallel:
+Mechanical gates (typecheck, lint, debug-output scan) run first, then four critics are consulted in parallel:
 
 | Critic | Focus |
 | --- | --- |
 | `adversarial-risk-critic` | Attacks risky surfaces: auth, data loss, concurrency, external I/O, error paths, gamed tests, weakened lint/typecheck configs |
 | `design-principles-critic` | Enforces DRY, SOLID, separation of concerns, abstraction boundaries, size/complexity signals, systems-design choices |
 | `security-checklist-critic` | Walks an OWASP-style checklist: secrets, injection, XSS, path traversal, authz, input validation, dependencies |
+| `ai-slop-critic` | Hunts AI-authoring residue. In code: narrating comments, needless defensive checks, `any` casts, style drift, emoji. In prose (comments, docs, UI copy, messages): the tells from Wikipedia's [Signs of AI writing](https://en.wikipedia.org/wiki/Wikipedia:Signs_of_AI_writing), such as AI vocabulary, puffery, negative parallelisms, bold inline-header lists, em dashes, chatbot leftovers, placeholder text, leaked citation markup, and documentation claims the code does not back |
 
 All agents are registered by the plugin itself, so the package is fully self-contained: no agent files to copy.
 
@@ -57,25 +58,25 @@ Or reference the clone directly from `opencode.json`:
 2. **Review**: a background **child session** is spawned (so the review never clutters your conversation). It:
    - runs `git diff` including untracked files,
    - runs **mechanical gates** first: the project's own typecheck/lint (e.g. `tsc --noEmit`, `ruff check`, `go vet`, `cargo check`), a scan for leftover debug output, and a check for weakened linter/formatter/typechecker configs. Any failure is an automatic P1 finding,
-   - delegates to `adversarial-risk-critic`, `design-principles-critic`, and `security-checklist-critic` in parallel, passing the gate results as context,
+   - delegates to `adversarial-risk-critic`, `design-principles-critic`, `security-checklist-critic`, and `ai-slop-critic` in parallel, passing the gate results as context,
    - injects language-specific guidance (TypeScript, Go, Python, Rust, Java/Kotlin, SQL, shell) based on the extensions of the changed files,
    - **adversarially verifies** every P0/P1 finding before accepting it (reads the full file, checks imports/declarations/callers, drops anything refutable; when uncertain, drops it), deduplicates findings across critics, and merges the survivors with the gate findings into one severity-ranked (P0-P3) list with file:line evidence,
    - runs diagnostics on every changed file,
    - outputs the **full findings report** (every finding with severity, file:line, what is wrong, and the suggested minimal fix),
    - issues a single verdict: **SHIP** or **NO-SHIP**. Any failed mechanical gate or verified P0/P1 finding forces NO-SHIP.
 
-   Critics carry built-in false-positive controls: a confidence threshold (findings under 0.7 confidence are omitted), a "no failure scenario, no P0/P1" rule, and a CI-boundary rule so they never re-report what the mechanical gates already caught. They run at temperature 0.1 for consistent verdicts.
+   Critics carry built-in false-positive controls: a confidence threshold (findings under 0.7 confidence are omitted), a "no failure scenario, no P0/P1" rule, and a CI-boundary rule so they never re-report what the mechanical gates already caught. They run at temperature 0.1 for consistent verdicts. The `ai-slop-critic` is further capped: it never issues P0, treats a lone tell as P3, and reserves P1 for chatbot residue or placeholder text in shipped prose and for documentation that is false about the code, so slop alone rarely blocks a SHIP.
 
-   The review is **read-only**: the three critic agents are registered with `edit`/`write`/`patch`/`bash`/`task` disabled (enforced by mechanism), and the orchestrating review session runs with `edit`/`write`/`patch` disabled. The orchestrator keeps `bash` for the mechanical gates, where read-only use is enforced by prompt instructions only, not by mechanism. It lists everything wrong; you decide what to act on.
+   The review is **read-only**: the four critic agents are registered with `edit`/`write`/`patch`/`bash`/`task` disabled (enforced by mechanism), and the orchestrating review session runs with `edit`/`write`/`patch` disabled. The orchestrator keeps `bash` for the mechanical gates, where read-only use is enforced by prompt instructions only, not by mechanism. It lists everything wrong; you decide what to act on.
 
    A watchdog aborts any review child still running after 10 minutes.
 
 3. **Delivery**: toasts report when the review starts and the final verdict. Full findings live in the child session titled "Adversarial review". The coding agent (and you) can also query the verdict via the **`review_status` tool**, which returns running/done, the verdict, and the findings report.
 
    **Progress tracking**: while the review runs, its phase is inferred from tool activity in the review session and surfaced three ways:
-   - `review_status` reports the current phase and elapsed time (e.g. "waiting on critics (2/3 returned), elapsed 3m 40s") instead of a bare "in progress",
+   - `review_status` reports the current phase and elapsed time (e.g. "waiting on critics (2/4 returned), elapsed 3m 40s") instead of a bare "in progress",
    - phase transitions emit toasts ("mechanical gates done, critics running", "critics done, verifying findings"); disable with `"progressToasts": false`,
-   - the review child's session title is renamed live ("Adversarial review - critics 1/3", "... - verifying", and finally the verdict), so the session list itself shows where the review is.
+   - the review child's session title is renamed live ("Adversarial review - critics 1/4", "... - verifying", and finally the verdict), so the session list itself shows where the review is.
 
 4. **Feedback loop**: on **NO-SHIP**, the findings report is injected back into the parent session as a new prompt (fenced and marked as untrusted data), so the coding agent wakes up and fixes the P0/P1 findings. The fix turn triggers a fresh review. This is capped at **2 re-review cycles** per user message, plus an absolute cap of **10 injections** per session; if a cap is hit, the toast tells you to check the review session yourself. On SHIP nothing is injected.
 
@@ -104,7 +105,7 @@ All options go in the plugin tuple form in `opencode.json`:
 | --- | --- | --- |
 | `disabled` | `false` | Turn the plugin off |
 | `model` | session default | `provider/model` used by the review orchestrator session |
-| `criticModel` | agent default | `provider/model` for the three critic subagents (route them to a cheaper model) |
+| `criticModel` | agent default | `provider/model` for the four critic subagents (route them to a cheaper model) |
 | `agent` | session default | Agent that orchestrates the review session. It needs the `task` tool. Set this if your default agent is pinned to a model your provider does not serve, or lacks `task` (common with agent packs) |
 | `maxDiffLines` | `2000` | Skip review when more changed lines than this (lockfiles/generated excluded from the count) |
 | `ignore` | `[]` | Extra regex patterns (strings) for files to exclude from review |
@@ -156,7 +157,7 @@ Use the tuple form in `opencode.json`:
 
 ### Customize the critics
 
-The plugin registers its agents only if you have not defined agents with the same names. To override a critic, define your own agent named `adversarial-risk-critic`, `design-principles-critic`, or `security-checklist-critic` (in `opencode.json` or as `~/.config/opencode/agent/<name>.md`) and it takes precedence.
+The plugin registers its agents only if you have not defined agents with the same names. To override a critic, define your own agent named `adversarial-risk-critic`, `design-principles-critic`, `security-checklist-critic`, or `ai-slop-critic` (in `opencode.json` or as `~/.config/opencode/agent/<name>.md`) and it takes precedence.
 
 ## Requirements
 

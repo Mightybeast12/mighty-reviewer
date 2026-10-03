@@ -14,7 +14,7 @@
  *             only read files / ran commands / chatted without writing code.
  * Review:     Mechanical gates run first (project typecheck/lint, debug-output
  *             scan, lint-config-weakening check); any failure is an automatic
- *             P1. Then three subagents are consulted in parallel:
+ *             P1. Then four subagents are consulted in parallel:
  *               - adversarial-risk-critic: attacks risky surfaces (auth,
  *                 data loss, concurrency, external I/O, error paths,
  *                 weakened guardrails).
@@ -24,6 +24,12 @@
  *               - security-checklist-critic: walks an OWASP-style checklist
  *                 (secrets, injection, XSS, path traversal, authz,
  *                 dependencies) over the diff.
+ *               - ai-slop-critic: hunts AI-authoring residue in code
+ *                 (narrating comments, needless defensive checks, `any`
+ *                 casts, style drift, emoji) and in prose (the tells from
+ *                 Wikipedia's "Signs of AI writing": vocabulary, puffery,
+ *                 negative parallelisms, bold inline-header lists, em
+ *                 dashes, chatbot leftovers, placeholders, leaked markup).
  *             Language-specific guidance (TS, Go, Python, Rust, etc.) is
  *             injected based on the extensions of the changed files.
  *             All subagents are registered by this plugin via the `config`
@@ -157,6 +163,7 @@ const CODE_WRITING_TOOLS = new Set(["edit", "write", "patch", "multiedit", "appl
 const RISK_AGENT = "adversarial-risk-critic";
 const DESIGN_AGENT = "design-principles-critic";
 const SECURITY_AGENT = "security-checklist-critic";
+const SLOP_AGENT = "ai-slop-critic";
 
 // Critic agents are review-only and never need a shell: deny the mutating
 // tools AND bash/task, so the read-only contract is enforced by mechanism.
@@ -238,7 +245,8 @@ const AGENT_DEFINITIONS = {
       "4. Abstraction quality: wrong or leaky boundaries, premature abstraction for a single caller, missing abstraction where call sites already diverge, helpers that obscure rather than clarify.",
       "5. Systems-design choices: data ownership and flow, state placement, synchronous versus asynchronous boundaries, whether the change fights or follows the existing architecture.",
       "6. Size and complexity thresholds (treat as signals, not absolute rules): new or grown functions over ~50 lines, files over ~800 lines, nesting deeper than 4 levels. Flag only when the size reflects a real SRP or readability problem, and severity is at most P2 unless it compounds another finding.",
-      "7. Comment noise: new comments that restate what the code already says, narrate obvious data structures or control flow, or label sections instead of extracting well-named functions. Flag each with the fix 'delete the comment' (or 'rename/extract so the code explains itself'). Severity P3, or P2 when the noise is pervasive across the diff. Comments that earn their keep are NOT findings: non-obvious invariants, security or concurrency constraints, tricky algorithms, regexes, and why-not-what explanations.",
+      "",
+      "Comment quality, defensive-code noise, and other AI-authoring residue are the ai-slop-critic's job; do not report them.",
       "",
       "Respect the codebase's own conventions. If the surrounding code deliberately favors duplication over coupling, or a simple procedural style, do not impose textbook patterns against the grain. A principle violation only counts when it creates real maintenance cost.",
       "",
@@ -286,6 +294,56 @@ const AGENT_DEFINITIONS = {
       CONFIDENCE_RULE,
       "",
       "Report ONLY material findings. If nothing on the checklist fires, say so in one sentence and stop. Do not pad the report.",
+    ].join("\n"),
+  },
+  [SLOP_AGENT]: {
+    description:
+      "AI-slop critique of a code change. Hunts the residue AI-assisted authoring leaves behind, in code (narrating comments, needless defensive checks, `any` casts, style drift, emoji) and in prose (AI vocabulary, puffery, negative parallelisms, bold inline-header lists, em dashes, chatbot leftovers, placeholder text, leaked citation markup, claims the code does not back), reporting severity-ranked findings with file:line evidence.",
+    mode: "subagent",
+    temperature: 0.1,
+    tools: { ...CRITIC_TOOLS },
+    prompt: [
+      "You are an AI-slop critic. Your job is to find the residue that AI-assisted authoring leaves in a code change: text and code a careful human author would not have left in. Structure (DRY/SOLID) and risk (auth, data loss, error paths) are other reviewers' jobs. You review ONLY the changed lines you are given, plus enough of each surrounding file to judge what that file's own conventions are.",
+      READ_ONLY_RULE,
+      CI_BOUNDARY_RULE,
+      "",
+      "Two surfaces, both in scope: (A) the changed CODE, and (B) every changed line of natural-language PROSE: comments, docstrings, README and docs, changelogs, commit and PR templates, UI copy, log and error messages, CLI help text.",
+      "",
+      "A. CODE SLOP. Flag only what is inconsistent with the rest of the file; a pattern the file already uses everywhere is a convention, not slop.",
+      "1. Comment noise: comments that restate what the code says, narrate obvious control flow or data structures, label sections instead of extracting well-named functions, or that a human would not add in this file. Fix: delete the comment, or rename/extract so the code explains itself. Comments that earn their keep are NOT findings: non-obvious invariants, security or concurrency constraints, tricky algorithms, regexes, why-not-what explanations.",
+      "2. Needless defensive code: null/undefined/type checks, try/catch blocks, fallbacks, or re-validation that are abnormal for that area of the codebase, especially on paths whose callers already validated the input or where the framework guarantees the shape. These obscure the real contract.",
+      "3. Type escape hatches: casts to any, unchecked casts, or suppressions added to get past a type error when a correct type was available.",
+      "4. Style drift: formatting, naming, idioms, import style, quote style, or error-handling style that differs from the surrounding file for no reason.",
+      "5. Emoji in code, comments, log output, or commit templates where the file or project does not already use them.",
+      "",
+      "B. PROSE SLOP. These are the tells catalogued in Wikipedia's 'Signs of AI writing' (WP:AISIGNS), adapted to repositories. One tell in isolation is weak evidence; flag clusters, formulaic repetition, and any tell that carries an empty or false claim.",
+      "1. Vocabulary density: Additionally (sentence-initial), align with, boasts, bolstered, crucial, deep dive, delve, emphasizing, enduring, enhance, fostering, garner, highlight (verb), interplay, intricate, key (adjective), landscape (abstract), meticulous, pivotal, robust, showcase, tapestry, testament, underscore (verb), valuable, vibrant; plus the repo-flavored seamless, leverage, streamline, comprehensive, elegant, powerful. Take the list literally: synonyms are not tells.",
+      "2. Puffery and undue significance: 'stands/serves as a testament', 'plays a crucial/pivotal/key role', 'underscores/highlights the importance', 'reflects broader', 'setting the stage', 'marks a shift', 'evolving landscape', 'in the heart of', 'diverse array'; marketing tone in docs ('cutting-edge', 'best-in-class'). In code docs this usually dresses up a claim the code does not make good on ('robust error handling' over a bare catch, 'secure by default' with no mechanism): then the finding is the false claim, not the adjective.",
+      "3. Superficial analysis: a trailing present-participle clause bolted onto a sentence to assert impact ('..., ensuring reliability', '..., highlighting its flexibility', '..., contributing to maintainability', 'fostering', 'encompassing', 'enhancing'). Fix: cut it, or replace it with the specific fact.",
+      "4. Avoided copulas: 'serves as', 'stands as', 'functions as', 'operates as', 'represents a', 'refers to' where 'is' would do.",
+      "5. Negative parallelisms: 'not just X, but (also) Y', 'not X, but Y', 'It's not ..., it's ...', 'no X, no Y, just Z', and the reversed 'Y rather than X'.",
+      "6. Rule of three: formulaic triplets ('fast, reliable, and secure') used to pad rather than enumerate.",
+      "7. Vague attribution: 'experts recommend', 'best practices suggest', 'it is widely known', 'industry standard' with no source.",
+      "8. Formulaic structure: 'Despite these challenges', 'Future Outlook' or 'Challenges' sections, 'In summary / In conclusion / Overall' wrap-ups, 'It's important/crucial to note', 'worth noting'.",
+      "9. Formatting tells: Title Case headings, headings that only contain other headings, skipped heading levels, mechanical boldface on every mention of a term, bullet lists whose items are a bold inline header plus a colon ('- **Caching:** ...'), tables for non-tabular content, horizontal rules between sections, emoji decorating headings or bullets, the em dash character (U+2014, especially with spaces around it) where a comma, colon, or parentheses would do, curly quotes or apostrophes mixed into a straight-quote file.",
+      "10. Markdown where it will not render: **bold**, # headings, or bullet markup inside code comments, docstrings, plain-text config, YAML descriptions, log or error strings, CLI output.",
+      "11. Chatbot residue: 'I hope this helps', 'Certainly!', 'Of course!', 'You're absolutely right', 'Would you like me to', 'let me know', 'Here is a', 'as an AI language model', knowledge-cutoff or source-availability disclaimers ('as of my last update', 'while specific details are limited', 'based on available information'), and leaked citation or tool markup: oaicite, contentReference, turn0search, attributableIndex, [cite: N], [span_N](start_span), grok_card, attached_file, ppl-ai-file-upload, :::writing, lenticular brackets, dagger citation marks.",
+      "12. Placeholder text: '[Insert ...]', '[Your Name]', '[Company]', '<placeholder>', 'Lorem ipsum', 'TODO: describe', 'Project Name', or any fill-in-the-blank template left unfilled.",
+      "13. Hallucinated references: docs or comments that name functions, files, flags, options, packages, or URLs that do not exist in this repository or its dependencies. Verify with the read and grep tools before reporting; if you cannot verify, do not report.",
+      "",
+      "NOT findings: perfect grammar, formal or academic register, 'bland' prose, a single transition word, a single vocabulary word, anything inside a quoted word list, test fixture, or prompt that deliberately enumerates these patterns, and any pattern the file already used before this change.",
+      "",
+      "For each finding provide:",
+      "- Severity P1-P3 (this critic never issues P0):",
+      "  - P1: chatbot residue, placeholder text, or leaked tool markup in user-facing or shipped text (README, docs, UI copy, error messages, API docs, help text); documentation or comments that assert something false about the code (hallucinated symbol, guarantee the code does not make).",
+      "  - P2: a type escape hatch where a correct type was available; defensive code that hides a real contract on a trusted path; the same slop pattern repeated three or more times across the diff; style drift that will cause churn.",
+      "  - P3: an individual tell (one narrating comment, one negative parallelism, one em dash, one Title Case heading, one lone emoji, one wrap-up paragraph).",
+      "- Exact location (file:line) and the exact text, quoted.",
+      "- Which tell it is, and what the sentence or code should actually say (often: nothing).",
+      "- The minimal fix: delete, or rewrite as a plain statement of the specific fact.",
+      CONFIDENCE_RULE,
+      "",
+      "Report ONLY material findings. If the change is clean, say so in one sentence and stop. Do not pad the report, and do not exhibit any of the patterns above in your own report.",
     ].join("\n"),
   },
 };
@@ -358,7 +416,7 @@ function buildReviewPrompt(languageHints, projectRules) {
     "   - Scan the changed files for leftover debug output (console.log, print-debugging, debugger statements) and commented-out code blocks.",
     "   - Check whether the diff touches linter/formatter/typechecker config (.eslintrc*, biome.json*, tsconfig*, .prettierrc*, ruff.toml, clippy.toml) in a way that WEAKENS rules.",
     "   Every mechanical failure is an automatic P1 finding. Record them; never fix anything.",
-    "3. Delegate the critique to THREE subagents IN PARALLEL (fire all three task calls in the same message, then wait for all). The critic tasks must run in the FOREGROUND: NEVER launch them as background tasks, and NEVER end your turn while any critique is still pending or the final verdict line is missing. Give each: the mechanical-gate results as context, the project review rules above (if any), and these standing orders: it is strictly read-only, it must not report anything the mechanical gates already cover, and it must omit findings it is less than 70% confident are real and material:",
+    "3. Delegate the critique to FOUR subagents IN PARALLEL (fire all four task calls in the same message, then wait for all). The critic tasks must run in the FOREGROUND: NEVER launch them as background tasks, and NEVER end your turn while any critique is still pending or the final verdict line is missing. Give each: the mechanical-gate results as context, the project review rules above (if any), and these standing orders: it is strictly read-only, it must not report anything the mechanical gates already cover, and it must omit findings it is less than 70% confident are real and material:",
     `   a. \`${RISK_AGENT}\` - adversarial risk critique. Its job is to BREAK confidence, not validate:`,
     "      - Attack the most expensive/risky surfaces first (auth, data loss, concurrency, external I/O, error paths).",
     "      - Report ONLY material findings, each with concrete evidence (file:line) and a severity P0-P3.",
@@ -370,7 +428,10 @@ function buildReviewPrompt(languageHints, projectRules) {
     `   c. \`${SECURITY_AGENT}\` - checklist-driven security review:`,
     "      - Walk the OWASP-style checklist (secrets, injection, XSS, path traversal, authz, input validation, dependencies) over the diff.",
     "      - Report ONLY material findings, each with concrete evidence (file:line) and a severity P0-P3.",
-    "   Use the task tool with subagent_type set to those exact agent names. NEVER substitute a different agent (explore, librarian, general, ...) for a critic: they run with other rubrics. If you have no way to delegate to the critics at all, perform all three critiques yourself in this session, one after another, applying each rubric above.",
+    `   d. \`${SLOP_AGENT}\` - AI-slop critique of code and prose:`,
+    "      - Hunt AI-authoring residue in the changed code (narrating comments, needless defensive checks, `any` casts, style drift, emoji) and in every changed line of prose (AI vocabulary, puffery, negative parallelisms, bold inline-header lists, em dashes, chatbot leftovers, placeholder text, leaked citation markup, documentation claims the code does not back).",
+    "      - Report ONLY material findings, each with concrete evidence (file:line, quoted text) and a severity P1-P3: slop is P3 by default, P2 when a pattern repeats across the diff, P1 only for chatbot residue or placeholder text in shipped text and for documentation that is false about the code.",
+    "   Use the task tool with subagent_type set to those exact agent names. NEVER substitute a different agent (explore, librarian, general, ...) for a critic: they run with other rubrics. If you have no way to delegate to the critics at all, perform all four critiques yourself in this session, one after another, applying each rubric above.",
     ...(languageHints.length
       ? [
           "4. Language-specific attention for this diff (pass these to the relevant critics):",

@@ -47,6 +47,7 @@ OpenCode 2 requires a package directory here (it resolves `index.js` and the TUI
 ### OpenCode 2 notes
 
 - **Toasts** come from a TUI companion module (`mighty-reviewer/tui`) that OpenCode 2 loads alongside the server plugin. Each notice is also queued as a `mighty-reviewer` entry in the session it concerns, where it enters the conversation on the next turn without waking the agent.
+- **Sidebar panel**: the same TUI module adds a "Mighty Reviewer" box to the right sidebar, styled to sit next to the oh-my-opencode-slim agent panel. See [Sidebar panel](#sidebar-panel-opencode-2).
 - **The review session is a root session**, not a child of the coding session. OpenCode 2 caps nested subagents at depth 1 (`experimental.subagent_depth`), and a nested review session could not spawn its four critics. The parent link is stored in the review session's metadata, and the toast offers to open the review session.
 - **`enforceNoShip`** denies `git commit` / `git push` through the permission hook, so a blocked command shows up as a permission denial carrying the reviewer's message.
 - Tool names differ between hosts (`bash` is `shell`, `task` is `subagent`); progress tracking and the critic permissions account for both.
@@ -92,6 +93,35 @@ OpenCode 2 requires a package directory here (it resolves `index.js` and the TUI
 5. **Loop guard**: spawned review sessions are tracked so they never review themselves, each finished turn produces exactly one review, and the re-review cycle cap keeps review -> fix -> re-review from looping forever.
 
 6. **Stall guard**: if the review session goes idle **without** a SHIP/NO-SHIP verdict (e.g. the orchestrating agent launched the critics as background tasks and ended its turn early), the review is not finalized as a fizzle. The plugin re-prompts the review session to collect the critic results and emit the verdict, capped at 2 nudges, after which the review finalizes with whatever it has. Duplicate idle events never burn the nudge budget.
+
+### Sidebar panel (OpenCode 2)
+
+While you are in a session that has a review, the right sidebar shows a small panel:
+
+```
+┌────────────────────────────────────┐
+│ ▼ Mighty Reviewer          running │
+│ ⠋ review               critics 3/4 │
+│   ⠋ adversarial-risk               │
+│   ✓ design-principles        clean │
+│   ✓ security-checklist   1 P1 2 P3 │
+│   ✓ ai-slop                   1 P3 │
+│                                    │
+│ Critic counts are raw, before the  │
+│ review checks them.                │
+└────────────────────────────────────┘
+```
+
+- A spinner marks anything still running, `✓` marks a critic that has returned. The phase on the `review` row comes from the review session's title.
+- Once a critic returns, its row shows how many findings it reported at each severity (P0 and P1 in red, P2 in amber, P3 muted), or `clean` when it reported none.
+- These are each critic's own findings, before the review session verifies and merges them. The review drops findings it can refute and merges duplicates across critics, so the totals can differ from the final verdict. The review session has the final list.
+- When the review finishes the panel folds to one line with the verdict (`SHIP`, `NO-SHIP`, `done`, or `timed out`). Click the header to unfold it and see the per-critic counts again.
+- Click the `review` row or a critic row to open that session.
+- The panel follows the session tree you are looking at and shows its most recent review. In a session that has no review yet it stays folded with `idle`, so it keeps its place in the sidebar like the other panels.
+
+The panel reads session titles, status, and critic reports from the TUI's own session data, so it needs no extra setup. After a restart, when the TUI has not loaded past review sessions yet, it asks the server for recent sessions to find them. On a TUI without sidebar slots it is skipped and toasts keep working.
+
+How findings are counted: a finding is a line that starts with a severity tag (`### [P1] ...`, `- **P2** ...`, `| P3 | file:line |`, `P1: ...`), a `Severity: P1` field, or a list item under a heading that is only a severity (`### P1`). Severity mentions inside sentences, ranges like `P0-P3`, tallies like `P1: 2`, and code blocks are ignored.
 
 ## Configuration
 

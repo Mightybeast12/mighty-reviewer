@@ -13,6 +13,7 @@
     "index.js",
     "v2.js",
     "tui.js",
+    "sidebar.js",
     "internals.js",
     "README.md",
     "LICENSE"

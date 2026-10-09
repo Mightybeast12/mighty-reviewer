@@ -114,6 +114,7 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 
 import { PKG_NAME, compareSemver, describeInstall, extractVerdict } from "./internals.js";
+import { createV2Setup } from "./v2.js";
 
 const REVIEW_MARKER = "<!--adversarial-review-auto-->";
 const FEEDBACK_MARKER = "<!--adversarial-review-feedback-->";
@@ -431,7 +432,7 @@ function buildReviewPrompt(languageHints, projectRules) {
     `   d. \`${SLOP_AGENT}\` - AI-slop critique of code and prose:`,
     "      - Hunt AI-authoring residue in the changed code (narrating comments, needless defensive checks, `any` casts, style drift, emoji) and in every changed line of prose (AI vocabulary, puffery, negative parallelisms, bold inline-header lists, em dashes, chatbot leftovers, placeholder text, leaked citation markup, documentation claims the code does not back).",
     "      - Report ONLY material findings, each with concrete evidence (file:line, quoted text) and a severity P1-P3: slop is P3 by default, P2 when a pattern repeats across the diff, P1 only for chatbot residue or placeholder text in shipped text and for documentation that is false about the code.",
-    "   Use the task tool with subagent_type set to those exact agent names. NEVER substitute a different agent (explore, librarian, general, ...) for a critic: they run with other rubrics. If you have no way to delegate to the critics at all, perform all four critiques yourself in this session, one after another, applying each rubric above.",
+    "   Use the task tool (named `subagent` on OpenCode 2, where the agent name goes in its `agent` parameter) with subagent_type set to those exact agent names. NEVER substitute a different agent (explore, librarian, general, ...) for a critic: they run with other rubrics. If you have no way to delegate to the critics at all, perform all four critiques yourself in this session, one after another, applying each rubric above.",
     ...(languageHints.length
       ? [
           "4. Language-specific attention for this diff (pass these to the relevant critics):",
@@ -659,6 +660,17 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
   // once per session; the parent link never changes.
   const sessionParents = new Map();
 
+  // Timers owned by this factory instance, so dispose() can cancel them when
+  // the host unloads the plugin (hot reload on OpenCode 2) without touching
+  // another instance's reviews.
+  const ownedTimers = new Set();
+
+  function ownTimer(timer) {
+    timer.unref?.();
+    ownedTimers.add(timer);
+    return timer;
+  }
+
   async function parentOf(sessionID) {
     if (sessionParents.has(sessionID)) return sessionParents.get(sessionID);
     let parent = null;
@@ -813,9 +825,12 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
     if (res?.error) throw new Error(`prompt rejected: ${JSON.stringify(res.error)}`);
   }
 
-  async function showToast(message, variant) {
+  // sessionID names the session the notice is about. The v1 host ignores
+  // it (toasts are global there); the v2 bridge delivers the notice into that
+  // session, because v2 server plugins have no toast API.
+  async function showToast(message, variant, sessionID) {
     try {
-      await client.tui.showToast({ body: { title: "mighty-reviewer", message, variant } });
+      await client.tui.showToast({ body: { title: "mighty-reviewer", message, variant } }, sessionID);
     } catch {
       // Toast is best-effort.
     }
@@ -917,16 +932,16 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
         // Abort is best-effort.
       }
       void setReviewTitle(reviewSessionID, "timed out");
-      await showToast("Background review timed out and was aborted.", "warning");
+      await showToast("Background review timed out and was aborted.", "warning", parentSessionID);
     }, REVIEW_TIMEOUT_MS);
-    timer.unref?.();
-    reviewWatchdogs.set(reviewSessionID, timer);
+    reviewWatchdogs.set(reviewSessionID, ownTimer(timer));
   }
 
   function clearWatchdog(reviewSessionID) {
     const timer = reviewWatchdogs.get(reviewSessionID);
     if (timer) {
       clearTimeout(timer);
+      ownedTimers.delete(timer);
       reviewWatchdogs.delete(reviewSessionID);
     }
   }
@@ -937,7 +952,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       const allFiles = await changedFileNames();
       const files = allFiles.filter((f) => !isIgnoredFile(f));
       if (allFiles.length && !files.length) {
-        if (viaCommand) await showToast("Only ignored files changed, review skipped.", "info");
+        if (viaCommand) await showToast("Only ignored files changed, review skipped.", "info", sessionID);
         return;
       }
       const diffLines = await diffLineCount();
@@ -945,6 +960,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
         await showToast(
           `Diff too large for review (${diffLines} lines > ${maxDiffLines}), skipped.`,
           "warning",
+          sessionID,
         );
         return;
       }
@@ -975,6 +991,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
           ? "Review requested, running in background..."
           : "Code changed, running background review...",
         "info",
+        sessionID,
       );
 
       await sendPrompt(reviewSessionID, reviewPrompt, {
@@ -1093,7 +1110,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       variant = "success";
     }
 
-    await showToast(message, variant);
+    await showToast(message, variant, parentSessionID);
   }
 
   // Returns true when the verdict-less review session was sent back to work
@@ -1126,6 +1143,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
     await showToast(
       `Review ended without a verdict; nudged it to collect critic results (${count + 1}/${MAX_VERDICT_NUDGES}).`,
       "warning",
+      parentSessionID,
     );
     return true;
   }
@@ -1191,10 +1209,11 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
 
   if (updateCheck && !updateCheckScheduled) {
     updateCheckScheduled = true;
-    const updateTimer = setTimeout(() => {
-      void checkForUpdate();
-    }, UPDATE_CHECK_DELAY_MS);
-    updateTimer.unref?.();
+    ownTimer(
+      setTimeout(() => {
+        void checkForUpdate();
+      }, UPDATE_CHECK_DELAY_MS),
+    );
   }
 
   return {
@@ -1345,10 +1364,22 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
         pendingIdleTimers.delete(sessionID);
         void handleParentIdle(sessionID);
       }, idleDebounceMs);
-      timer.unref?.();
-      pendingIdleTimers.set(sessionID, timer);
+      pendingIdleTimers.set(sessionID, ownTimer(timer));
+    },
+    dispose: () => {
+      for (const timer of ownedTimers) clearTimeout(timer);
+      ownedTimers.clear();
     },
   };
 };
 
-export default MightyReviewer;
+// Dual-host module: OpenCode 1.18.29+ reads `server`, OpenCode 2 reads
+// `id` + `setup`. Both run the same MightyReviewer factory; v2.js adapts the
+// v2 plugin context to the v1 hook and client surface it expects.
+const plugin = {
+  id: PKG_NAME,
+  setup: createV2Setup(MightyReviewer),
+  server: MightyReviewer,
+};
+
+export default plugin;

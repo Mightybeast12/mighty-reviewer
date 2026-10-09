@@ -1,11 +1,20 @@
 import assert from "node:assert/strict";
-import plugin, { MightyReviewer } from "./index.js";
+import module, { MightyReviewer } from "./index.js";
+import tuiPlugin from "./tui.js";
 import { extractVerdict, compareSemver, describeInstall } from "./internals.js";
 
-assert.equal(plugin, MightyReviewer, "default export matches named export");
+// Dual-host entry: OpenCode 1.18.29+ reads `server`, OpenCode 2 reads
+// `id` + `setup`. The v1 factory stays the sole implementation.
+assert.equal(module.id, "mighty-reviewer", "v2 plugin id matches the package name");
+assert.equal(module.server, MightyReviewer, "v1 entry is the named factory");
+assert.equal(typeof module.setup, "function", "v2 setup function exported");
+assert.equal(tuiPlugin.id, "mighty-reviewer", "tui companion shares the plugin id");
+assert.equal(typeof tuiPlugin.setup, "function", "tui companion exports setup");
+const plugin = MightyReviewer;
 
-// opencode calls EVERY export of the plugin entry point as a plugin factory,
-// so any extra export (helpers returning null) bricks opencode at bootstrap.
+// opencode v1 calls EVERY function export of the plugin entry point as a
+// plugin factory, so any extra export (helpers returning null) bricks
+// opencode at bootstrap.
 const entryExports = Object.keys(await import("./index.js")).sort();
 assert.deepEqual(entryExports, ["MightyReviewer", "default"], "index.js exposes only the plugin factory");
 
@@ -15,7 +24,7 @@ const client = {};
 
 // 1. Normal init returns all hooks.
 const hooks = await plugin({ client, directory: "/tmp", worktree: "/tmp", $ });
-for (const key of ["config", "tool.execute.after", "tool.execute.before", "chat.message", "command.execute.before", "event"]) {
+for (const key of ["config", "tool.execute.after", "tool.execute.before", "chat.message", "command.execute.before", "event", "dispose"]) {
   assert.ok(typeof hooks[key] === "function", `hook ${key} registered`);
 }
 assert.ok(typeof hooks.tool?.review_status?.execute === "function", "review_status tool registered");
@@ -528,6 +537,242 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
   assert.ok(done.includes("unknown"), "finalized without a verdict once the cap is hit");
   assert.ok(done.includes("still waiting, attempt 3"), "last report still captured");
   assert.ok(h.toasts.some((t) => t.message.includes("Background review finished")), "generic completion toast shown");
+}
+
+
+
+// 23. OpenCode 2 bridge: setup(ctx) registers the critics, command, tool and
+//     hooks through the v2 context, and routes the review lifecycle through
+//     v2 session calls (create carries agent/model/permissions, notices land
+//     as synthetic messages in the parent session, idle arrives as
+//     session.execution.succeeded).
+{
+  const calls = [];
+  const agents = new Map([["build", { id: "build", request: { body: {} }, permissions: [] }]]);
+  const commands = [];
+  const tools = [];
+  const hookCallbacks = {};
+  let eventQueue = [];
+  let resolveNext = null;
+  const events = {
+    async *subscribe({ signal }) {
+      while (!signal.aborted) {
+        if (eventQueue.length) {
+          yield eventQueue.shift();
+          continue;
+        }
+        await new Promise((resolve) => {
+          resolveNext = resolve;
+          signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+      }
+    },
+  };
+  const push = (event) => {
+    eventQueue.push(event);
+    resolveNext?.();
+    resolveNext = null;
+  };
+  const registration = { dispose: async () => {} };
+  const transform = (callback) => async (fn) => {
+    fn(callback);
+    return registration;
+  };
+  let report = "report body\nNO-SHIP";
+  const ctx = {
+    options: { model: "prov/model-x", agent: "reviewer", idleDebounceMs: 0, enforceNoShip: true },
+    location: { directory: "/tmp/v2-project", project: { directory: "/tmp/v2-project" } },
+    agent: {
+      transform: transform({
+        get: (id) => agents.get(id),
+        update: (id, fn) => {
+          const agent = agents.get(id) ?? { id, request: { settings: {}, headers: {}, body: {} }, permissions: [], mode: "primary" };
+          agents.set(id, agent);
+          fn(agent);
+        },
+      }),
+    },
+    command: {
+      list: async () => ({ data: [{ name: "existing" }] }),
+      transform: transform({ add: (definition) => commands.push(definition) }),
+    },
+    tool: {
+      transform: transform({ add: (definition) => tools.push(definition) }),
+      hook: async (name, callback) => {
+        hookCallbacks[`tool.${name}`] = callback;
+        return registration;
+      },
+    },
+    permission: {
+      hook: async (name, callback) => {
+        hookCallbacks[`permission.${name}`] = callback;
+        return registration;
+      },
+    },
+    session: {
+      hook: async (name, callback) => {
+        hookCallbacks[`session.${name}`] = callback;
+        return registration;
+      },
+      get: async ({ sessionID }) => ({
+        id: sessionID,
+        parentID: sessionID.startsWith("child") ? "parent-v2" : undefined,
+        location: { directory: "/tmp/v2-project" },
+      }),
+      context: async () => [
+        { type: "user", text: "review this" },
+        { type: "assistant", content: [{ type: "text", text: report }] },
+      ],
+      create: async (input) => {
+        calls.push(["create", input]);
+        return { id: "child-v2" };
+      },
+      prompt: async (input) => {
+        calls.push(["prompt", input]);
+        return {};
+      },
+      synthetic: async (input) => {
+        calls.push(["synthetic", input]);
+        return {};
+      },
+      update: async (input) => {
+        calls.push(["update", input]);
+      },
+      interrupt: async () => ({ interrupted: true }),
+    },
+    event: events,
+  };
+
+  const cleanup = await module.setup(ctx);
+  assert.equal(typeof cleanup, "function", "v2 setup returns a cleanup");
+
+  const critic = agents.get("adversarial-risk-critic");
+  assert.ok(critic, "critic registered through agent.transform");
+  assert.equal(critic.mode, "subagent");
+  assert.equal(critic.request.body.temperature, 0.1, "temperature lands in request.body");
+  assert.ok(critic.system.includes("Weakened guardrails"), "prompt becomes system");
+  const denied = critic.permissions.filter((rule) => rule.effect === "deny").map((rule) => rule.action).sort();
+  assert.deepEqual(denied, ["edit", "shell", "subagent"], "critic tools map to v2 permission actions");
+  assert.equal(agents.get("build").system, undefined, "existing agents untouched");
+
+  assert.equal(commands.length, 1, "mighty-review command registered");
+  assert.equal(commands[0].name, "mighty-review");
+  assert.equal(tools.length, 1, "review_status tool registered");
+  assert.equal(tools[0].name, "review_status");
+  const idle = await tools[0].execute({}, { sessionID: "parent-v2" });
+  assert.ok(idle.content.includes("No review"), "review_status answers through v2 tool result");
+
+  // The reviewer snapshots real git state through $ (Bun's tag, or the Node
+  // fallback), so give it a clean repo before the turn and dirty it after
+  // the edit so the before/after snapshots differ.
+  const { mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+  const { execFileSync } = await import("node:child_process");
+  rmSync("/tmp/v2-project", { recursive: true, force: true });
+  mkdirSync("/tmp/v2-project", { recursive: true });
+  execFileSync("git", ["-C", "/tmp/v2-project", "init", "-q"]);
+
+  // A user turn that edits a file, then goes idle, spawns a review.
+  await hookCallbacks["session.prompt"]({ sessionID: "parent-v2", prompt: { text: "please fix" } });
+  await hookCallbacks["tool.execute.after"]({ sessionID: "parent-v2", tool: "edit" });
+  writeFileSync("/tmp/v2-project/a.txt", "changed\n");
+  push({ type: "session.execution.succeeded", location: { directory: "/tmp/v2-project" }, data: { sessionID: "parent-v2" } });
+  await new Promise((resolve) => setTimeout(resolve, 600));
+
+  const create = calls.find(([kind]) => kind === "create");
+  assert.ok(create, "review child session created through ctx.session.create");
+  assert.equal(create[1].parentID, undefined, "review session is a root session so critics clear the subagent depth cap");
+  assert.equal(create[1].metadata.mightyReviewer.parentID, "parent-v2", "parent link kept in metadata");
+  assert.equal(create[1].agent, "reviewer", "options.agent applied at create time");
+  assert.deepEqual(create[1].model, { providerID: "prov", id: "model-x" }, "options.model applied at create time");
+  assert.deepEqual(create[1].permissions, [{ action: "edit", resource: "*", effect: "deny" }], "orchestrator edit tools denied by permission");
+  const reviewPrompt = calls.find(([kind, input]) => kind === "prompt" && input.sessionID === "child-v2");
+  assert.ok(reviewPrompt, "review prompt sent to the child");
+  assert.ok(reviewPrompt[1].text.includes("ADVERSARIAL"), "review prompt body preserved");
+  assert.equal(reviewPrompt[1].delivery, "queue");
+  const started = calls.find(([kind, input]) => kind === "synthetic" && input.text.includes("running background review"));
+  assert.ok(started, "start notice delivered into the parent session");
+  assert.equal(started[1].sessionID, "parent-v2");
+  assert.equal(started[1].metadata.mightyReviewer.variant, "info");
+  assert.equal(started[1].resume, false, "notices never wake the agent");
+
+  // Review progress tracking sees v1 tool names for v2 tools.
+  await hookCallbacks["tool.execute.before"]({ sessionID: "child-v2", tool: "shell", input: { command: "git diff" } });
+  await hookCallbacks["tool.execute.before"]({ sessionID: "child-v2", tool: "subagent", input: {} });
+  const progress = await tools[0].execute({}, { sessionID: "parent-v2" });
+  assert.ok(progress.content.includes("waiting on critics (0/1"), `v2 tool names drive phase tracking: ${progress.content}`);
+
+  // Child idle with NO-SHIP: findings injected into the parent, notice posted.
+  push({ type: "session.execution.succeeded", location: { directory: "/tmp/v2-project" }, data: { sessionID: "child-v2" } });
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  const feedback = calls.find(([kind, input]) => kind === "prompt" && input.sessionID === "parent-v2");
+  assert.ok(feedback, "NO-SHIP findings injected into the parent session");
+  assert.ok(feedback[1].text.includes("report body"), "report body forwarded");
+  const verdictNotice = calls.find(([kind, input]) => kind === "synthetic" && input.text.includes("NO-SHIP"));
+  assert.ok(verdictNotice, "verdict notice delivered into the parent session");
+  assert.equal(verdictNotice[1].metadata.mightyReviewer.variant, "warning");
+  const status = await tools[0].execute({}, { sessionID: "parent-v2" });
+  assert.ok(status.content.includes("verdict: NO-SHIP"), "review_status reports the verdict");
+
+  // Events from other locations are ignored.
+  const before = calls.length;
+  push({ type: "session.execution.succeeded", location: { directory: "/elsewhere" }, data: { sessionID: "parent-v2" } });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(calls.length, before, "foreign-location events ignored");
+
+  // The tui companion turns the synthetic notice event into a toast.
+  const toasts = [];
+  let tuiPush;
+  const tuiCleanup = await tuiPlugin.setup({
+    client: {
+      event: {
+        async *subscribe({ signal }) {
+          while (!signal.aborted) {
+            const next = await new Promise((resolve) => {
+              tuiPush = resolve;
+              signal.addEventListener("abort", () => resolve(null), { once: true });
+            });
+            if (next) yield next;
+          }
+        },
+      },
+    },
+    ui: { toast: { show: (toast) => toasts.push(toast) } },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  tuiPush({ type: "session.inbox.enqueued", data: { sessionID: "parent-v2", inboxID: "msg_1", item: { type: "synthetic", payload: { text: "x", metadata: { mightyReviewer: { message: "SHIP: ok", variant: "success" } } } } } });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  tuiPush({ type: "session.inbox.enqueued", data: { sessionID: "parent-v2", inboxID: "msg_2", item: { type: "user", payload: { text: "unrelated" } } } });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  tuiPush({ type: "session.synthetic", data: { sessionID: "parent-v2", text: "delivered later", metadata: { mightyReviewer: { message: "dup", variant: "info" } } } });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(toasts, [{ title: "mighty-reviewer", message: "SHIP: ok", variant: "success", sessionID: "parent-v2" }], "only tagged notices become toasts");
+  await tuiCleanup();
+
+  // enforceNoShip: with a NO-SHIP verdict outstanding, git commit/push is
+  // refused through the permission hook (clean deny, not a thrown defect).
+  const blocked = { sessionID: "parent-v2", action: "shell", resources: ["git push origin main"], effect: "allow" };
+  await hookCallbacks["permission.evaluate"](blocked);
+  assert.equal(blocked.effect, "deny", "unresolved NO-SHIP denies git push");
+  assert.ok(blocked.message.includes("NO-SHIP"), "denial carries the reviewer message");
+  const harmless = { sessionID: "parent-v2", action: "shell", resources: ["git status"], effect: "allow" };
+  await hookCallbacks["permission.evaluate"](harmless);
+  assert.equal(harmless.effect, "allow", "non-commit git commands stay allowed");
+  const other = { sessionID: "other-session", action: "shell", resources: ["git push"], effect: "allow" };
+  await hookCallbacks["permission.evaluate"](other);
+  assert.equal(other.effect, "allow", "sessions without a NO-SHIP are unaffected");
+
+  // Cleanup cancels this instance's timers (debounce, watchdog) so a hot
+  // reload cannot fire a stale "timed out" notice from the old instance.
+  await hookCallbacks["session.prompt"]({ sessionID: "parent-v2", prompt: { text: "another turn" } });
+  await hookCallbacks["tool.execute.after"]({ sessionID: "parent-v2", tool: "edit" });
+  writeFileSync("/tmp/v2-project/b.txt", "new file\n");
+  const createsBefore = calls.filter(([kind]) => kind === "create").length;
+  push({ type: "session.execution.succeeded", location: { directory: "/tmp/v2-project" }, data: { sessionID: "parent-v2" } });
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  assert.equal(calls.filter(([kind]) => kind === "create").length, createsBefore + 1, "second review spawned (watchdog armed)");
+  await cleanup();
+  assert.equal(typeof hooks.dispose, "function", "v1 hooks expose dispose for host teardown");
+  rmSync("/tmp/v2-project", { recursive: true, force: true });
 }
 
 console.log("ALL SMOKE TESTS PASSED");

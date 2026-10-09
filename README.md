@@ -15,33 +15,42 @@ All agents are registered by the plugin itself, so the package is fully self-con
 
 ## Install
 
-Add the plugin to your `opencode.json` (project or global at `~/.config/opencode/opencode.json`):
+Supports OpenCode 1.18.29+ and OpenCode 2.x from the same package.
+
+Add the plugin to your `opencode.json` (project or global at `~/.config/opencode/opencode.json`). OpenCode 2 reads `plugins`; OpenCode 1 reads `plugin`:
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["mighty-reviewer"]
+  "plugins": ["mighty-reviewer"]
 }
 ```
 
 Restart opencode. That's it.
 
-### Alternative: local file install
+### Alternative: local checkout
 
-Clone this repo and drop `index.js` into your plugin directory; opencode auto-discovers it:
+Clone this repo and reference the checkout directory from `opencode.json`:
 
 ```bash
 git clone https://github.com/Mightybeast12/mighty-reviewer.git
-cp mighty-reviewer/index.js ~/.config/opencode/plugin/mighty-reviewer.js
 ```
-
-Or reference the clone directly from `opencode.json`:
 
 ```json
 {
-  "plugin": ["/absolute/path/to/mighty-reviewer/index.js"]
+  "plugins": ["/absolute/path/to/mighty-reviewer"]
 }
 ```
+
+OpenCode 2 requires a package directory here (it resolves `index.js` and the TUI companion `tui.js` from it); a bare path to `index.js` is rejected. On OpenCode 1 you can also copy `index.js`, `v2.js`, `tui.js`, and `internals.js` into `~/.config/opencode/plugin/`.
+
+### OpenCode 2 notes
+
+- **Toasts** come from a TUI companion module (`mighty-reviewer/tui`) that OpenCode 2 loads alongside the server plugin. Each notice is also queued as a `mighty-reviewer` entry in the session it concerns, where it enters the conversation on the next turn without waking the agent.
+- **The review session is a root session**, not a child of the coding session. OpenCode 2 caps nested subagents at depth 1 (`experimental.subagent_depth`), and a nested review session could not spawn its four critics. The parent link is stored in the review session's metadata, and the toast offers to open the review session.
+- **`enforceNoShip`** denies `git commit` / `git push` through the permission hook, so a blocked command shows up as a permission denial carrying the reviewer's message.
+- Tool names differ between hosts (`bash` is `shell`, `task` is `subagent`); progress tracking and the critic permissions account for both.
+- The self-update check only manages OpenCode 1's plugin cache. On OpenCode 2 use `opencode plugin update`.
 
 ## How it works
 
@@ -86,18 +95,18 @@ Or reference the clone directly from `opencode.json`:
 
 ## Configuration
 
-All options go in the plugin tuple form in `opencode.json`:
+All options go in the plugin entry in `opencode.json` (OpenCode 2 object form shown; OpenCode 1 uses the tuple form `["mighty-reviewer", { ... }]` under `plugin`):
 
 ```json
 {
-  "plugin": [["mighty-reviewer", {
+  "plugins": [{ "package": "mighty-reviewer", "options": {
     "model": "anthropic/claude-sonnet-4-5",
     "criticModel": "anthropic/claude-haiku-4-5",
     "maxDiffLines": 2000,
     "ignore": ["^docs/", "\\.stories\\.tsx$"],
     "idleDebounceMs": 1000,
     "enforceNoShip": false
-  }]]
+  } }]
 }
 ```
 
@@ -110,7 +119,7 @@ All options go in the plugin tuple form in `opencode.json`:
 | `maxDiffLines` | `2000` | Skip review when more changed lines than this (lockfiles/generated excluded from the count) |
 | `ignore` | `[]` | Extra regex patterns (strings) for files to exclude from review |
 | `idleDebounceMs` | `1000` | Debounce for `session.idle` before triggering a review |
-| `enforceNoShip` | `false` | Block `git commit` / `git push` in a session while a NO-SHIP verdict is unresolved (until a later review SHIPs, e.g. via `/mighty-review`) |
+| `enforceNoShip` | `false` | Block `git commit` / `git push` in a session while a NO-SHIP verdict is unresolved (until a later review SHIPs, e.g. via `/mighty-review`). On OpenCode 2 this is a permission denial |
 | `progressToasts` | `true` | Toast on review phase transitions (gates done / critics done); `review_status` and live session titles report progress regardless |
 | `updateCheck` | `true` | Check npm for a newer version a few seconds after startup |
 | `autoUpdate` | `true` | Install the newer version into opencode's plugin cache automatically (unpinned npm installs only); with `false` you get a notification toast instead |
@@ -147,11 +156,11 @@ MIGHTY_REVIEWER_DISABLE=1 opencode```
 
 ### Disable via config
 
-Use the tuple form in `opencode.json`:
+Pass the `disabled` option in `opencode.json`:
 
 ```json
 {
-  "plugin": [["mighty-reviewer", { "disabled": true }]]
+  "plugins": [{ "package": "mighty-reviewer", "options": { "disabled": true } }]
 }
 ```
 
@@ -162,7 +171,7 @@ The plugin registers its agents only if you have not defined agents with the sam
 ## Requirements
 
 - The project being reviewed must be a git repository (the trigger compares git diffs; outside a repo the plugin stays silent).
-- opencode with plugin support (`plugin` array in `opencode.json`).
+- OpenCode 1.18.29+ (`plugin` array) or OpenCode 2.x (`plugins` array) in `opencode.json`.
 
 ## License
 

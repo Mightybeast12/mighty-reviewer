@@ -87,7 +87,7 @@
  *             query the running/done state and verdict.
  * Lifecycle:  session.idle handling is debounced (idleDebounceMs); each
  *             review child is armed with a watchdog that aborts it after
- *             REVIEW_TIMEOUT_MS. With { enforceNoShip: true }, git commit
+ *             timeoutMs (default 10 min). With { enforceNoShip: true }, git commit
  *             and push are blocked in a session while a NO-SHIP verdict is
  *             unresolved.
  * Updates:    opencode installs npm plugins into ~/.cache/opencode/packages
@@ -103,7 +103,7 @@
  *             to their root session, so a turn that fans out to N subagents
  *             produces one review for the parent turn, not N+1 and not 0.
  * Options:    { disabled, model, criticModel, agent, maxDiffLines, ignore,
- *             idleDebounceMs, enforceNoShip, progressToasts, updateCheck,
+ *             idleDebounceMs, timeoutMs, enforceNoShip, progressToasts, updateCheck,
  *             autoUpdate } via the plugin tuple form.
  * Opt-out:    set MIGHTY_REVIEWER_DISABLE=1, or pass { disabled: true }
  *             via the plugin tuple form in opencode.json.
@@ -137,7 +137,12 @@ const MAX_VERDICT_NUDGES = 2;
 
 const DEFAULT_MAX_DIFF_LINES = 2000;
 const DEFAULT_IDLE_DEBOUNCE_MS = 1000;
-const REVIEW_TIMEOUT_MS = 10 * 60 * 1000;
+// Half-time check: a review still in its mechanical gates at this point is
+// stuck in setup (observed: hunting type packages outside the project) and
+// is steered straight to the critics. A review whose critics are running
+// when the deadline hits gets one extension of half the budget instead of
+// an abort. Both derive from reviewTimeoutMs (option: timeoutMs).
+const DEFAULT_REVIEW_TIMEOUT_MS = 10 * 60 * 1000;
 const RULES_FILE = ".mighty-reviewer.md";
 const MAX_RULES_CHARS = 4000;
 const COMMAND_NAME = "mighty-review";
@@ -394,12 +399,15 @@ function languageHintsFor(files) {
   return hints;
 }
 
-function buildReviewPrompt(languageHints, projectRules) {
+function buildReviewPrompt(languageHints, projectRules, timeoutMs) {
   return [
     REVIEW_MARKER,
     "You are reviewing, in the background, a coding turn that just finished in another session. Run an ADVERSARIAL self-review of that work before it is considered done.",
     "",
     "HARD CONSTRAINT: this review is strictly READ-ONLY. You must NEVER edit, write, create, delete, or fix any source file, and never run commands that modify source files or git state (no formatters with --write, no git add/commit/stash). Read-only checks that only write to build caches (e.g. `cargo check`, `tsc --noEmit`) are allowed. Your ONLY deliverable is a report.",
+    "",
+    "HARD SCOPE: stay inside the project directory. Never read, list, or search paths outside it (the home directory, other repositories, global caches, another project's node_modules): access outside the project is denied for this session and a denied call is a wasted call. Never install tooling, write a tsconfig, or hunt for type packages. Skip any session-start protocol, skill load, or observation-log step that instruction files ask of coding sessions: this is a review session, not a coding session, and those steps do not apply here.",
+    `TIME BUDGET: the review is aborted after ${Math.max(1, Math.round(timeoutMs / 60000))} minutes. Dispatch the four critics by your fourth tool call at the latest; mechanical gates that would take longer than that are recorded as 'not run' and skipped.`,
     "",
     ...(projectRules
       ? [
@@ -413,7 +421,7 @@ function buildReviewPrompt(languageHints, projectRules) {
     "Do this:",
     "1. Run `git diff` (and include untracked files) to see exactly what changed. EXCLUDE noise files from the entire review: lockfiles (package-lock.json, yarn.lock, Cargo.lock, go.sum, ...), generated/minified output (dist/, build/, *.min.js, *.map, *.snap), and vendored code (node_modules/, vendor/). If nothing else changed, report that and stop with SHIP.",
     "2. MECHANICAL GATES - run these BEFORE consulting any critic:",
-    "   - Detect the project's own typecheck/lint commands (package.json scripts, tsconfig.json, Makefile, pyproject.toml, go.mod, Cargo.toml) and run the cheapest applicable check (e.g. `tsc --noEmit`, `ruff check`, `go vet`, `cargo check`), scoped to changed files where the tool allows.",
+    "   - Detect the project's own typecheck/lint commands (package.json scripts, tsconfig.json, Makefile, pyproject.toml, go.mod, Cargo.toml) and run the cheapest applicable check (e.g. `tsc --noEmit`, `ruff check`, `go vet`, `cargo check`), scoped to changed files where the tool allows. Only run a check the project itself configures: if the changed files have no project-configured typecheck or lint (for example a standalone script or plugin file with no package.json or tsconfig next to it), record 'no project typecheck configured' and move on immediately.",
     "   - Scan the changed files for leftover debug output (console.log, print-debugging, debugger statements) and commented-out code blocks.",
     "   - Check whether the diff touches linter/formatter/typechecker config (.eslintrc*, biome.json*, tsconfig*, .prettierrc*, ruff.toml, clippy.toml) in a way that WEAKENS rules.",
     "   Every mechanical failure is an automatic P1 finding. Record them; never fix anything.",
@@ -464,6 +472,11 @@ const VERDICT_NUDGE_PROMPT = [
   "2. Adversarially verify and deduplicate the findings as originally instructed.",
   "3. Output the FULL findings report, then exactly the single word SHIP or NO-SHIP on its own line.",
   "Do NOT launch new background work. Do NOT end your turn without the verdict line.",
+].join("\n");
+
+const HALFTIME_NUDGE_PROMPT = [
+  REVIEW_MARKER,
+  "Half of the review time budget is gone and the critics have not been dispatched. Stop the mechanical gates now: record any gate you did not finish as 'not run', then dispatch the four critics in parallel immediately with the diff you already have. Do not look for tooling or type packages, and do not leave the project directory.",
 ].join("\n");
 
 // --- Self-update: opencode resolves an unpinned plugin spec against npm
@@ -650,6 +663,10 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
   const cwd = worktree || directory;
   const maxDiffLines = options.maxDiffLines ?? DEFAULT_MAX_DIFF_LINES;
   const idleDebounceMs = options.idleDebounceMs ?? DEFAULT_IDLE_DEBOUNCE_MS;
+  const reviewTimeoutMs =
+    Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? options.timeoutMs : DEFAULT_REVIEW_TIMEOUT_MS;
+  const reviewHalftimeMs = reviewTimeoutMs / 2;
+  const reviewExtensionMs = reviewTimeoutMs / 2;
   const enforceNoShip = options.enforceNoShip === true;
   const progressToasts = options.progressToasts !== false;
   const extraIgnore = (options.ignore ?? []).map((p) => new RegExp(p));
@@ -814,7 +831,11 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
   }
 
   async function sendPrompt(sessionIDToPrompt, text, extra = {}) {
-    const body = { ...extra, parts: [{ type: "text", text }] };
+    const { delivery, ...rest } = extra;
+    const body = { ...rest, parts: [{ type: "text", text }] };
+    // delivery is an OpenCode 2 inbox concept; the V1 prompt body has no
+    // such field, so it only travels through the V2 adapter.
+    if (delivery && client.v2) body.delivery = delivery;
     // The plugin host's SDK client resolves with { error } on HTTP failures
     // (e.g. session deleted) instead of throwing, so surface that as a throw
     // or callers would count failed injections against the cycle budget.
@@ -914,7 +935,24 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
   }
 
   function armWatchdog(reviewSessionID, parentSessionID) {
-    const timer = setTimeout(async () => {
+    const halftime = setTimeout(async () => {
+      const state = reviewStates.get(parentSessionID);
+      if (!spawnedReviewSessions.has(reviewSessionID) || state?.status !== "running") return;
+      if (state.phase !== "starting" && state.phase !== "gates") return;
+      try {
+        await sendPrompt(reviewSessionID, HALFTIME_NUDGE_PROMPT, {
+          delivery: "steer",
+          tools: { ...ORCHESTRATOR_TOOLS },
+          ...(reviewAgent ? { agent: reviewAgent } : {}),
+          ...(reviewModel ? { model: reviewModel } : {}),
+        });
+      } catch {
+        // The nudge is best-effort; the deadline below still applies.
+      }
+      void setReviewTitle(reviewSessionID, "steered to critics");
+    }, reviewHalftimeMs);
+
+    const abortReview = async () => {
       reviewWatchdogs.delete(reviewSessionID);
       if (!spawnedReviewSessions.has(reviewSessionID)) return;
       spawnedReviewSessions.delete(reviewSessionID);
@@ -933,15 +971,34 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       }
       void setReviewTitle(reviewSessionID, "timed out");
       await showToast("Background review timed out and was aborted.", "warning", parentSessionID);
-    }, REVIEW_TIMEOUT_MS);
-    reviewWatchdogs.set(reviewSessionID, ownTimer(timer));
+    };
+
+    const deadline = setTimeout(async () => {
+      const state = reviewStates.get(parentSessionID);
+      const criticsRunning =
+        state?.status === "running" &&
+        (state.phase === "critics" || state.phase === "verifying" || state.phase === "collecting");
+      if (criticsRunning && spawnedReviewSessions.has(reviewSessionID)) {
+        // Critics are mid-flight: one extension, then a hard abort.
+        state.updatedAt = Date.now();
+        const extension = ownTimer(setTimeout(abortReview, reviewExtensionMs));
+        reviewWatchdogs.set(reviewSessionID, [extension]);
+        void setReviewTitle(reviewSessionID, `${describePhase(state)}, extended`);
+        await showToast(`Background review is still verifying; extended once by ${Math.max(1, Math.round(reviewExtensionMs / 60000))} minutes.`, "info", parentSessionID);
+        return;
+      }
+      await abortReview();
+    }, reviewTimeoutMs);
+    reviewWatchdogs.set(reviewSessionID, [ownTimer(halftime), ownTimer(deadline)]);
   }
 
   function clearWatchdog(reviewSessionID) {
-    const timer = reviewWatchdogs.get(reviewSessionID);
-    if (timer) {
-      clearTimeout(timer);
-      ownedTimers.delete(timer);
+    const timers = reviewWatchdogs.get(reviewSessionID);
+    if (timers) {
+      for (const timer of timers) {
+        clearTimeout(timer);
+        ownedTimers.delete(timer);
+      }
       reviewWatchdogs.delete(reviewSessionID);
     }
   }
@@ -966,7 +1023,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       }
 
       const rules = await projectRules();
-      const reviewPrompt = buildReviewPrompt(languageHintsFor(files), rules);
+      const reviewPrompt = buildReviewPrompt(languageHintsFor(files), rules, reviewTimeoutMs);
 
       const created = await client.session.create({
         body: { parentID: sessionID, title: "Adversarial review" },
@@ -1248,7 +1305,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
           if (!state) return "No review has run for this session yet.";
           if (state.status === "running") {
             const elapsed = formatElapsed(Date.now() - (state.startedAt ?? state.updatedAt));
-            return `Review still in progress: ${describePhase(state)} (elapsed ${elapsed}; reviews are aborted after 10 minutes).`;
+            return `Review still in progress: ${describePhase(state)} (elapsed ${elapsed}; reviews are aborted after ${Math.max(1, Math.round(reviewTimeoutMs / 60000))} minutes).`;
           }
           return [
             `verdict: ${state.verdict ?? "unknown (no verdict line found)"}`,

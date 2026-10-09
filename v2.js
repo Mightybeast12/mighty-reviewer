@@ -34,6 +34,9 @@ import path from "node:path";
 import { PKG_NAME } from "./internals.js";
 
 const TOOL_NAME_TO_V1 = { shell: "bash", subagent: "task" };
+// Critics and the review session never need anything outside the project;
+// see the session.create note on why "ask" is worse than "deny" here.
+const EXTERNAL_DIRECTORY_DENY = { action: "external_directory", resource: "*", effect: "deny" };
 const TOOL_NAME_TO_V2 = { bash: "shell", task: "subagent", write: "edit", patch: "edit" };
 const IDLE_EVENTS = new Set([
   "session.idle",
@@ -189,8 +192,9 @@ function applyAgentDefinition(agent, definition) {
   }
   const model = parseModelRef(definition.model);
   if (model) agent.model = model;
-  agent.permissions.push(...toolsToPermissions(definition.tools));
+  agent.permissions.push(...toolsToPermissions(definition.tools), EXTERNAL_DIRECTORY_DENY);
 }
+
 
 function toolsToPermissions(tools) {
   const rules = [];
@@ -231,6 +235,7 @@ function createLegacyClient(ctx, options) {
       .join("\n");
 
   return {
+    v2: true,
     app: {
       log: async ({ body }) => {
         const level = body?.level === "error" ? "error" : "info";
@@ -278,7 +283,15 @@ function createLegacyClient(ctx, options) {
           ...(body?.parentID ? { metadata: { [NOTICE_METADATA_KEY]: { parentID: body.parentID } } } : {}),
           ...(options.agent ? { agent: options.agent } : {}),
           ...(model ? { model } : {}),
-          permissions: toolsToPermissions({ edit: false, write: false, patch: false }),
+          // The review session is headless: a permission prompt has nobody to
+          // answer it and stalls the review until the watchdog fires
+          // (observed: ~5 min per out-of-project read). Denying
+          // external_directory turns that stall into an immediate error the
+          // orchestrator can route around.
+          permissions: [
+            ...toolsToPermissions({ edit: false, write: false, patch: false }),
+            EXTERNAL_DIRECTORY_DENY,
+          ],
         });
         return { data: created };
       },
@@ -286,7 +299,7 @@ function createLegacyClient(ctx, options) {
         await ctx.session.prompt({
           sessionID: sessionIDOf(input),
           text: textOf(input?.body?.parts),
-          delivery: "queue",
+          delivery: input?.body?.delivery === "steer" ? "steer" : "queue",
         });
         return {};
       },

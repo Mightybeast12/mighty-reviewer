@@ -3,8 +3,9 @@
  *
  * Shows the background review for the session tree being viewed: one row for
  * the review session (with the phase parsed from its live title) and one row
- * per critic subagent it spawned. Once a critic returns, its row shows the
- * findings it reported, counted by severity. Everything is derived from host
+ * per critic: the four expected critics are listed as pending until their
+ * subagent sessions exist, then each row tracks its session. Once a critic
+ * returns, its row shows the findings it reported, counted by severity. Everything is derived from host
  * session data and the TUI client; the server side needs no extra wiring.
  *
  * Laid out like the oh-my-opencode-slim agent panel (single border, header
@@ -25,6 +26,10 @@ const BADGE = "Mighty Reviewer";
 const TERMINAL_PHASES = new Set(["SHIP", "NO-SHIP", "done", "timed out"]);
 // Phases before any critic has been dispatched.
 const EARLY_PHASES = new Set(["starting", "gates"]);
+// The four critics every review dispatches (index.js AGENT_DEFINITIONS, with
+// the "-critic" suffix dropped as criticName does). Shown as pending rows
+// until their sessions exist, so the panel has the same shape at every phase.
+const EXPECTED_CRITICS = ["adversarial-risk", "design-principles", "security-checklist", "ai-slop"];
 const SEVERITIES = ["P0", "P1", "P2", "P3"];
 
 const BORDER = { type: "single" };
@@ -290,7 +295,7 @@ function createStore(ctx) {
     if (critics.length === 0 && !EARLY_PHASES.has(phase)) discoverCritics(review.id);
 
     const reviewRunning = !finished && (isRunning(review.id) || critics.some((c) => c.running));
-    return { id: review.id, phase, finished, running: reviewRunning, critics };
+    return { id: review.id, phase, finished, running: reviewRunning, critics: withExpected(critics) };
   };
 
   return {
@@ -302,6 +307,19 @@ function createStore(ctx) {
       for (const off of offs) off?.();
     },
   };
+}
+
+// Expected critics first, in a fixed order, each replaced by its real session
+// once spawned; any other child of the review (ad hoc verification subagents)
+// follows. A missing critic is a pending row with no session to open.
+function withExpected(critics) {
+  const rest = [...critics];
+  const rows = EXPECTED_CRITICS.map((name) => {
+    const index = rest.findIndex((critic) => critic.name === name);
+    if (index === -1) return { id: null, name, running: false, result: null, pending: true };
+    return rest.splice(index, 1)[0];
+  });
+  return [...rows, ...rest];
 }
 
 function isReviewSession(info) {
@@ -537,15 +555,25 @@ function renderPanel(review, colors, now, ui) {
   if (!ui.open) return frame(colors, [panelHeader]);
 
   const criticRows = review.critics.map((critic) =>
-    row({
-      glyph: glyphOf(critic.running, critic.result !== null || review.finished, colors, now),
-      label: critic.name,
-      detail: critic.running ? null : resultCells(critic.result, colors),
-      indent: 2,
-      colors,
-      onClick: () => ui.navigate(critic.id),
-      hasSelection: ui.hasSelection,
-    }),
+    critic.pending
+      ? row({
+          glyph: glyphOf(false, false, colors, now),
+          label: critic.name,
+          detail: review.finished ? [text({ fg: colors.muted, wrapMode: "none" }, ["not run"])] : null,
+          indent: 2,
+          colors,
+          onClick: () => {},
+          hasSelection: ui.hasSelection,
+        })
+      : row({
+          glyph: glyphOf(critic.running, critic.result !== null || review.finished, colors, now),
+          label: critic.name,
+          detail: critic.running ? null : resultCells(critic.result, colors),
+          indent: 2,
+          colors,
+          onClick: () => ui.navigate(critic.id),
+          hasSelection: ui.hasSelection,
+        }),
   );
   const hasCounts = review.critics.some((critic) => critic.result?.counts);
   return frame(colors, [

@@ -149,6 +149,7 @@ All options go in the plugin entry in `opencode.json` (OpenCode 2 object form sh
 | `maxDiffLines` | `2000` | Skip review when more changed lines than this (lockfiles/generated excluded from the count) |
 | `ignore` | `[]` | Extra regex patterns (strings) for files to exclude from review |
 | `idleDebounceMs` | `1000` | Debounce for `session.idle` before triggering a review |
+| `timeoutMs` | `600000` | Review time budget. At half time a review still in its mechanical gates is steered straight to the critics; at the deadline a review whose critics are running gets one extension of half the budget, otherwise it is aborted. The review session is also denied access outside the project directory, so a headless permission prompt cannot stall it |
 | `enforceNoShip` | `false` | Block `git commit` / `git push` in a session while a NO-SHIP verdict is unresolved (until a later review SHIPs, e.g. via `/mighty-review`). On OpenCode 2 this is a permission denial |
 | `progressToasts` | `true` | Toast on review phase transitions (gates done / critics done); `review_status` and live session titles report progress regardless |
 | `updateCheck` | `true` | Check npm for a newer version a few seconds after startup |

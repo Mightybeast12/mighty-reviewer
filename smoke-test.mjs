@@ -652,7 +652,7 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
   assert.equal(critic.request.body.temperature, 0.1, "temperature lands in request.body");
   assert.ok(critic.system.includes("Weakened guardrails"), "prompt becomes system");
   const denied = critic.permissions.filter((rule) => rule.effect === "deny").map((rule) => rule.action).sort();
-  assert.deepEqual(denied, ["edit", "shell", "subagent"], "critic tools map to v2 permission actions");
+  assert.deepEqual(denied, ["edit", "external_directory", "shell", "subagent"], "critic tools map to v2 permission actions, plus out-of-project access denied");
   assert.equal(agents.get("build").system, undefined, "existing agents untouched");
 
   assert.equal(commands.length, 1, "mighty-review command registered");
@@ -684,7 +684,14 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
   assert.equal(create[1].metadata.mightyReviewer.parentID, "parent-v2", "parent link kept in metadata");
   assert.equal(create[1].agent, "reviewer", "options.agent applied at create time");
   assert.deepEqual(create[1].model, { providerID: "prov", id: "model-x" }, "options.model applied at create time");
-  assert.deepEqual(create[1].permissions, [{ action: "edit", resource: "*", effect: "deny" }], "orchestrator edit tools denied by permission");
+  assert.deepEqual(
+    create[1].permissions,
+    [
+      { action: "edit", resource: "*", effect: "deny" },
+      { action: "external_directory", resource: "*", effect: "deny" },
+    ],
+    "orchestrator edit tools and out-of-project access denied by permission",
+  );
   const reviewPrompt = calls.find(([kind, input]) => kind === "prompt" && input.sessionID === "child-v2");
   assert.ok(reviewPrompt, "review prompt sent to the child");
   assert.ok(reviewPrompt[1].text.includes("ADVERSARIAL"), "review prompt body preserved");
@@ -773,6 +780,36 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
   await cleanup();
   assert.equal(typeof hooks.dispose, "function", "v1 hooks expose dispose for host teardown");
   rmSync("/tmp/v2-project", { recursive: true, force: true });
+}
+
+// Watchdog (timeoutMs): a review still in its gates at half time is steered
+// to the critics; a review whose critics are running at the deadline gets one
+// extension of half the budget, then is aborted; a review still in setup at
+// the deadline is aborted without an extension.
+{
+  const h = await makeHarness("no verdict yet", { options: { timeoutMs: 400 } });
+  await h.turn("parent", "please add a feature");
+  const child = h.lastChild();
+  await h.hooks["tool.execute.before"]({ sessionID: child, tool: "bash" }, { args: { command: "git diff" } });
+  await new Promise((r) => setTimeout(r, 260));
+  const steer = h.promptCalls.find((c) => c.id === child && c.text.includes("Half of the review time budget"));
+  assert.ok(steer, "half-time nudge sent while still in gates");
+  assert.equal(steer.body.delivery, undefined, "delivery field never reaches the V1 prompt body");
+  await h.hooks["tool.execute.before"]({ sessionID: child, tool: "task" }, { args: {} });
+  await new Promise((r) => setTimeout(r, 200));
+  assert.ok(h.toasts.some((t) => t.message.includes("extended once")), "deadline with critics running extends instead of aborting");
+  assert.deepEqual(h.aborted, [], "no abort while extended");
+  await new Promise((r) => setTimeout(r, 260));
+  assert.deepEqual(h.aborted, [child], "hard abort after the extension");
+  assert.ok(h.toasts.some((t) => t.message.includes("timed out")), "timeout reported after the extension");
+
+  const g = await makeHarness("no verdict yet", { options: { timeoutMs: 200 } });
+  await g.turn("parent", "please add a feature");
+  await new Promise((r) => setTimeout(r, 300));
+  assert.deepEqual(g.aborted, [g.lastChild()], "review still in setup at the deadline is aborted");
+  assert.ok(!g.toasts.some((t) => t.message.includes("extended once")), "no extension without critics running");
+  h.hooks.dispose?.();
+  g.hooks.dispose?.();
 }
 
 console.log("ALL SMOKE TESTS PASSED");

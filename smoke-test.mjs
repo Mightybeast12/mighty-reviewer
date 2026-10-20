@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
 import module, { MightyReviewer } from "./index.js";
 import tuiPlugin from "./tui.js";
-import { extractVerdict, compareSemver, describeInstall } from "./internals.js";
+import {
+  extractVerdict,
+  compareSemver,
+  describeInstall,
+  countFindings,
+  formatCompactElapsed,
+  formatTokenCount,
+  severityTokens,
+} from "./internals.js";
 
 // Dual-host entry: OpenCode 1.18.29+ reads `server`, OpenCode 2 reads
 // `id` + `setup`. The v1 factory stays the sole implementation.
@@ -810,6 +818,87 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
   assert.ok(!g.toasts.some((t) => t.message.includes("extended once")), "no extension without critics running");
   h.hooks.dispose?.();
   g.hooks.dispose?.();
+}
+
+// 24. Sidebar pure helpers (internals.js, so they're testable without
+//     @opentui/solid / solid-js): countFindings keeps the raw line behind
+//     each counted finding, split by whichever shape matched (heading tag,
+//     bold-inline tag, group heading, bracketed table cell, or a Severity
+//     field); the compact elapsed and token formatters; and the
+//     constant-position severity run the sidebar's rows and totals line
+//     share.
+{
+  const report = [
+    "### [P1] SQL injection in query builder",
+    "- file: db.js:42",
+    "- Severity: P1",
+    "",
+    "- **P2** Missing input validation",
+    "  - file: api.js:10",
+    "",
+    "### P3",
+    "- Unused import in utils.js",
+    "- Another nit in helpers.js",
+    "",
+    "| P0 | auth.js:5 | hardcoded secret |",
+  ].join("\n");
+  const { counts, lines } = countFindings(report);
+  assert.deepEqual(counts, { P0: 1, P1: 1, P2: 1, P3: 2 }, "counts unchanged by the move into internals.js");
+  assert.deepEqual(lines.P0, ["| P0 | auth.js:5 | hardcoded secret |"], "bracketed-tag finding line captured");
+  assert.deepEqual(lines.P1, ["### [P1] SQL injection in query builder"], "tagged-heading finding line captured");
+  assert.deepEqual(lines.P2, ["- **P2** Missing input validation"], "bold-inline-tag finding line captured");
+  assert.deepEqual(
+    lines.P3,
+    ["- Unused import in utils.js", "- Another nit in helpers.js"],
+    "group-heading finding lines captured in order",
+  );
+
+  // A Severity field repeating a heading tag must still count once, and the
+  // winning shape's lines (not the loser's) are the ones returned.
+  const fieldOnly = countFindings("- Severity: P2\n- Severity: P2\n- note");
+  assert.deepEqual(fieldOnly.counts, { P0: 0, P1: 0, P2: 2, P3: 0 }, "field-only report counted via Severity lines");
+  assert.deepEqual(fieldOnly.lines.P2, ["- Severity: P2", "- Severity: P2"], "field lines are the raw Severity lines");
+
+  assert.deepEqual(countFindings("The change is clean.").counts, { P0: 0, P1: 0, P2: 0, P3: 0 }, "no findings, all zero");
+  assert.deepEqual(countFindings("").lines, { P0: [], P1: [], P2: [], P3: [] }, "empty report has no lines anywhere");
+}
+
+{
+  assert.equal(formatCompactElapsed(5000), "5s", "under a minute");
+  assert.equal(formatCompactElapsed(42000), "42s");
+  assert.equal(formatCompactElapsed(102000), "1m42", "minutes and zero-padded seconds, no unit letters");
+  assert.equal(formatCompactElapsed(3600000), "1h00", "exactly an hour");
+  assert.equal(formatCompactElapsed(3900000), "1h05", "hours and zero-padded minutes");
+  assert.equal(formatCompactElapsed(-10), "0s", "never negative");
+}
+
+{
+  assert.equal(formatTokenCount(0), null, "zero tokens is nothing to show");
+  assert.equal(formatTokenCount(-5), null, "negative is nothing to show");
+  assert.equal(formatTokenCount(Number.NaN), null, "NaN is nothing to show");
+  assert.equal(formatTokenCount(500), "500", "bare digits under a thousand");
+  assert.equal(formatTokenCount(999), "999");
+  assert.equal(formatTokenCount(1000), "1k", "thousand rounds up to the k suffix");
+  assert.equal(formatTokenCount(12345), "12k", "rounded to the nearest thousand");
+}
+
+{
+  const run = severityTokens({ P0: 0, P1: 2, P2: 0, P3: 5 });
+  assert.deepEqual(
+    run.map((token) => token.severity),
+    ["P0", "P1", "P2", "P3"],
+    "severity run is always four slots, in P0-P3 order",
+  );
+  assert.deepEqual(
+    run.map((token) => token.label),
+    ["\u00b7", "2 P1", "\u00b7", "5 P3"],
+    "zero slots are a bare dot, counted slots are '<n> P<k>'",
+  );
+  assert.deepEqual(
+    severityTokens({}).map((token) => token.label),
+    ["\u00b7", "\u00b7", "\u00b7", "\u00b7"],
+    "a missing counts object reads as all zero, not a crash",
+  );
 }
 
 console.log("ALL SMOKE TESTS PASSED");

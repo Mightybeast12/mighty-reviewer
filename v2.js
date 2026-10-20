@@ -31,7 +31,7 @@
 import { execFile } from "node:child_process";
 import path from "node:path";
 
-import { PKG_NAME } from "./internals.js";
+import { PKG_NAME, METADATA_KEY } from "./internals.js";
 
 const TOOL_NAME_TO_V1 = { shell: "bash", subagent: "task" };
 // Critics and the review session never need anything outside the project;
@@ -44,7 +44,6 @@ const IDLE_EVENTS = new Set([
   "session.execution.failed",
   "session.execution.interrupted",
 ]);
-const NOTICE_METADATA_KEY = "mightyReviewer";
 
 export function createV2Setup(factory) {
   return async function setup(ctx) {
@@ -254,7 +253,7 @@ function createLegacyClient(ctx, options) {
           sessionID,
           text: `${body?.title ?? PKG_NAME}: ${message}`,
           description: PKG_NAME,
-          metadata: { [NOTICE_METADATA_KEY]: { message, variant: body?.variant ?? "info" } },
+          metadata: { [METADATA_KEY]: { message, variant: body?.variant ?? "info" } },
           delivery: "queue",
           resume: false,
         });
@@ -280,7 +279,7 @@ function createLegacyClient(ctx, options) {
         // the parent link is kept in metadata instead of parentID.
         const created = await ctx.session.create({
           title: body?.title ?? null,
-          ...(body?.parentID ? { metadata: { [NOTICE_METADATA_KEY]: { parentID: body.parentID } } } : {}),
+          ...(body?.parentID ? { metadata: { [METADATA_KEY]: { parentID: body.parentID } } } : {}),
           ...(options.agent ? { agent: options.agent } : {}),
           ...(model ? { model } : {}),
           // The review session is headless: a permission prompt has nobody to
@@ -304,7 +303,15 @@ function createLegacyClient(ctx, options) {
         return {};
       },
       update: async (input) => {
-        await ctx.session.update({ sessionID: sessionIDOf(input), title: input?.body?.title });
+        const body = input?.body ?? {};
+        await ctx.session.update({
+          sessionID: sessionIDOf(input),
+          title: body.title,
+          // Review-progress metadata (index.js setReviewTitle) rides along
+          // here; only forward it when the caller actually set it, so a
+          // plain title update never clobbers metadata with undefined.
+          ...(body.metadata !== undefined ? { metadata: body.metadata } : {}),
+        });
         return { data: true };
       },
       abort: async (input) => {

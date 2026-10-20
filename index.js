@@ -113,7 +113,7 @@ import { readFile, writeFile, rename, rm, stat } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import path from "node:path";
 
-import { PKG_NAME, compareSemver, describeInstall, extractVerdict } from "./internals.js";
+import { PKG_NAME, compareSemver, describeInstall, extractVerdict, METADATA_KEY } from "./internals.js";
 import { createV2Setup } from "./v2.js";
 
 const REVIEW_MARKER = "<!--adversarial-review-auto-->";
@@ -866,17 +866,33 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
 
   // Live progress in the session list: rename the review child session as
   // phases advance. Cosmetic and best-effort; older servers without
-  // session.update just keep the static title.
-  async function setReviewTitle(reviewSessionID, suffix) {
+  // session.update just keep the static title. On OpenCode 2 the same call
+  // also snapshots review-progress metadata onto the review session, so a
+  // sidebar panel that has evicted its live state can still read it back.
+  async function setReviewTitle(reviewSessionID, suffix, parentSessionID) {
     try {
       if (typeof client.session.update !== "function") return;
-      await client.session.update({
-        path: { id: reviewSessionID },
-        body: { title: `Adversarial review - ${suffix}` },
-      });
+      const body = { title: `Adversarial review - ${suffix}` };
+      if (client.v2 && parentSessionID) {
+        body.metadata = { [METADATA_KEY]: reviewMetadataFor(parentSessionID) };
+      }
+      await client.session.update({ path: { id: reviewSessionID }, body });
     } catch {
       // Title updates are best-effort.
     }
+  }
+
+  function reviewMetadataFor(parentSessionID) {
+    const state = reviewStates.get(parentSessionID);
+    return {
+      parentID: parentSessionID,
+      cycle: feedbackCycles.get(parentSessionID) ?? 0,
+      maxCycles: MAX_REREVIEW_CYCLES,
+      startedAt: state?.startedAt ?? null,
+      criticsDone: state?.criticsDone ?? 0,
+      criticsTotal: state?.criticsTotal ?? 0,
+      verdict: state?.verdict ?? null,
+    };
   }
 
   function describePhase(state) {
@@ -931,7 +947,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
     }
     state.updatedAt = Date.now();
     if (toast && progressToasts) await showToast(toast, "info");
-    if (title) void setReviewTitle(reviewSessionID, title);
+    if (title) void setReviewTitle(reviewSessionID, title, parentSessionID);
   }
 
   function armWatchdog(reviewSessionID, parentSessionID) {
@@ -949,7 +965,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       } catch {
         // The nudge is best-effort; the deadline below still applies.
       }
-      void setReviewTitle(reviewSessionID, "steered to critics");
+      void setReviewTitle(reviewSessionID, "steered to critics", parentSessionID);
     }, reviewHalftimeMs);
 
     const abortReview = async () => {
@@ -969,7 +985,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       } catch {
         // Abort is best-effort.
       }
-      void setReviewTitle(reviewSessionID, "timed out");
+      void setReviewTitle(reviewSessionID, "timed out", parentSessionID);
       await showToast("Background review timed out and was aborted.", "warning", parentSessionID);
     };
 
@@ -983,7 +999,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
         state.updatedAt = Date.now();
         const extension = ownTimer(setTimeout(abortReview, reviewExtensionMs));
         reviewWatchdogs.set(reviewSessionID, [extension]);
-        void setReviewTitle(reviewSessionID, `${describePhase(state)}, extended`);
+        void setReviewTitle(reviewSessionID, `${describePhase(state)}, extended`, parentSessionID);
         await showToast(`Background review is still verifying; extended once by ${Math.max(1, Math.round(reviewExtensionMs / 60000))} minutes.`, "info", parentSessionID);
         return;
       }
@@ -1131,8 +1147,6 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
   }
 
   async function reportReviewCompletion(reviewSessionID, parentSessionID, report, verdict) {
-    void setReviewTitle(reviewSessionID, verdict ?? "done");
-
     if (parentSessionID) {
       reviewStates.set(parentSessionID, {
         status: "done",
@@ -1167,6 +1181,10 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       variant = "success";
     }
 
+    // Set after the NO-SHIP cycle above resolves, so the metadata snapshot
+    // (reviewMetadataFor) carries the just-incremented cycle count, not the
+    // stale pre-injection one.
+    void setReviewTitle(reviewSessionID, verdict ?? "done", parentSessionID);
     await showToast(message, variant, parentSessionID);
   }
 
@@ -1196,7 +1214,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       state.phase = "collecting";
       state.updatedAt = Date.now();
     }
-    void setReviewTitle(reviewSessionID, "collecting results");
+    void setReviewTitle(reviewSessionID, "collecting results", parentSessionID);
     await showToast(
       `Review ended without a verdict; nudged it to collect critic results (${count + 1}/${MAX_VERDICT_NUDGES}).`,
       "warning",

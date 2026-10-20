@@ -99,27 +99,28 @@ OpenCode 2 requires a package directory here (it resolves `index.js` and the TUI
 While you are in a session that has a review, the right sidebar shows a small panel:
 
 ```
-┌────────────────────────────────────┐
-│ ▼ Mighty Reviewer          running │
-│ ⠋ review               critics 3/4 │
-│   ⠋ adversarial-risk               │
-│   ✓ design-principles        clean │
-│   ✓ security-checklist   1 P1 2 P3 │
-│   ✓ ai-slop                   1 P3 │
-│                                    │
-│ Critic counts are raw, before the  │
-│ review checks them.                │
-└────────────────────────────────────┘
+┌───────────────────────────────────────────────────────┐
+│ ▼ Mighty Reviewer                              NO-SHIP│
+│ ✓ review        7 files +240/-31   1m42               │
+│   ✓ adversarial-risk    1 P0  ·  ·  2 P3  12k         │
+│   ✓ design-principles          clean   8k             │
+│   ✓ security-checklist  ·  ·  3 P2  ·  11k            │
+│   ✓ ai-slop                    no report              │
+│                                                       │
+│ total            1 P0  ·  3 P2  2 P3 · verified 4 of 6│
+│ cycle 1/2 · fixes sent to session                     │
+└───────────────────────────────────────────────────────┘
 ```
 
-- A spinner marks anything still running, `✓` marks a critic that has returned. The phase on the `review` row comes from the review session's title.
-- Once a critic returns, its row shows how many findings it reported at each severity (P0 and P1 in red, P2 in amber, P3 muted), or `clean` when it reported none.
-- These are each critic's own findings, before the review session verifies and merges them. The review drops findings it can refute and merges duplicates across critics, so the totals can differ from the final verdict. The review session has the final list.
-- When the review finishes the panel folds to one line with the verdict (`SHIP`, `NO-SHIP`, `done`, or `timed out`). Click the header to unfold it and see the per-critic counts again.
-- Click the `review` row or a critic row to open that session.
-- The panel follows the session tree you are looking at and shows its most recent review. In a session that has no review yet it stays folded with `idle`, so it keeps its place in the sidebar like the other panels.
+- A spinner marks anything still running, `✓` marks a critic that has returned. Click the header to unfold the panel and see the per-critic rows again; it folds back to the header line with the verdict once the review finishes (`SHIP`, `NO-SHIP`, `done`, or `timed out`).
+- The `review` row shows the diff scope from the reviewed session (`<files> files +<added>/-<deleted>`, omitted if unavailable) and elapsed time, right-aligned: ticking while the review runs, fixed once it finishes (`42s`, `1m42`, `1h05`). The phase (`critics 2/4`, `verifying`, ...) is shown only while running, and only once it says something the row doesn't already (an early "starting"/"gates" phase is skipped).
+- Each critic row shows a constant-position severity run across P0-P3: a colored `<n> P<k>` where it found something (P0/P1 red, P2 amber, P3 muted), a faint `·` where it found nothing, `clean` in place of the whole run when every slot is zero, `no report` when the critic ended without any text, and `not run` for a critic the review never got to. The faint number at the row's right edge is that critic's token total.
+- These are each critic's own findings, before the review session verifies and merges them. The `total` row (shown once at least one critic has reported) sums the same severity run across critics, raw; once the review itself finishes and its own report can be read, it appends `· verified N of M`, where N is what survived the review's adversarial verification and dedup, and M is the raw total that preceded it.
+- A `cycle N/max` line appears once the NO-SHIP -> fix -> re-review loop (`MAX_REREVIEW_CYCLES`) has run at least once for this session, with `· fixes sent to session` appended while the latest verdict is NO-SHIP.
+- While there is no review yet for the session you are viewing, the panel stays folded with `idle` like the other sidebar panels, showing the latest queued notice for it underneath (e.g. "diff too large for review, skipped") instead of staying silent.
+- Click the `review` row or a critic row to open that session. Clicking a critic row also opens a findings panel for it (P0/P1 lines plus the review's status); run the **`/review-findings`** command for the same panel over every critic at once. On a host without a panel system, clicking a critic row still just opens its session.
 
-The panel reads session titles, status, and critic reports from the TUI's own session data, so it needs no extra setup. After a restart, when the TUI has not loaded past review sessions yet, it asks the server for recent sessions to find them. On a TUI without sidebar slots it is skipped and toasts keep working.
+The panel reads session titles, status, metadata, and critic reports from the TUI's own session data, so it needs no extra setup beyond the review-progress metadata the plugin writes on the review session itself (`parentID`, `cycle`, `maxCycles`, `startedAt`, `criticsDone`, `criticsTotal`, `verdict`), which the panel reads back for the `cycle` line and a sidebar that survived a restart. After a restart, when the TUI has not loaded past review sessions yet, it asks the server for recent sessions to find them. On a TUI without sidebar slots it is skipped and toasts keep working.
 
 How findings are counted: a finding is a line that starts with a severity tag (`### [P1] ...`, `- **P2** ...`, `| P3 | file:line |`, `P1: ...`), a `Severity: P1` field, or a list item under a heading that is only a severity (`### P1`). Severity mentions inside sentences, ranges like `P0-P3`, tallies like `P1: 2`, and code blocks are ignored.
 

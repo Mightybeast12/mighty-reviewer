@@ -12,9 +12,7 @@
  * solid-js, so it is loaded lazily and a failure there never stops toasts.
  */
 
-import { PKG_NAME } from "./internals.js";
-
-const NOTICE_METADATA_KEY = "mightyReviewer";
+import { PKG_NAME, METADATA_KEY } from "./internals.js";
 
 const plugin = {
   id: PKG_NAME,
@@ -62,7 +60,7 @@ function noticeFrom(raw) {
   if (source?.type !== "session.inbox.enqueued") return null;
   const item = source.data?.item;
   if (item?.type !== "synthetic") return null;
-  const notice = item.payload?.metadata?.[NOTICE_METADATA_KEY];
+  const notice = item.payload?.metadata?.[METADATA_KEY];
   if (!notice || typeof notice.message !== "string") return null;
   return { message: notice.message, variant: notice.variant ?? "info", sessionID: source.data.sessionID };
 }

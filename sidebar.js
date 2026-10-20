@@ -2,35 +2,57 @@
  * OpenCode 2 sidebar panel for mighty-reviewer.
  *
  * Shows the background review for the session tree being viewed: one row for
- * the review session (with the phase parsed from its live title) and one row
- * per critic: the four expected critics are listed as pending until their
- * subagent sessions exist, then each row tracks its session. Once a critic
- * returns, its row shows the findings it reported, counted by severity. Everything is derived from host
- * session data and the TUI client; the server side needs no extra wiring.
+ * the review session (diff scope, elapsed time, and live phase while
+ * running) and one row per critic: the four expected critics are listed as
+ * pending until their subagent sessions exist, then each row tracks its
+ * session. Once a critic returns, its row shows the findings it reported, a
+ * constant-position severity run plus its token total. A totals row sums the
+ * raw per-critic counts and, once the review itself is done, how many of
+ * them survived its own verification pass. A cycle line surfaces the
+ * re-review loop (index.js MAX_REREVIEW_CYCLES) once it has run at least
+ * once. Everything is derived from host session data and the TUI client;
+ * the server side only adds the review-progress metadata snapshot (see
+ * index.js reviewMetadataFor) and the notices below.
+ *
+ * While no review exists yet for the viewed session, the panel instead shows
+ * the latest queued notice for it (index.js showToast via the v2 synthetic-
+ * inbox bridge in v2.js), so a skip ("diff too large") is not silent.
+ *
+ * A "mighty-reviewer.findings" session.panel claim shows the P0/P1 lines of
+ * the selected critic (or all of them) plus the review's own status;
+ * clicking a critic row opens it, and so does the global `/review-findings`
+ * command registered through a keymap layer.
  *
  * Laid out like the oh-my-opencode-slim agent panel (single border, header
  * row, a status glyph column, muted labels) so the two read as siblings.
  *
  * Loaded lazily by tui.js: @opentui/solid and solid-js are provided by the
  * OpenCode TUI at runtime and are absent anywhere else (e.g. smoke tests).
+ * The pure counting and formatting helpers live in internals.js instead, so
+ * smoke-test.mjs can exercise them without those two packages.
  */
 
 import { createElement, insert, setProp } from "@opentui/solid";
 import { createMemo, createSignal } from "solid-js";
 
+import { countFindings, formatCompactElapsed, formatTokenCount, severityTokens, SEVERITIES, METADATA_KEY } from "./internals.js";
+
 // Must match the title index.js gives review sessions; phase suffixes are
 // appended as "Adversarial review - <phase>".
 const REVIEW_TITLE = "Adversarial review";
-const NOTICE_METADATA_KEY = "mightyReviewer";
 const BADGE = "Mighty Reviewer";
 const TERMINAL_PHASES = new Set(["SHIP", "NO-SHIP", "done", "timed out"]);
-// Phases before any critic has been dispatched.
+// Phases before any critic has been dispatched: shown nowhere in the row
+// detail, since there is nothing to say yet beyond "it's running" (which the
+// spinner already says). Later phases ("critics 2/4", "verifying", ...) are
+// genuinely informative and stay on the row.
 const EARLY_PHASES = new Set(["starting", "gates"]);
 // The four critics every review dispatches (index.js AGENT_DEFINITIONS, with
 // the "-critic" suffix dropped as criticName does). Shown as pending rows
 // until their sessions exist, so the panel has the same shape at every phase.
 const EXPECTED_CRITICS = ["adversarial-risk", "design-principles", "security-checklist", "ai-slop"];
-const SEVERITIES = ["P0", "P1", "P2", "P3"];
+const FINDINGS_PANEL = "mighty-reviewer.findings";
+const REVIEW_FINDINGS_COMMAND = "mighty-reviewer.review-findings";
 
 const BORDER = { type: "single" };
 const FRAME_MS = 100;
@@ -40,7 +62,6 @@ const DISCOVER_MS = 30000;
 const FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const GLYPH_PENDING = "•";
 const GLYPH_DONE = "✓";
-const RAW_NOTE = "Critic counts are raw, before the review checks them.";
 const IDLE_STATUS = (colors) => ({ label: "idle", color: colors.muted });
 
 const FALLBACK = {
@@ -68,6 +89,7 @@ const WATCHED_EVENTS = [
   "session.status",
   "session.metadata.updated",
   "session.execution.started",
+  "session.inbox.enqueued",
   ...IDLE_EVENTS,
 ];
 
@@ -75,6 +97,7 @@ export function mountSidebar(ctx) {
   const store = createStore(ctx);
   const [now, setNow] = createSignal(Date.now());
   const [openOverride, setOpenOverride] = createSignal(null);
+  const [selectedCritic, setSelectedCritic] = createSignal(null);
 
   let animating = false;
   const pollTimer = setInterval(store.bump, POLL_MS);
@@ -83,26 +106,48 @@ export function mountSidebar(ctx) {
   }, FRAME_MS);
   store.discoverReviews();
 
-  const dispose = ctx.ui.slot({
+  // Opening the findings panel is a thin wrapper so the panel content (which
+  // re-reads `selectedCritic`) always matches whichever row (or none, for
+  // the global command) was clicked. A no-op when the host has no panel
+  // system, which also keeps the review row's/critic rows' click handlers
+  // free to bind it unconditionally.
+  const openFindings = (criticID) => {
+    setSelectedCritic(criticID ?? null);
+    if (typeof ctx.ui?.panel?.open === "function") {
+      ctx.ui.panel.open(FINDINGS_PANEL, { presentation: "panel" });
+    }
+  };
+
+  const disposeSidebar = ctx.ui.slot({
     append: "sidebar.content",
     render: (input) => {
       const view = createMemo(
         () => {
           store.tick();
           const sessionID = input?.sessionID ?? routeSessionID(ctx);
-          return sessionID ? store.readReview(sessionID) : null;
+          if (!sessionID) return null;
+          const review = store.readReview(sessionID);
+          return review ? { review } : { notice: store.noticeFor(sessionID) };
         },
         null,
         { equals: (a, b) => viewKey(a) === viewKey(b) },
       );
       const root = box({ width: "100%", flexDirection: "column" });
       insert(root, () => {
-        const review = view();
+        const current = view();
+        const review = current?.review ?? null;
         animating = review?.running === true;
         const colors = palette(ctx.theme);
         // No review for this session tree yet: keep the panel visible, like
-        // the other sidebar panels, folded to its header.
-        if (!review) return frame(colors, [header(colors, { open: false, status: IDLE_STATUS(colors) })]);
+        // the other sidebar panels, folded to its header. Surface the last
+        // queued notice (e.g. "diff too large, skipped") underneath it.
+        if (!review) {
+          const notice = current?.notice;
+          return frame(colors, [
+            header(colors, { open: false, status: IDLE_STATUS(colors) }),
+            notice ? noticeLine(colors, notice) : null,
+          ]);
+        }
         // Open while running, folded once finished, unless the user toggled
         // this particular review.
         const override = openOverride();
@@ -111,6 +156,7 @@ export function mountSidebar(ctx) {
           open,
           toggle: () => setOpenOverride({ id: review.id, open: !open }),
           navigate: (sessionID) => navigate(ctx, sessionID),
+          openFindings,
           hasSelection: () => hasSelection(ctx.renderer),
         });
       });
@@ -118,12 +164,50 @@ export function mountSidebar(ctx) {
     },
   });
 
+  // Detail view for a critic (or, from the global command below, every
+  // critic): the P0/P1 lines countFindings captured, plus the review's own
+  // status. Registered unconditionally; a host without session.panel simply
+  // never calls this render with our name.
+  const disposeFindingsPanel = ctx.ui.slot({
+    append: "session.panel",
+    render: (panel) => (panel.name === FINDINGS_PANEL ? renderFindingsPanel(panel, store, selectedCritic, ctx.theme) : null),
+  });
+
+  const disposeKeymap = mountFindingsCommand(ctx, openFindings);
+
   return () => {
     clearInterval(pollTimer);
     clearInterval(frameTimer);
     store.dispose();
-    dispose?.();
+    disposeSidebar?.();
+    disposeFindingsPanel?.();
+    disposeKeymap?.();
   };
+}
+
+// Registered the way a global keymap command is documented: a claim on the
+// "app" slot (rendered once, nowhere in particular) that registers a
+// reactive keymap layer and renders nothing itself. Skipped entirely on a
+// host without a keymap API.
+function mountFindingsCommand(ctx, openFindings) {
+  if (typeof ctx.keymap?.layer !== "function") return undefined;
+  return ctx.ui.slot({
+    append: "app",
+    render: () => {
+      ctx.keymap.layer(() => ({
+        mode: "global",
+        commands: [
+          {
+            id: REVIEW_FINDINGS_COMMAND,
+            title: "Mighty Reviewer: review findings",
+            slash: { name: "review-findings" },
+            run: () => openFindings(null),
+          },
+        ],
+      }));
+      return null;
+    },
+  });
 }
 
 // ---------------------------------------------------------------- data
@@ -140,6 +224,8 @@ function createStore(ctx) {
   const known = new Map();
   const running = new Set();
   const results = new Map();
+  const reviewReports = new Map();
+  const notices = new Map();
   const lastTry = new Map();
 
   const throttled = (key, everyMs) => {
@@ -192,13 +278,14 @@ function createStore(ctx) {
   // report never changes, so a parsed result is kept for good.
   const resultOf = (criticID, settled) => {
     if (results.has(criticID)) return results.get(criticID);
-    const cached = reportFrom(safe(() => data.session.message.list(criticID)) ?? [], "asc");
-    if (cached !== null) return keepResult(criticID, cached);
+    const cachedMessages = safe(() => data.session.message.list(criticID)) ?? [];
+    const cachedReport = reportFrom(cachedMessages, "asc");
+    if (cachedReport !== null) return keepResult(criticID, cachedReport, cachedMessages);
     if (throttled(`messages:${criticID}`, RETRY_MS)) {
       fetchMessages(criticID)
         .then((messages) => {
           const report = reportFrom(messages, "desc");
-          if (report !== null) keepResult(criticID, report);
+          if (report !== null) keepResult(criticID, report, messages);
           else if (settled) results.set(criticID, { noReport: true });
           bump();
         })
@@ -207,10 +294,46 @@ function createStore(ctx) {
     return null;
   };
 
-  const keepResult = (criticID, report) => {
-    const result = { counts: countFindings(report) };
+  const keepResult = (criticID, report, messages) => {
+    const { counts, lines } = countFindings(report);
+    const result = { counts, lines, tokens: tokensOf(criticID, messages) };
     results.set(criticID, result);
     return result;
+  };
+
+  // Session.tokens is the authoritative running total; fall back to summing
+  // whatever assistant messages were on hand (host cache or the fallback
+  // fetch above) when the session itself hasn't got one yet.
+  const tokensOf = (criticID, messages) => {
+    const sessionTokens = known.get(criticID)?.tokens;
+    if (sessionTokens) return sumTokenUsage(sessionTokens);
+    const total = messages.reduce((sum, message) => sum + messageTokens(message), 0);
+    return total > 0 ? total : null;
+  };
+
+  // The review's own merged/verified report, counted the same way as a
+  // critic's, so the totals row can show "verified N of <raw total>".
+  const verifiedCountOf = (reviewID) => {
+    if (reviewReports.has(reviewID)) return reviewReports.get(reviewID);
+    const cachedMessages = safe(() => data.session.message.list(reviewID)) ?? [];
+    const cachedReport = reportFrom(cachedMessages, "asc");
+    if (cachedReport !== null) {
+      const verified = sumCounts(countFindings(cachedReport).counts);
+      reviewReports.set(reviewID, verified);
+      return verified;
+    }
+    if (throttled(`review-report:${reviewID}`, RETRY_MS)) {
+      fetchMessages(reviewID)
+        .then((messages) => {
+          const report = reportFrom(messages, "desc");
+          if (report !== null) {
+            reviewReports.set(reviewID, sumCounts(countFindings(report).counts));
+            bump();
+          }
+        })
+        .catch(() => {});
+    }
+    return null;
   };
 
   const fetchMessages = async (sessionID) => {
@@ -231,6 +354,9 @@ function createStore(ctx) {
       known.set(id, { ...known.get(id), metadata: info.metadata });
     } else if (type === "session.deleted") {
       known.delete(id);
+    } else if (type === "session.inbox.enqueued") {
+      const notice = noticeFromItem(info.item);
+      if (notice) notices.set(id, notice);
     }
     if (type === "session.execution.started") running.add(id);
     if (IDLE_EVENTS.has(type)) running.delete(id);
@@ -270,7 +396,7 @@ function createStore(ctx) {
     let review;
     for (const info of known.values()) {
       if (!isReviewSession(info)) continue;
-      const parentID = info.metadata?.[NOTICE_METADATA_KEY]?.parentID;
+      const parentID = info.metadata?.[METADATA_KEY]?.parentID;
       if (!tree.has(info.id) && !tree.has(parentID)) continue;
       if (!review || millis(info.time?.created) > millis(review.time?.created)) review = info;
     }
@@ -282,6 +408,12 @@ function createStore(ctx) {
     for (const id of safe(() => data.session.family(review.id)) ?? []) {
       remember(safe(() => data.session.get(id)));
     }
+    // The review's own time.updated and metadata only land in `known` once
+    // it is refreshed from the host; family() may or may not include the
+    // review session itself, so refresh it explicitly.
+    remember(safe(() => data.session.get(review.id)));
+    review = known.get(review.id) ?? review;
+
     const phase = phaseOf(review.title);
     const finished = TERMINAL_PHASES.has(phase);
     const critics = [...known.values()]
@@ -295,7 +427,40 @@ function createStore(ctx) {
     if (critics.length === 0 && !EARLY_PHASES.has(phase)) discoverCritics(review.id);
 
     const reviewRunning = !finished && (isRunning(review.id) || critics.some((c) => c.running));
-    return { id: review.id, phase, finished, running: reviewRunning, critics: withExpected(critics) };
+
+    const parentID = review.metadata?.[METADATA_KEY]?.parentID;
+    const parentSession = parentID ? safe(() => data.session.get(parentID)) : null;
+    const diffSummary = parentSession?.summary
+      ? `${parentSession.summary.files} files +${parentSession.summary.additions}/-${parentSession.summary.deletions}`
+      : null;
+
+    const rawCounts = totalCounts(critics);
+    let verifiedSuffix = null;
+    if (rawCounts && finished) {
+      const verified = verifiedCountOf(review.id);
+      if (verified !== null) verifiedSuffix = ` · verified ${verified} of ${sumCounts(rawCounts)}`;
+    }
+
+    const reviewMeta = review.metadata?.[METADATA_KEY];
+    const cycleLabel =
+      reviewMeta?.cycle > 0
+        ? `cycle ${reviewMeta.cycle}/${reviewMeta.maxCycles ?? reviewMeta.cycle}${
+            reviewMeta.verdict === "NO-SHIP" ? " · fixes sent to session" : ""
+          }`
+        : null;
+
+    return {
+      id: review.id,
+      phase,
+      finished,
+      running: reviewRunning,
+      time: review.time,
+      diffSummary,
+      rawCounts,
+      verifiedSuffix,
+      cycleLabel,
+      critics: withExpected(critics),
+    };
   };
 
   return {
@@ -303,6 +468,7 @@ function createStore(ctx) {
     bump,
     readReview,
     discoverReviews,
+    noticeFor: (sessionID) => notices.get(sessionID) ?? null,
     dispose: () => {
       for (const off of offs) off?.();
     },
@@ -359,122 +525,39 @@ function reportFrom(messages, order) {
   return null;
 }
 
-// ---------------------------------------------------------------- findings
-
-const DECORATION = /^(?:\s+|[#>*+|-]+|\d+[.)]|__|[[(`])/;
-const FENCE = /^\s*(```|~~~)/;
-const HEADING = /^\s*#/;
-const TOP_LEVEL_ITEM = /^ ?(?:[-*+]|\d+[.)])\s/;
-const STRUCTURAL = /^\s*(?:#|[-*+]\s|\d+[.)]\s|\|)/;
-const LEADING_TAG = /^(P[0-3])\b/i;
-const FIELD_TAG = /^severity\b[\s*_]*[:=-]?[\s*_]*[[(`]?\s*(P[0-3])\b/i;
-const BRACKET_TAG = /[[(](P[0-3])[\])]/i;
-// A bare severity label used as a group heading: "### P1", "**P2 findings**",
-// "P1 - High:", "P3 (nits)". Items listed under it carry its severity.
-const GROUP_LABEL =
-  /^(P[0-3])\b[\s*_:\u2013-]*(?:\(?\s*(?:critical|high|medium|low|minor|major|nits?|findings?|issues?|blocking|none|n\/a|nothing)(?:\s+(?:findings?|issues?))?\s*\)?)?[\s*_:.\u2013-]*$/i;
-const EMPTY_LABEL = /\b(?:none|n\/a|nothing)\b/i;
-// After a tag on a plain paragraph line, only a separator marks a finding
-// ("P1: foo.ts:3 ...", "P2 - ..."); "P1 is reserved for ..." is prose.
-const PLAIN_SEPARATOR = /^[\])*_`]*\s*[:|\u2013-]/;
-// What may follow a leading tag without it being a finding: a range or pair
-// ("P0-P3", "P0/P1"), prose about the severity itself ("P1 findings must"),
-// a summary of nothing ("P1: none"), or a bare tally ("P1: 2").
-const NOT_A_FINDING =
-  /^(?:\s*[-/\u2013]\s*P?[0-3]\b|[\s\])`*_:\u2013-]*findings?\b|[\s\])`*_:\u2013-]*(?:none|n\/a|nothing)\b|[\s\])`*_:=\u2013-]*\d+[\s*_.]*$)/i;
-
-/**
- * Counts one critic's findings by severity.
- *
- * The critic prompts (index.js AGENT_DEFINITIONS) require a P0-P3 severity on
- * every finding but leave the layout free, so three shapes are recognized,
- * each only at the start of a line after markdown decoration
- * (#, -, *, 1., |, **):
- *   - a severity tag that opens the finding: "### [P1] ...", "- **P2** ...",
- *     "| P3 | file:line |", or a bracketed tag in a heading or list item;
- *   - a group heading that is only a severity label ("### P1", "**P2**"),
- *     where each top-level list item under it is one finding;
- *   - a severity field inside a finding block: "- Severity: P1".
- * A finding written in two shapes (tagged heading plus a Severity field)
- * must count once, so field lines are tallied separately and the larger
- * tally wins. Severity mentions inside prose, ranges like "P0-P3", and lines
- * like "P1: none" or "P1: 2" never count. Code fences are skipped.
- */
-export function countFindings(report) {
-  const tagged = emptyCounts();
-  const fields = emptyCounts();
-  let fenced = false;
-  let section = null;
-  let sectionLevel = 0;
-  let sectionByHeadings = false;
-  for (const raw of String(report ?? "").split("\n")) {
-    if (FENCE.test(raw)) {
-      fenced = !fenced;
-      continue;
-    }
-    if (fenced || !raw.trim()) continue;
-    const line = stripDecoration(raw);
-    const isItem = TOP_LEVEL_ITEM.test(raw);
-    const structural = STRUCTURAL.test(raw);
-    const level = headingLevel(raw);
-
-    const group = isGroupLine(raw, isItem) ? GROUP_LABEL.exec(line) : null;
-    if (group) {
-      section = EMPTY_LABEL.test(line) ? null : group[1].toUpperCase();
-      sectionLevel = level || 99;
-      sectionByHeadings = false;
-      continue;
-    }
-    // A deeper heading inside a severity group is one finding of that group;
-    // a heading at the group's level or above ends the group.
-    const subHeading = level > 0 && section !== null && level > sectionLevel;
-    if (level > 0 && !subHeading) section = null;
-    // Once a group lists its findings as sub-headings, list items below them
-    // are details of those findings, not findings of their own.
-    if (subHeading) sectionByHeadings = true;
-
-    const field = FIELD_TAG.exec(line);
-    if (field) {
-      fields[field[1].toUpperCase()] += 1;
-      continue;
-    }
-    const lead = LEADING_TAG.exec(line);
-    const rest = lead ? line.slice(lead[0].length) : "";
-    const leadCounts = lead && !NOT_A_FINDING.test(rest) && (structural || PLAIN_SEPARATOR.test(rest));
-    const bracket = lead || !structural ? null : BRACKET_TAG.exec(line);
-    const tag = leadCounts ? lead[1] : bracket?.[1];
-    if (tag) tagged[tag.toUpperCase()] += 1;
-    else if (!lead && section && (subHeading || (isItem && !sectionByHeadings))) tagged[section] += 1;
-  }
-  return total(tagged) >= total(fields) ? tagged : fields;
+function sumTokenUsage(tokens) {
+  return (tokens?.input ?? 0) + (tokens?.output ?? 0) + (tokens?.reasoning ?? 0);
 }
 
-function headingLevel(raw) {
-  const match = /^\s*(#+)\s/.exec(raw);
-  return match ? match[1].length : 0;
+function messageTokens(message) {
+  const isAssistant = message?.type === "assistant" || message?.info?.role === "assistant";
+  return isAssistant ? sumTokenUsage(message.tokens) : 0;
 }
 
-// Group labels only come as headings, bold lines, or lines ending in ":".
-function isGroupLine(raw, isItem) {
-  if (isItem) return false;
-  return HEADING.test(raw) || /^\s*(\*\*|__).*(\*\*|__)\s*:?\s*$/.test(raw) || /:\s*$/.test(raw);
-}
-
-function stripDecoration(line) {
-  let rest = line;
-  for (let previous = null; previous !== rest; ) {
-    previous = rest;
-    rest = rest.replace(DECORATION, "");
-  }
-  return rest;
-}
-
-function emptyCounts() {
-  return { P0: 0, P1: 0, P2: 0, P3: 0 };
-}
-
-function total(counts) {
+function sumCounts(counts) {
   return SEVERITIES.reduce((sum, severity) => sum + counts[severity], 0);
+}
+
+// Sums each critic's raw counts; null (not a zero-filled object) when no
+// critic has reported yet, so the totals row knows to stay hidden.
+function totalCounts(critics) {
+  let any = false;
+  const sums = { P0: 0, P1: 0, P2: 0, P3: 0 };
+  for (const critic of critics) {
+    if (!critic.result?.counts) continue;
+    any = true;
+    for (const severity of SEVERITIES) sums[severity] += critic.result.counts[severity];
+  }
+  return any ? sums : null;
+}
+
+// Same parse as tui.js's noticeFrom, applied to the raw inbox item instead of
+// the wrapped event envelope: a synthetic item carrying our metadata key.
+function noticeFromItem(item) {
+  if (item?.type !== "synthetic") return null;
+  const notice = item.payload?.metadata?.[METADATA_KEY];
+  if (!notice || typeof notice.message !== "string") return null;
+  return { message: notice.message, variant: notice.variant ?? "info" };
 }
 
 // ---------------------------------------------------------------- helpers
@@ -547,6 +630,12 @@ function palette(theme) {
   };
 }
 
+// Severity -> color, zero-valued slots always rendered in the faint/muted
+// color regardless of which severity they are.
+function severityColors(colors) {
+  return { P0: colors.error, P1: colors.error, P2: colors.warning, P3: colors.muted };
+}
+
 // ---------------------------------------------------------------- view
 
 function renderPanel(review, colors, now, ui) {
@@ -568,26 +657,27 @@ function renderPanel(review, colors, now, ui) {
       : row({
           glyph: glyphOf(critic.running, critic.result !== null || review.finished, colors, now),
           label: critic.name,
-          detail: critic.running ? null : resultCells(critic.result, colors),
+          detail: critic.running ? null : resultDetail(critic.result, colors),
           indent: 2,
           colors,
           onClick: () => ui.navigate(critic.id),
+          onPress: () => ui.openFindings(critic.id),
           hasSelection: ui.hasSelection,
         }),
   );
-  const hasCounts = review.critics.some((critic) => critic.result?.counts);
   return frame(colors, [
     panelHeader,
     row({
       glyph: glyphOf(review.running, review.finished, colors, now),
       label: "review",
-      detail: review.finished ? null : [text({ fg: colors.muted, wrapMode: "none" }, [review.phase])],
+      detail: reviewDetail(review, colors, now),
       colors,
       onClick: () => ui.navigate(review.id),
       hasSelection: ui.hasSelection,
     }),
     ...criticRows,
-    hasCounts ? text({ fg: colors.muted, marginTop: 1 }, [RAW_NOTE]) : null,
+    totalsLine(review, colors),
+    cycleLine(review, colors),
   ]);
 }
 
@@ -626,22 +716,107 @@ function header(colors, { open, status, toggle, hasSelection }) {
     ]),
     text({ fg: status.color, wrapMode: "none" }, [status.label]),
   ]);
-  return toggle ? clickable(line, toggle, hasSelection) : line;
+  return toggle ? clickable(line, toggle, undefined, hasSelection) : line;
 }
 
-// "1 P1 2 P3" with each pair in its severity color, "clean" when the critic
-// reported nothing, "no report" when it ended without any text.
-function resultCells(result, colors) {
+// A muted single line under the folded header, for the latest queued notice
+// (index.js showToast, delivered as a synthetic inbox item on v2 - see
+// noticeFromItem) when there is no review to show instead.
+function noticeLine(colors, notice) {
+  return box({ width: "100%", flexDirection: "row", paddingLeft: 2 }, [
+    text({ fg: colors.muted, wrapMode: "none", truncate: true }, [notice.message]),
+  ]);
+}
+
+// Review row detail, left to right: diff scope (parent session's
+// Session.summary), the phase while it is running and worth saying, and the
+// elapsed time, right-aligned by the row's own layout (label grows, detail
+// shrinks). Elapsed ticks every frame while running; it is a fixed value
+// once finished.
+function reviewDetail(review, colors, now) {
+  const items = [];
+  if (review.diffSummary) items.push(review.diffSummary);
+  const phaseLabel = review.running && !EARLY_PHASES.has(review.phase) ? review.phase : null;
+  if (phaseLabel) items.push(phaseLabel);
+  const elapsed = elapsedLabel(review, now);
+  if (elapsed !== null) items.push(elapsed);
+  if (!items.length) return null;
+  return items.map((value, index) =>
+    text({ fg: colors.muted, wrapMode: "none", marginLeft: index === 0 ? 0 : 1 }, [value]),
+  );
+}
+
+// A plain string once finished (static), a reactive thunk reading `now()`
+// while running (so it ticks), or null when there is no created time to
+// measure from yet.
+function elapsedLabel(review, now) {
+  const created = millis(review.time?.created);
+  if (!created) return null;
+  if (review.finished) {
+    const updated = millis(review.time?.updated);
+    return updated >= created ? formatCompactElapsed(updated - created) : null;
+  }
+  return () => formatCompactElapsed(Math.max(0, now() - created));
+}
+
+// "1 P0  ·  ·  2 P3" with each severity in a constant position (its color
+// when counted, faint when zero), "clean" when the critic reported nothing,
+// "no report" when it ended without any text, each (but "no report")
+// followed by the critic session's token total.
+function resultDetail(result, colors) {
   if (!result) return null;
   if (result.noReport) return [text({ fg: colors.muted, wrapMode: "none" }, ["no report"])];
-  const present = SEVERITIES.filter((severity) => result.counts[severity] > 0);
-  if (present.length === 0) return [text({ fg: colors.success, wrapMode: "none" }, ["clean"])];
-  const severityColor = { P0: colors.error, P1: colors.error, P2: colors.warning, P3: colors.muted };
-  return present.map((severity, index) =>
-    text({ fg: severityColor[severity], wrapMode: "none", marginLeft: index === 0 ? 0 : 1 }, [
-      `${result.counts[severity]} ${severity}`,
-    ]),
-  );
+  const cells = [];
+  const hasFindings = SEVERITIES.some((severity) => result.counts[severity] > 0);
+  if (!hasFindings) {
+    cells.push(text({ fg: colors.success, wrapMode: "none" }, ["clean"]));
+  } else {
+    const severityColor = severityColors(colors);
+    severityTokens(result.counts).forEach((token, index) => {
+      cells.push(
+        text(
+          {
+            fg: token.count > 0 ? severityColor[token.severity] : colors.muted,
+            wrapMode: "none",
+            marginLeft: index === 0 ? 0 : 1,
+          },
+          [token.label],
+        ),
+      );
+    });
+  }
+  const tokenLabel = formatTokenCount(result.tokens);
+  if (tokenLabel) cells.push(text({ fg: colors.muted, wrapMode: "none", marginLeft: 1 }, [tokenLabel]));
+  return cells;
+}
+
+// "total" line: the summed severity run across every critic that has
+// counts, plus " · verified N of M" once the review itself is done and its
+// own report could be fetched and counted.
+function totalsLine(review, colors) {
+  if (!review.rawCounts) return null;
+  const severityColor = severityColors(colors);
+  const cells = [text({ fg: colors.muted, wrapMode: "none" }, ["total"])];
+  severityTokens(review.rawCounts).forEach((token) => {
+    cells.push(
+      text(
+        { fg: token.count > 0 ? severityColor[token.severity] : colors.muted, wrapMode: "none", marginLeft: 1 },
+        [token.label],
+      ),
+    );
+  });
+  if (review.verifiedSuffix) cells.push(text({ fg: colors.muted, wrapMode: "none" }, [review.verifiedSuffix]));
+  return box({ width: "100%", flexDirection: "row" }, cells);
+}
+
+// "cycle N/max" once the re-review loop (index.js MAX_REREVIEW_CYCLES) has
+// run at least once for this review's parent session, with " · fixes sent
+// to session" appended while the latest verdict is NO-SHIP.
+function cycleLine(review, colors) {
+  if (!review.cycleLabel) return null;
+  return box({ width: "100%", flexDirection: "row" }, [
+    text({ fg: colors.muted, wrapMode: "none" }, [review.cycleLabel]),
+  ]);
 }
 
 function glyphOf(isRunning, settled, colors, now) {
@@ -651,7 +826,7 @@ function glyphOf(isRunning, settled, colors, now) {
   return { color: colors.muted, value: `${settled ? GLYPH_DONE : GLYPH_PENDING} ` };
 }
 
-function row({ glyph, label, detail, indent = 0, colors, onClick, hasSelection }) {
+function row({ glyph, label, detail, indent = 0, colors, onClick, onPress, hasSelection }) {
   return clickable(
     box({ width: "100%", flexDirection: "row", paddingLeft: indent, shouldFill: true }, [
       text({ fg: glyph.color, width: 2, flexShrink: 0, wrapMode: "none" }, [glyph.value]),
@@ -659,17 +834,67 @@ function row({ glyph, label, detail, indent = 0, colors, onClick, hasSelection }
       detail ? box({ flexDirection: "row", flexShrink: 0, marginLeft: 1 }, detail) : null,
     ]),
     onClick,
+    onPress,
     hasSelection,
   );
 }
 
-function clickable(node, onActivate, hasSelection) {
+// onMouseUp keeps the existing click-to-navigate behavior; onMouseDown (when
+// given) additionally opens the findings panel, so a host without a panel
+// system is left with exactly the old navigate-only behavior.
+function clickable(node, onActivate, onPress, hasSelection) {
   setProp(node, "onMouseUp", (event) => {
     if (event?.button !== undefined && event.button !== 0) return;
     if (hasSelection()) return;
-    onActivate();
+    onActivate?.();
   });
+  if (onPress) {
+    setProp(node, "onMouseDown", (event) => {
+      if (event?.button !== undefined && event.button !== 0) return;
+      if (hasSelection()) return;
+      onPress();
+    });
+  }
   return node;
+}
+
+// ---------------------------------------------------------------- findings panel
+
+// "mighty-reviewer.findings" session.panel content: the P0/P1 lines of the
+// selected critic (or every critic, for the global command / no selection),
+// plus the review's own status.
+function renderFindingsPanel(panel, store, selectedCritic, theme) {
+  const colors = palette(theme);
+  const review = store.readReview(panel.sessionID);
+  if (!review) {
+    return panelBox(colors, [text({ fg: colors.muted }, ["No review for this session."])]);
+  }
+
+  const criticID = selectedCritic();
+  const selected = criticID ? review.critics.find((critic) => critic.id === criticID) : null;
+  const targets = selected ? [selected] : review.critics;
+
+  const lines = [];
+  for (const critic of targets) {
+    const criticLines = critic.result?.lines;
+    if (!criticLines) continue;
+    for (const severity of ["P0", "P1"]) {
+      for (const line of criticLines[severity] ?? []) {
+        lines.push(text({ fg: colors.error, wrapMode: "none" }, [`${severity} [${critic.name}] ${line}`]));
+      }
+    }
+  }
+
+  const status = statusOf(review, colors);
+  return panelBox(colors, [
+    text({ fg: colors.text }, [selected ? `Findings: ${selected.name}` : "Findings: all critics"]),
+    text({ fg: status.color, wrapMode: "none" }, [status.label]),
+    ...(lines.length ? lines : [text({ fg: colors.muted }, ["No P0/P1 findings."])]),
+  ]);
+}
+
+function panelBox(colors, children) {
+  return box({ width: "100%", flexDirection: "column", padding: 1 }, children);
 }
 
 function element(tag, props, children = []) {

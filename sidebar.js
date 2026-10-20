@@ -33,9 +33,9 @@
  */
 
 import { createElement, insert, setProp } from "@opentui/solid";
-import { createMemo, createSignal } from "solid-js";
+import { createMemo, createSignal, onCleanup } from "solid-js";
 
-import { countFindings, formatCompactElapsed, formatTokenCount, severityTokens, SEVERITIES, METADATA_KEY } from "./internals.js";
+import { countFindings, formatCompactElapsed, formatTokenCount, severityTokens, SEVERITIES, METADATA_KEY, PKG_NAME } from "./internals.js";
 
 // Must match the title index.js gives review sessions; phase suffixes are
 // appended as "Adversarial review - <phase>".
@@ -167,10 +167,21 @@ export function mountSidebar(ctx) {
   // Detail view for a critic (or, from the global command below, every
   // critic): the P0/P1 lines countFindings captured, plus the review's own
   // status. Registered unconditionally; a host without session.panel simply
-  // never calls this render with our name.
+  // never calls this render with our name. controlledPanels makes sure a
+  // given panel instance only gets its keymap layer/focus set up once,
+  // even though render runs again on every reactive tick (store.tick(),
+  // selectedCritic()).
+  const controlledPanels = new WeakSet();
   const disposeFindingsPanel = ctx.ui.slot({
     append: "session.panel",
-    render: (panel) => (panel.name === FINDINGS_PANEL ? renderFindingsPanel(panel, store, selectedCritic, ctx.theme) : null),
+    render: (panel) => {
+      if (panel?.name !== FINDINGS_PANEL) return null;
+      if (!controlledPanels.has(panel)) {
+        controlledPanels.add(panel);
+        setupPanelControls(ctx, panel);
+      }
+      return renderFindingsPanel(panel, store, selectedCritic, ctx.theme);
+    },
   });
 
   const disposeKeymap = mountFindingsCommand(ctx, openFindings);
@@ -860,6 +871,72 @@ function clickable(node, onActivate, onPress, hasSelection) {
 
 // ---------------------------------------------------------------- findings panel
 
+// Gives the findings panel keyboard escape/q close and an f fullscreen
+// toggle, plus input focus on first render, since the host documents
+// that a panel's keymap layers and input modes are active only while
+// the panel owns input, and nothing closes a panel unless the plugin
+// does. Guarded on both ctx.keymap.layer and panel.focus actually
+// existing: a host missing either surface just leaves the mouse hint
+// (and, for focus, one extra click) as the only way in.
+function setupPanelControls(ctx, panel) {
+  if (typeof ctx.keymap?.layer === "function") {
+    try {
+      const dispose = ctx.keymap.layer(() => ({
+        target: () => panel,
+        commands: [
+          { id: `${PKG_NAME}.panel.close`, bind: "escape", run: () => { panel.close(); } },
+          { id: `${PKG_NAME}.panel.close-q`, bind: "q", run: () => { panel.close(); } },
+          { id: `${PKG_NAME}.panel.fullscreen`, bind: "f", run: () => { panel.toggleFullscreen(); } },
+        ],
+      }));
+      if (typeof dispose === "function") {
+        try {
+          onCleanup(dispose);
+        } catch {
+          // onCleanup needs a reactive owner; harmless to skip without one.
+        }
+      }
+    } catch (error) {
+      console.error(`[${PKG_NAME}] findings panel keymap layer registration failed`, error);
+    }
+  }
+  try {
+    panel.focus?.();
+  } catch {
+    // Best-effort: a host without focus() just needs one extra click.
+  }
+}
+
+// Title on the left, close/fullscreen hints on the right. The hints are
+// muted (not actionable-looking text) but clickable, mirroring the
+// keyboard bindings setupPanelControls registers: esc or q closes the
+// panel, f toggles fullscreen.
+function findingsPanelHeader(colors, panel) {
+  return box({ width: "100%", flexDirection: "row", justifyContent: "space-between" }, [
+    text({ fg: colors.text, wrapMode: "none" }, ["Mighty Reviewer findings"]),
+    box({ flexDirection: "row" }, [
+      panelHint("close (esc)", colors, () => panel.close()),
+      text({ fg: colors.muted, wrapMode: "none" }, ["  "]),
+      panelHint("fullscreen (f)", colors, () => panel.toggleFullscreen()),
+    ]),
+  ]);
+}
+
+// A muted, clickable hint (primary mouse button only, mirroring
+// clickable's guard).
+function panelHint(label, colors, onActivate) {
+  return box(
+    {
+      flexDirection: "row",
+      onMouseUp: (event) => {
+        if (event?.button !== undefined && event.button !== 0) return;
+        onActivate();
+      },
+    },
+    [text({ fg: colors.muted, wrapMode: "none" }, [label])],
+  );
+}
+
 // "mighty-reviewer.findings" session.panel content: the P0/P1 lines of the
 // selected critic (or every critic, for the global command / no selection),
 // plus the review's own status.
@@ -867,7 +944,7 @@ function renderFindingsPanel(panel, store, selectedCritic, theme) {
   const colors = palette(theme);
   const review = store.readReview(panel.sessionID);
   if (!review) {
-    return panelBox(colors, [text({ fg: colors.muted }, ["No review for this session."])]);
+    return panelBox(colors, [findingsPanelHeader(colors, panel), text({ fg: colors.muted }, ["No review for this session."])]);
   }
 
   const criticID = selectedCritic();
@@ -887,6 +964,7 @@ function renderFindingsPanel(panel, store, selectedCritic, theme) {
 
   const status = statusOf(review, colors);
   return panelBox(colors, [
+    findingsPanelHeader(colors, panel),
     text({ fg: colors.text }, [selected ? `Findings: ${selected.name}` : "Findings: all critics"]),
     text({ fg: status.color, wrapMode: "none" }, [status.label]),
     ...(lines.length ? lines : [text({ fg: colors.muted }, ["No P0/P1 findings."])]),

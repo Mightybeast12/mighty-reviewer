@@ -176,11 +176,17 @@ export function mountSidebar(ctx) {
     append: "session.panel",
     render: (panel) => {
       if (panel?.name !== FINDINGS_PANEL) return null;
+      // A stable outer box per panel instance: the keymap layer targets a
+      // renderable (the host subscribes to its DESTROYED event), so the
+      // reactive content is inserted inside it rather than returned anew
+      // on every tick.
+      const shell = box({ width: "100%", flexDirection: "column" });
+      insert(shell, () => renderFindingsPanel(panel, store, selectedCritic, ctx.theme));
       if (!controlledPanels.has(panel)) {
         controlledPanels.add(panel);
-        setupPanelControls(ctx, panel);
+        setupPanelControls(ctx, panel, shell);
       }
-      return renderFindingsPanel(panel, store, selectedCritic, ctx.theme);
+      return shell;
     },
   });
 
@@ -879,11 +885,14 @@ function clickable(node, onActivate, onPress, hasSelection) {
 // does. Guarded on both ctx.keymap.layer and panel.focus actually
 // existing: a host missing either surface just leaves the mouse hint
 // (and, for focus, one extra click) as the only way in.
-function setupPanelControls(ctx, panel) {
+function setupPanelControls(ctx, panel, target) {
   if (typeof ctx.keymap?.layer === "function") {
     try {
+      // `target` must be an OpenTUI renderable, never the PanelInput: the
+      // host calls target().once(DESTROYED, ...) to retire the layer, and
+      // passing the input object crashed the whole session.panel slot.
       const dispose = ctx.keymap.layer(() => ({
-        target: () => panel,
+        target: () => target,
         commands: [
           { id: `${PKG_NAME}.panel.close`, bind: "escape", run: () => { panel.close(); } },
           { id: `${PKG_NAME}.panel.close-q`, bind: "q", run: () => { panel.close(); } },

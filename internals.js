@@ -8,8 +8,20 @@
 
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { createRequire } from "node:module";
 
 export const PKG_NAME = "mighty-reviewer";
+// Shown in the sidebar header; read from package.json so it cannot drift
+// from the published version. Empty when the lookup fails (odd loaders).
+export const PKG_VERSION = readPackageVersion();
+
+function readPackageVersion() {
+  try {
+    return createRequire(import.meta.url)("./package.json").version ?? "";
+  } catch {
+    return "";
+  }
+}
 
 // Metadata key both the server side (index.js, v2.js) and the TUI side
 // (tui.js, sidebar.js) read and write: notices queued as synthetic inbox

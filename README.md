@@ -100,7 +100,7 @@ While you are in a session that has a review, the right sidebar shows a small pa
 
 ```
 ┌───────────────────────────────────────────────────────┐
-│ ▼ Mighty Reviewer                              NO-SHIP│
+│ ▼ Mighty Reviewer v0.9.2                       NO-SHIP│
 │ ✓ review        7 files +240/-31   1m42               │
 │   ✓ adversarial-risk    1 P0  ·  ·  2 P3  12k         │
 │   ✓ design-principles          clean   8k             │

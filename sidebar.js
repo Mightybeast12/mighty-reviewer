@@ -35,7 +35,7 @@
 import { createElement, insert, setProp } from "@opentui/solid";
 import { createMemo, createSignal, onCleanup } from "solid-js";
 
-import { countFindings, formatCompactElapsed, formatTokenCount, severityTokens, SEVERITIES, METADATA_KEY, PKG_NAME } from "./internals.js";
+import { countFindings, formatCompactElapsed, formatTokenCount, severityTokens, SEVERITIES, METADATA_KEY, PKG_NAME, PKG_VERSION } from "./internals.js";
 
 // Must match the title index.js gives review sessions; phase suffixes are
 // appended as "Adversarial review - <phase>".
@@ -724,6 +724,7 @@ function header(colors, { open, status, toggle, hasSelection }) {
     box({ flexDirection: "row", alignItems: "center" }, [
       text({ fg: colors.muted, width: 2 }, [open ? "▼ " : "▶ "]),
       text({ fg: colors.text }, [BADGE]),
+      PKG_VERSION ? text({ fg: colors.muted, marginLeft: 1, wrapMode: "none" }, [`v${PKG_VERSION}`]) : null,
     ]),
     text({ fg: status.color, wrapMode: "none" }, [status.label]),
   ]);

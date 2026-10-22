@@ -7,6 +7,9 @@ import {
   describeInstall,
   countFindings,
   countVerifiedFindings,
+  topVerifiedFinding,
+  clipFindingTitle,
+  formatNoShipSummary,
   criticLabel,
   formatCompactElapsed,
   formatTokenCount,
@@ -111,7 +114,7 @@ assert.equal(extractVerdict("review died mid-report, forces NO-SHIP eventually")
 assert.equal(extractVerdict(undefined), null);
 
 // Fake-client harness driving the hook choreography of one parent session.
-const makeHarness = async (report, { promptAsyncResult, options } = {}) => {
+const makeHarness = async (report, { promptAsyncResult, options, clientV2 } = {}) => {
   let currentReport = report;
   const promptCalls = [];
   const toasts = [];
@@ -121,6 +124,7 @@ const makeHarness = async (report, { promptAsyncResult, options } = {}) => {
   let childN = 0;
   const sessionInfo = {};
   const fclient = {
+    ...(clientV2 ? { v2: true } : {}),
     tui: { showToast: async ({ body }) => toasts.push(body) },
     session: {
       get: async ({ path }) => ({ data: sessionInfo[path.id] ?? { id: path.id } }),
@@ -148,7 +152,7 @@ const makeHarness = async (report, { promptAsyncResult, options } = {}) => {
     { client: fclient, directory: "/tmp", worktree: "/tmp", $: f$ },
     { idleDebounceMs: 0, ...options },
   );
-  const tick = () => new Promise((r) => setTimeout(r, 25));
+  const tick = () => new Promise((r) => setTimeout(r, 75));
   return {
     hooks: fhooks,
     tick,
@@ -199,7 +203,10 @@ const makeHarness = async (report, { promptAsyncResult, options } = {}) => {
   assert.ok(first.text.includes("UNTRUSTED DATA"), "report is labeled untrusted");
   assert.ok(!first.text.includes("<!--adversarial-review-auto-->"), "quoted REVIEW_MARKER stripped from report");
   assert.equal(first.text.split("</review-report>").length, 2, "quoted closing fence stripped, only ours remains");
-  assert.ok(h.toasts.some((t) => t.message.includes("cycle 1/2")), "toast reports cycle 1/2");
+  const injectedToast = h.toasts.find((t) => t.message.includes("cycle 1/2"));
+  assert.ok(injectedToast, "toast reports cycle 1/2");
+  assert.equal(injectedToast.resume, false, "a successfully injected NO-SHIP notice stays quiet (real prompt already started the fix cycle)");
+  assert.equal(injectedToast.detail, undefined, "no duplicate report when the real injection already carried it");
 
   await h.turn("parent", first.text);
   await h.childIdle("child-2");
@@ -209,7 +216,10 @@ const makeHarness = async (report, { promptAsyncResult, options } = {}) => {
   await h.turn("parent", h.injections("parent")[1].text);
   await h.childIdle("child-3");
   assert.equal(h.injections("parent").length, 2, "third NO-SHIP hits cycle cap, no injection");
-  assert.ok(h.toasts.some((t) => t.message.includes("cycle cap")), "toast reports cycle cap");
+  const cycleCapToast = h.toasts.find((t) => t.message.includes("cycle cap"));
+  assert.ok(cycleCapToast, "toast reports cycle cap");
+  assert.equal(cycleCapToast.resume, true, "cycle-cap NO-SHIP notice starts the fix cycle itself, nothing else will");
+  assert.ok(typeof cycleCapToast.detail === "string" && cycleCapToast.detail.includes("findings body"), "cycle-cap notice carries the full report as detail");
 
   await h.turn("parent", "a brand new user request");
   await h.childIdle("child-4");
@@ -231,7 +241,7 @@ const makeHarness = async (report, { promptAsyncResult, options } = {}) => {
 
 // 9. SDK clients resolve with { error } on HTTP failures instead of throwing:
 //    a rejected injection must not burn the cycle budget, and must be logged
-//    and reported as a plain failure toast.
+//    and reported as a plain failure toast carrying the NO-SHIP summary.
 {
   const h = await makeHarness("findings\n\nNO-SHIP", {
     promptAsyncResult: { error: { name: "NotFoundError" } },
@@ -239,8 +249,8 @@ const makeHarness = async (report, { promptAsyncResult, options } = {}) => {
   await h.turn("parent9", "please add a feature");
   await h.childIdle("child-1");
   assert.ok(
-    h.toasts.some((t) => t.message.includes("NO-SHIP: background review found issues")),
-    "failed injection falls back to plain NO-SHIP toast",
+    h.toasts.some((t) => t.message.startsWith("NO-SHIP:") && t.message.includes("see session for details")),
+    "failed injection falls back to a NO-SHIP toast with the summary line",
   );
   assert.ok(!h.toasts.some((t) => t.message.includes("cycle 1/2")), "failed injection does not count a cycle");
   assert.ok(
@@ -951,7 +961,103 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
   assert.equal(countVerifiedFindings("clean, no findings.", 4), 0, "a clean report counts zero, not null");
 }
 
-// 26. criticLabel (internals.js): the four known critics get fixed short
+// 26. topVerifiedFinding / clipFindingTitle / formatNoShipSummary
+//     (internals.js): the NO-SHIP one-liner leads with the top finding
+//     (first P0, else first P1) clipped to 80 chars, plus the verified
+//     P0/P1/P2 counts, reusing countVerifiedFindings' Findings-section
+//     scoping.
+{
+  const report = [
+    "## Findings",
+    "",
+    "### [P0] Hardcoded secret in connection string",
+    "- file: db.js:10",
+    "",
+    "- **P1** Missing auth check on admin route",
+    "  - file: routes.js:22",
+    "",
+    "- **P2** Unused import",
+    "",
+    "NO-SHIP",
+  ].join("\n");
+  const detail = topVerifiedFinding(report);
+  assert.deepEqual(detail.counts, { P0: 1, P1: 1, P2: 1, P3: 0 }, "per-severity counts match countVerifiedFindings' total");
+  assert.equal(detail.topLine, "### [P0] Hardcoded secret in connection string", "top finding is the first P0 line");
+  assert.equal(countVerifiedFindings(report, 3), 3, "countVerifiedFindings still returns the same total as before");
+
+  assert.equal(
+    clipFindingTitle(detail.topLine),
+    "Hardcoded secret in connection string",
+    "clipFindingTitle strips markdown decoration and the leading severity tag",
+  );
+  const longLine = `### [P1] ${"x".repeat(100)}`;
+  assert.equal(clipFindingTitle(longLine).length, 80, "clipFindingTitle clips to 80 chars");
+  assert.ok(clipFindingTitle(longLine).endsWith("\u2026"), "clipping ends in an ellipsis, never cut from the middle");
+  assert.equal(clipFindingTitle(null), "", "a non-string line clips to an empty title instead of throwing");
+
+  assert.equal(
+    formatNoShipSummary(report),
+    "NO-SHIP: Hardcoded secret in connection string (1 P0, 1 P1, 1 P2) \u00b7 fixes requested",
+    "formatNoShipSummary composes the one-liner from the top finding and the counts",
+  );
+
+  const p1Only = "- **P1** Only a P1 finding\n\nNO-SHIP";
+  assert.equal(topVerifiedFinding(p1Only).topLine, "- **P1** Only a P1 finding", "falls back to the first P1 when there is no P0");
+
+  const noFindings = "Nothing to report.\n\nNO-SHIP";
+  assert.equal(topVerifiedFinding(noFindings).topLine, null, "no top finding when the report has no tagged findings");
+  assert.equal(
+    formatNoShipSummary(noFindings),
+    "NO-SHIP: no finding details captured (0 P0, 0 P1, 0 P2) \u00b7 fixes requested",
+    "formatNoShipSummary falls back to a neutral title instead of a blank one",
+  );
+
+  assert.equal(topVerifiedFinding(null), null, "a non-string report yields no finding detail");
+  assert.equal(formatNoShipSummary(42), null, "a non-string report omits the summary instead of showing 'undefined'");
+}
+
+// 27. quiet: true suppresses every notice except NO-SHIP's.
+{
+  const h = await makeHarness("findings\n\nNO-SHIP", { options: { quiet: true } });
+  await h.turn("quiet-parent", "please add a feature");
+  assert.equal(h.toasts.length, 0, "quiet suppresses the 'review started' notice");
+  await h.hooks["tool.execute.before"]({ sessionID: "child-1", tool: "task" }, { args: {} });
+  await h.hooks["tool.execute.after"]({ sessionID: "child-1", tool: "task" });
+  assert.equal(h.toasts.length, 0, "quiet suppresses progress notices too");
+  await h.childIdle("child-1");
+  assert.ok(h.toasts.some((t) => t.message.startsWith("NO-SHIP:")), "quiet still delivers the NO-SHIP notice");
+  assert.equal(h.toasts.length, 1, "quiet delivers NO-SHIP and nothing else");
+}
+
+// 28. SHIP verdict notice stays quiet (resume: false) and carries no detail.
+{
+  const h = await makeHarness("all good\n\nSHIP");
+  await h.turn("ship-parent", "please add a feature");
+  await h.childIdle("child-1");
+  const shipToast = h.toasts.find((t) => t.message.startsWith("SHIP:"));
+  assert.ok(shipToast, "SHIP toast shown");
+  assert.equal(shipToast.resume, false, "SHIP notice never wakes the agent");
+  assert.equal(shipToast.detail, undefined, "SHIP notice carries no extra detail");
+}
+
+// 29. On v2 (client.v2), progress notices are skipped outright: the TUI's
+//     phase toaster (tui.js) covers the same transitions straight off the
+//     review session's title, so index.js makes no redundant call at all.
+//     Lifecycle notices (started, verdict) are unaffected.
+{
+  const h = await makeHarness("clean\n\nSHIP", { clientV2: true });
+  await h.turn("v2-progress-parent", "please add a feature");
+  await h.hooks["tool.execute.before"]({ sessionID: "child-1", tool: "task" }, { args: {} });
+  await h.hooks["tool.execute.after"]({ sessionID: "child-1", tool: "task" });
+  assert.ok(!h.toasts.some((t) => t.message.includes("critics running")), "no progress notice call on v2 (gates done)");
+  assert.ok(!h.toasts.some((t) => t.message.includes("verifying findings")), "no progress notice call on v2 (critics done)");
+  assert.ok(
+    h.toasts.some((t) => t.message.includes("Code changed, running background review")),
+    "the 'started' notice is still posted on v2",
+  );
+}
+
+// 30. criticLabel (internals.js): the four known critics get fixed short
 //     row labels so their row width never depends on the real agent id;
 //     an unmapped id is cut from the END with an ellipsis, never the
 //     middle, so the row never shows something like "secur...ecklist".
@@ -966,6 +1072,107 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     "some-very-l\u2026",
     "a long unknown id is cut from the end with an ellipsis, never the middle",
   );
+}
+
+// 31. tui.js phase toaster: toasts fire off the review session's title
+//     (session.created / session.renamed), independent of any synthetic
+//     notice, at: started, gates done / critics running, critics 2/4 and
+//     4/4 done (not 1/4 or 3/4), and the terminal NO-SHIP phase (with live
+//     P0/P1 counts fetched from the review session's own report). An old-
+//     bridge notice for a phase already toasted is dropped as a duplicate;
+//     one for an unrelated session or phase is never deduped.
+{
+  const toasts = [];
+  const reportFor = new Map();
+  let pushEvent;
+  const ctx = {
+    client: {
+      event: {
+        async *subscribe({ signal }) {
+          while (!signal.aborted) {
+            const next = await new Promise((resolve) => {
+              pushEvent = resolve;
+              signal.addEventListener("abort", () => resolve(null), { once: true });
+            });
+            if (next) yield next;
+          }
+        },
+      },
+      message: {
+        list: async ({ sessionID }) => {
+          const text = reportFor.get(sessionID);
+          return text ? [{ type: "assistant", content: [{ type: "text", text }] }] : [];
+        },
+      },
+    },
+    ui: { toast: { show: (toast) => toasts.push(toast) } },
+  };
+  const cleanup = await tuiPlugin.setup(ctx);
+  const send = async (event) => {
+    pushEvent(event);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  };
+
+  await send({
+    type: "session.created",
+    data: { sessionID: "review-1", title: "Adversarial review", metadata: { mightyReviewer: { parentID: "parent-x" } } },
+  });
+  assert.deepEqual(toasts.map((t) => t.message), ["Review started."], "review started toast fires off session.created");
+  assert.equal(toasts[0].sessionID, "parent-x", "toast targets the parent session, not the review session");
+
+  await send({ type: "session.renamed", data: { sessionID: "review-1", title: "Adversarial review - gates" } });
+  assert.equal(toasts.length, 1, "no toast yet for the gates phase by itself");
+
+  await send({ type: "session.renamed", data: { sessionID: "review-1", title: "Adversarial review - critics 0/4" } });
+  assert.ok(toasts.some((t) => t.message === "Gates done, critics running."), "gates-done toast fires on the first critics-phase title");
+  assert.equal(toasts.filter((t) => t.message === "Gates done, critics running.").length, 1, "gates-done toast only once");
+
+  await send({ type: "session.renamed", data: { sessionID: "review-1", title: "Adversarial review - critics 1/4" } });
+  assert.ok(!toasts.some((t) => t.message.includes("1/4")), "no toast at 1/4, only at 2/4 and 4/4");
+
+  await send({ type: "session.renamed", data: { sessionID: "review-1", title: "Adversarial review - critics 2/4" } });
+  assert.ok(toasts.some((t) => t.message === "Critics 2/4 done."), "critics-half toast fires at 2/4");
+
+  await send({ type: "session.renamed", data: { sessionID: "review-1", title: "Adversarial review - critics 3/4" } });
+  assert.equal(toasts.filter((t) => t.message === "Critics 2/4 done.").length, 1, "critics-half toast never repeats, e.g. at 3/4");
+
+  await send({ type: "session.renamed", data: { sessionID: "review-1", title: "Adversarial review - verifying" } });
+  assert.ok(toasts.some((t) => t.message === "Critics 4/4 done."), "critics-done toast fires on entering verifying");
+
+  reportFor.set("review-1", "### [P0] Hardcoded secret\n\n- **P1** another finding\n\nNO-SHIP");
+  await send({ type: "session.renamed", data: { sessionID: "review-1", title: "Adversarial review - NO-SHIP" } });
+  const noShipToast = toasts.find((t) => t.message.startsWith("NO-SHIP:"));
+  assert.ok(noShipToast, "NO-SHIP phase toast fires");
+  assert.equal(noShipToast.variant, "error");
+  assert.ok(noShipToast.message.includes("1 P0, 1 P1"), "NO-SHIP toast carries live P0/P1 counts from the review's own report");
+
+  // Dedup: an old-bridge notice for the SAME phase of the SAME review must
+  // not produce a second toast.
+  const beforeDedup = toasts.length;
+  await send({
+    type: "session.inbox.enqueued",
+    data: {
+      sessionID: "parent-x",
+      item: {
+        type: "synthetic",
+        payload: { metadata: { mightyReviewer: { message: "NO-SHIP: findings sent back to the session for fixes (cycle 1/2).", variant: "warning" } } },
+      },
+    },
+  });
+  assert.equal(toasts.length, beforeDedup, "an old-bridge notice duplicating an already-shown phase toast is dropped");
+
+  // A notice for an unrelated session (never toasted via the phase toaster)
+  // is never deduped.
+  await send({
+    type: "session.inbox.enqueued",
+    data: {
+      sessionID: "some-other-session",
+      item: { type: "synthetic", payload: { metadata: { mightyReviewer: { message: "SHIP: background review passed.", variant: "success" } } } },
+    },
+  });
+  assert.equal(toasts.length, beforeDedup + 1, "a notice for an unrelated session is never deduped");
+
+  await cleanup();
 }
 
 console.log("ALL SMOKE TESTS PASSED");

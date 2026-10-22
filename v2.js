@@ -249,13 +249,22 @@ function createLegacyClient(ctx, options) {
           console.info(`[${PKG_NAME}] ${message}`);
           return { data: true };
         }
+        // `detail` is extra text (e.g. the full NO-SHIP findings report)
+        // appended to the synthetic message body only, kept out of
+        // metadata.message so the toast and the sidebar's notice line
+        // (which read metadata.message) stay a short, single line.
+        const detail = typeof body?.detail === "string" && body.detail ? `\n\n${body.detail}` : "";
         await ctx.session.synthetic({
           sessionID,
-          text: `${body?.title ?? PKG_NAME}: ${message}`,
+          text: `${body?.title ?? PKG_NAME}: ${message}${detail}`,
           description: PKG_NAME,
           metadata: { [METADATA_KEY]: { message, variant: body?.variant ?? "info" } },
           delivery: "queue",
-          resume: false,
+          // Quiet by default: the TUI's phase toaster (tui.js) already
+          // notified the user live. index.js sets resume: true only for
+          // the NO-SHIP notice, so the fix cycle starts without the user
+          // even when the real feedback injection could not be sent.
+          resume: body?.resume === true,
         });
         return { data: true };
       },

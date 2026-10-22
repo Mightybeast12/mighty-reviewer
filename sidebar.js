@@ -39,20 +39,22 @@ import {
   countFindings,
   countVerifiedFindings,
   criticLabel,
+  extractAssistantReport,
   formatCompactElapsed,
   formatTokenCount,
+  isReviewSession,
+  phaseOf,
   severityTokens,
   SEVERITIES,
+  TERMINAL_PHASES,
   METADATA_KEY,
   PKG_NAME,
   PKG_VERSION,
 } from "./internals.js";
 
-// Must match the title index.js gives review sessions; phase suffixes are
-// appended as "Adversarial review - <phase>".
-const REVIEW_TITLE = "Adversarial review";
+// Phase suffixes are appended to REVIEW_TITLE (internals.js) as
+// "Adversarial review - <phase>".
 const BADGE = "Mighty Reviewer";
-const TERMINAL_PHASES = new Set(["SHIP", "NO-SHIP", "done", "timed out"]);
 // Phases before any critic has been dispatched: shown nowhere in the row
 // detail, since there is nothing to say yet beyond "it's running" (which the
 // spinner already says). Later phases ("critics 2/4", "verifying", ...) are
@@ -121,9 +123,10 @@ export function mountSidebar(ctx) {
   const [selectedCritic, setSelectedCritic] = createSignal(null);
 
   let animating = false;
+  let footerAnimating = false;
   const pollTimer = setInterval(store.bump, POLL_MS);
   const frameTimer = setInterval(() => {
-    if (animating) setNow(Date.now());
+    if (animating || footerAnimating) setNow(Date.now());
   }, FRAME_MS);
   store.discoverReviews();
 
@@ -185,6 +188,29 @@ export function mountSidebar(ctx) {
     },
   });
 
+  // Footer status line ("prompt.footer.status"): while a review for the
+  // viewed session is running, one muted line under the prompt box showing
+  // the spinner (FRAMES, shared with the review row above), live critic
+  // count, and elapsed time; nothing while no review is running. Reuses
+  // the same store, so it needs no extra session tracking of its own.
+  // `footerAnimating` is separate from the sidebar panel's `animating` so
+  // either slot alone keeps the frame timer ticking.
+  const disposeFooterStatus = ctx.ui.slot({
+    append: "prompt.footer.status",
+    render: (input) => {
+      const root = box({ width: "100%", flexDirection: "row" });
+      insert(root, () => {
+        store.tick();
+        const sessionID = input?.sessionID ?? routeSessionID(ctx);
+        const review = sessionID ? store.readReview(sessionID) : null;
+        footerAnimating = review?.running === true;
+        if (!footerAnimating) return null;
+        return footerStatusLine(review, palette(ctx.theme), now);
+      });
+      return root;
+    },
+  });
+
   // Detail view for a critic (or, from the global command below, every
   // critic): the P0/P1 lines countFindings captured, plus the review's own
   // status. Registered unconditionally; a host without session.panel simply
@@ -218,6 +244,7 @@ export function mountSidebar(ctx) {
     clearInterval(frameTimer);
     store.dispose();
     disposeSidebar?.();
+    disposeFooterStatus?.();
     disposeFindingsPanel?.();
     disposeKeymap?.();
   };
@@ -321,12 +348,12 @@ function createStore(ctx) {
   const resultOf = (criticID, settled) => {
     if (results.has(criticID)) return results.get(criticID);
     const cachedMessages = safe(() => data.session.message.list(criticID)) ?? [];
-    const cachedReport = reportFrom(cachedMessages, "asc");
+    const cachedReport = extractAssistantReport(cachedMessages, "asc");
     if (cachedReport !== null) return keepResult(criticID, cachedReport, cachedMessages);
     if (throttled(`messages:${criticID}`, RETRY_MS)) {
       fetchMessages(criticID)
         .then((messages) => {
-          const report = reportFrom(messages, "desc");
+          const report = extractAssistantReport(messages, "desc");
           if (report !== null) keepResult(criticID, report, messages);
           else if (settled) results.set(criticID, { noReport: true });
           bump();
@@ -360,7 +387,7 @@ function createStore(ctx) {
   const verifiedCountOf = (reviewID, rawTotal) => {
     if (reviewReports.has(reviewID)) return reviewReports.get(reviewID);
     const cachedMessages = safe(() => data.session.message.list(reviewID)) ?? [];
-    const cachedReport = reportFrom(cachedMessages, "asc");
+    const cachedReport = extractAssistantReport(cachedMessages, "asc");
     if (cachedReport !== null) {
       const verified = countVerifiedFindings(cachedReport, rawTotal);
       reviewReports.set(reviewID, verified);
@@ -369,7 +396,7 @@ function createStore(ctx) {
     if (throttled(`review-report:${reviewID}`, RETRY_MS)) {
       fetchMessages(reviewID)
         .then((messages) => {
-          const report = reportFrom(messages, "desc");
+          const report = extractAssistantReport(messages, "desc");
           if (report !== null) {
             reviewReports.set(reviewID, countVerifiedFindings(report, rawTotal));
             bump();
@@ -554,17 +581,8 @@ function withExpected(critics) {
   return [...rows, ...rest];
 }
 
-function isReviewSession(info) {
-  return typeof info?.title === "string" && info.title.startsWith(REVIEW_TITLE);
-}
-
 function definedFields(info) {
   return Object.fromEntries(Object.entries(info).filter(([, value]) => value !== undefined));
-}
-
-function phaseOf(title) {
-  const rest = title.slice(REVIEW_TITLE.length).replace(/^\s*-\s*/, "").trim();
-  return rest || "starting";
 }
 
 // Critic agents are all named "<topic>-critic"; the suffix only costs width.
@@ -572,23 +590,6 @@ function criticName(info) {
   const tagged = /@([\w.-]+)/.exec(info.title ?? "");
   const name = info.agent ? String(info.agent) : tagged ? tagged[1] : (info.title ?? "subagent");
   return name.replace(/-critic$/, "");
-}
-
-// Final assistant text of a session, or null when there is none yet.
-// `order` says whether `messages` is oldest-first or newest-first.
-function reportFrom(messages, order) {
-  const list = order === "asc" ? [...messages].reverse() : messages;
-  for (const message of list) {
-    if (message?.type !== "assistant" && message?.info?.role !== "assistant") continue;
-    const parts = message.content ?? message.parts ?? [];
-    const text = parts
-      .filter((part) => part?.type === "text" && typeof part.text === "string")
-      .map((part) => part.text)
-      .join("\n")
-      .trim();
-    if (text) return text;
-  }
-  return null;
 }
 
 function sumTokenUsage(tokens) {
@@ -858,6 +859,22 @@ function elapsedLabel(review, now) {
     return updated >= created ? formatCompactElapsed(updated - created) : null;
   }
   return () => formatCompactElapsed(Math.max(0, now() - created));
+}
+
+// "prompt.footer.status" content for a running review: a spinner frame
+// (FRAMES, same ones the review row's glyph animates through), how many of
+// the expected critics have returned (review.critics already includes the
+// pending ones via withExpected, so its length is the stable denominator),
+// and elapsed time. Only called while review.running, so there is always a
+// created time to measure from.
+function footerStatusLine(review, colors, now) {
+  const frame = FRAMES[Math.floor(now() / FRAME_MS) % FRAMES.length];
+  const total = review.critics.length;
+  const done = review.critics.filter((critic) => !critic.pending && !critic.running).length;
+  const created = millis(review.time?.created);
+  const elapsed = created ? formatCompactElapsed(Math.max(0, now() - created)) : null;
+  const parts = [`${frame} reviewing`, `critics ${done}/${total}`, ...(elapsed ? [elapsed] : [])];
+  return text({ fg: colors.muted, wrapMode: "none" }, [parts.join(" \u00b7 ")]);
 }
 
 // "1 P0  ·  ·  2 P3" with each severity in a constant position (its color

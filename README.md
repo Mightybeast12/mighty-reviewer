@@ -46,7 +46,7 @@ OpenCode 2 requires a package directory here (it resolves `index.js` and the TUI
 
 ### OpenCode 2 notes
 
-- **Toasts** come from a TUI companion module (`mighty-reviewer/tui`) that OpenCode 2 loads alongside the server plugin. Each notice is also queued as a `mighty-reviewer` entry in the session it concerns, where it enters the conversation on the next turn without waking the agent.
+- **Toasts and the footer line** come from a TUI companion module (`mighty-reviewer/tui`) that OpenCode 2 loads alongside the server plugin, and show up live, independent of anything posted into the conversation. See [What you see during a review](#what-you-see-during-a-review) for exactly what shows up and when, and the `quiet` option.
 - **Sidebar panel**: the same TUI module adds a "Mighty Reviewer" box to the right sidebar, styled to sit next to the oh-my-opencode-slim agent panel. See [Sidebar panel](#sidebar-panel-opencode-2).
 - **The review session is a root session**, not a child of the coding session. OpenCode 2 caps nested subagents at depth 1 (`experimental.subagent_depth`), and a nested review session could not spawn its four critics. The parent link is stored in the review session's metadata, and the toast offers to open the review session.
 - **`enforceNoShip`** denies `git commit` / `git push` through the permission hook, so a blocked command shows up as a permission denial carrying the reviewer's message.
@@ -81,11 +81,11 @@ OpenCode 2 requires a package directory here (it resolves `index.js` and the TUI
 
    A watchdog aborts any review child still running after 10 minutes.
 
-3. **Delivery**: toasts report when the review starts and the final verdict. Full findings live in the child session titled "Adversarial review". The coding agent (and you) can also query the verdict via the **`review_status` tool**, which returns running/done, the verdict, and the findings report.
+3. **Delivery**: toasts report when the review starts and the final verdict. Full findings live in the child session titled "Adversarial review". The coding agent (and you) can also query the verdict via the **`review_status` tool**, which returns running/done, the verdict, and the findings report. See [What you see during a review](#what-you-see-during-a-review) for exactly what shows up, when, and whether it starts a turn.
 
    **Progress tracking**: while the review runs, its phase is inferred from tool activity in the review session and surfaced three ways:
    - `review_status` reports the current phase and elapsed time (e.g. "waiting on critics (2/4 returned), elapsed 3m 40s") instead of a bare "in progress",
-   - phase transitions emit toasts ("mechanical gates done, critics running", "critics done, verifying findings"); disable with `"progressToasts": false`,
+   - phase transitions are toasted (disable with `"progressToasts": false`): on OpenCode 2 the TUI watches the review session's title directly for this, so it works even if the server-side notice for the same phase never gets queued (see below); on OpenCode 1 the toast comes straight from the server,
    - the review child's session title is renamed live ("Adversarial review - critics 1/4", "... - verifying", and finally the verdict), so the session list itself shows where the review is.
 
 4. **Feedback loop**: on **NO-SHIP**, the findings report is injected back into the parent session as a new prompt (fenced and marked as untrusted data), so the coding agent wakes up and fixes the P0/P1 findings. The fix turn triggers a fresh review. This is capped at **2 re-review cycles** per user message, plus an absolute cap of **10 injections** per session; if a cap is hit, the toast tells you to check the review session yourself. On SHIP nothing is injected.
@@ -94,13 +94,33 @@ OpenCode 2 requires a package directory here (it resolves `index.js` and the TUI
 
 6. **Stall guard**: if the review session goes idle **without** a SHIP/NO-SHIP verdict (e.g. the orchestrating agent launched the critics as background tasks and ended its turn early), the review is not finalized as a fizzle. The plugin re-prompts the review session to collect the critic results and emit the verdict, capped at 2 nudges, after which the review finalizes with whatever it has. Duplicate idle events never burn the nudge budget.
 
+### What you see during a review
+
+**Toasts (OpenCode 2).** The TUI watches the review session's title directly and toasts on each transition, independent of anything posted into the conversation: review started, gates done / critics running, critics 2/4 and 4/4 done, and the terminal `SHIP`, `NO-SHIP` (with live P0/P1 counts), or timed-out phase. Each fires once per review, live, whether or not a matching notice ever gets queued into the conversation; if one does (see below), the duplicate toast for that same phase is dropped rather than shown twice.
+
+**Footer line (OpenCode 2).** While a review for the session you are looking at is running, a muted line under the prompt box shows its live state, e.g. `⠸ reviewing · critics 2/4 · 1m12`. It disappears once the review finishes.
+
+**What lands in the conversation, and when.** Every notice can also be queued into the session it concerns as a message, but not all of them are, and not all of them wake the agent:
+
+| Notice | Queued? | Wakes the agent? |
+| --- | --- | --- |
+| Progress (gates done, critics done) | No (OpenCode 2 only; the toast and footer line already cover it live) | - |
+| Skip reasons, started, timed out, update checks | Yes | No (`resume: false`; surfaces on your next turn) |
+| **SHIP** | Yes | No (the toast already told you; this is the record) |
+| **NO-SHIP**, real fix-cycle injection reached the coding session | Yes | No (that injection already started the fix cycle) |
+| **NO-SHIP**, injection failed or hit the re-review cycle cap | Yes | **Yes** (`resume: true`; nothing else will start the fix cycle) |
+
+The NO-SHIP notice always leads with a one-line summary before the full findings report: `NO-SHIP: <top finding> (<P0> P0, <P1> P1, <P2> P2) · fixes requested`.
+
+**Quiet mode.** Set `"quiet": true` to suppress every notice except NO-SHIP's. On OpenCode 2 this only changes what gets queued into the conversation: the toasts and footer line above do not depend on a queued notice, so live progress still shows up; you just stop getting a permanent record for anything other than NO-SHIP. On OpenCode 1, where a notice is a toast and nothing else, `quiet` suppresses the toast itself for everything except NO-SHIP.
+
 ### Sidebar panel (OpenCode 2)
 
 While you are in a session that has a review, the right sidebar shows a small panel:
 
 ```
 ┌───────────────────────────────────────────────────────┐
-│ ▼ Mighty Reviewer v0.9.4                       NO-SHIP│
+│ ▼ Mighty Reviewer v0.10.0                      NO-SHIP│
 │ ✓ review        7 files +240/-31   1m42               │
 │  ✓ risk                      1 P0    ·    · 2 P3   12k│
 │  ✓ design                    clean                  8k│
@@ -153,6 +173,7 @@ All options go in the plugin entry in `opencode.json` (OpenCode 2 object form sh
 | `timeoutMs` | `600000` | Review time budget. At half time a review still in its mechanical gates is steered straight to the critics; at the deadline a review whose critics are running gets one extension of half the budget, otherwise it is aborted. The review session is also denied access outside the project directory, so a headless permission prompt cannot stall it |
 | `enforceNoShip` | `false` | Block `git commit` / `git push` in a session while a NO-SHIP verdict is unresolved (until a later review SHIPs, e.g. via `/mighty-review`). On OpenCode 2 this is a permission denial |
 | `progressToasts` | `true` | Toast on review phase transitions (gates done / critics done); `review_status` and live session titles report progress regardless |
+| `quiet` | `false` | Suppress every notice except NO-SHIP's (see [What you see during a review](#what-you-see-during-a-review)); the OpenCode 2 toasts and footer line are unaffected |
 | `updateCheck` | `true` | Check npm for a newer version a few seconds after startup |
 | `autoUpdate` | `true` | Install the newer version into opencode's plugin cache automatically (unpinned npm installs only); with `false` you get a notification toast instead |
 

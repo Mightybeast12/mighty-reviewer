@@ -48,21 +48,34 @@
  *             git-diff output, subagent critique, and verdict out of the
  *             conversation the user is reading. A toast reports progress and
  *             the terse SHIP / NO-SHIP verdict once the child session
- *             finishes.
+ *             finishes. On OpenCode 2, toasts route through a synthetic
+ *             inbox item (see v2.js and tui.js); progress notices are
+ *             toast-only there (no synthetic message, since the TUI's phase
+ *             toaster watches the review session's title directly), and the
+ *             SHIP verdict's notice stays quiet (resume: false). The NO-SHIP
+ *             notice is quiet too when the feedback injection below already
+ *             sent a real, tracked prompt turn; when that failed or hit its
+ *             cap, the notice is the only thing reaching the session, so it
+ *             carries the full report and is posted with resume: true so
+ *             the fix cycle starts without waiting on the user's next turn.
+ *             { quiet: true } suppresses every notice except NO-SHIP's.
  * Progress:   the review's phase is inferred from tool activity inside the
  *             review session (bash -> mechanical gates, task dispatch ->
  *             critics running N/M, all tasks returned -> verifying) and
  *             surfaced three ways: the review_status tool reports the phase
  *             and elapsed time while running, phase transitions emit toasts
- *             (disable with { progressToasts: false }), and the review
- *             child's session title is renamed live as phases advance.
+ *             (disable with { progressToasts: false }; on OpenCode 2 these
+ *             are toast-only, see Delivery above), and the review child's
+ *             session title is renamed live as phases advance.
  * Feedback:   On NO-SHIP, the findings report is injected back into the
  *             PARENT session as a new prompt, so the coding agent wakes up
  *             and fixes the findings. The fix turn is itself reviewed again,
  *             capped at MAX_REREVIEW_CYCLES injections per genuine user
  *             message plus a monotonic MAX_TOTAL_INJECTIONS per session, so
  *             review -> fix -> re-review can never loop forever. The report
- *             is fenced and labeled untrusted data before injection.
+ *             is fenced and labeled untrusted data before injection. The
+ *             notice reporting this (see Delivery above) leads with a
+ *             one-line summary: the top finding plus P0/P1/P2 counts.
  * Loop guard: spawned child (review) session IDs are tracked in
  *             `spawnedReviewSessions`, so their own idle events are
  *             recognized as review completions and never mistaken for a
@@ -103,8 +116,8 @@
  *             to their root session, so a turn that fans out to N subagents
  *             produces one review for the parent turn, not N+1 and not 0.
  * Options:    { disabled, model, criticModel, agent, maxDiffLines, ignore,
- *             idleDebounceMs, timeoutMs, enforceNoShip, progressToasts, updateCheck,
- *             autoUpdate } via the plugin tuple form.
+ *             idleDebounceMs, timeoutMs, enforceNoShip, progressToasts, quiet,
+ *             updateCheck, autoUpdate } via the plugin tuple form.
  * Opt-out:    set MIGHTY_REVIEWER_DISABLE=1, or pass { disabled: true }
  *             via the plugin tuple form in opencode.json.
  */
@@ -113,7 +126,7 @@ import { readFile, writeFile, rename, rm, stat } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import path from "node:path";
 
-import { PKG_NAME, compareSemver, describeInstall, extractVerdict, METADATA_KEY } from "./internals.js";
+import { PKG_NAME, compareSemver, describeInstall, extractVerdict, formatNoShipSummary, METADATA_KEY } from "./internals.js";
 import { createV2Setup } from "./v2.js";
 
 const REVIEW_MARKER = "<!--adversarial-review-auto-->";
@@ -669,6 +682,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
   const reviewExtensionMs = reviewTimeoutMs / 2;
   const enforceNoShip = options.enforceNoShip === true;
   const progressToasts = options.progressToasts !== false;
+  const quiet = options.quiet === true;
   const extraIgnore = (options.ignore ?? []).map((p) => new RegExp(p));
   const reviewModel = parseModel(options.model);
   const reviewAgent = typeof options.agent === "string" && options.agent ? options.agent : null;
@@ -849,9 +863,25 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
   // sessionID names the session the notice is about. The v1 host ignores
   // it (toasts are global there); the v2 bridge delivers the notice into that
   // session, because v2 server plugins have no toast API.
-  async function showToast(message, variant, sessionID) {
+  //
+  // meta.category tags the notice for two v2-only behaviors: pure progress
+  // notices ("progress") are skipped entirely on v2, since the TUI's phase
+  // toaster (tui.js) now covers them straight off the review session's
+  // title, with no synthetic message needed; and { quiet: true } suppresses
+  // every category except "no-ship", since that one also carries the
+  // feedback report, not just a status blurb. meta.resume and meta.detail
+  // forward to v2.js's synthetic post (resume: true starts a model turn
+  // immediately; detail is extra text appended after `message`, kept out
+  // of the toast itself).
+  async function showToast(message, variant, sessionID, meta = {}) {
+    const { resume = false, detail, category = null } = meta;
+    if (quiet && category !== "no-ship") return;
+    if (category === "progress" && client.v2) return;
     try {
-      await client.tui.showToast({ body: { title: "mighty-reviewer", message, variant } }, sessionID);
+      await client.tui.showToast(
+        { body: { title: "mighty-reviewer", message, variant, resume, ...(detail ? { detail } : {}) } },
+        sessionID,
+      );
     } catch {
       // Toast is best-effort.
     }
@@ -946,7 +976,9 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       return;
     }
     state.updatedAt = Date.now();
-    if (toast && progressToasts) await showToast(toast, "info");
+    if (toast && progressToasts) {
+      await showToast(toast, "info", parentSessionID, { category: "progress" });
+    }
     if (title) void setReviewTitle(reviewSessionID, title, parentSessionID);
   }
 
@@ -986,7 +1018,9 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
         // Abort is best-effort.
       }
       void setReviewTitle(reviewSessionID, "timed out", parentSessionID);
-      await showToast("Background review timed out and was aborted.", "warning", parentSessionID);
+      await showToast("Background review timed out and was aborted.", "warning", parentSessionID, {
+        category: "timed-out",
+      });
     };
 
     const deadline = setTimeout(async () => {
@@ -1000,7 +1034,12 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
         const extension = ownTimer(setTimeout(abortReview, reviewExtensionMs));
         reviewWatchdogs.set(reviewSessionID, [extension]);
         void setReviewTitle(reviewSessionID, `${describePhase(state)}, extended`, parentSessionID);
-        await showToast(`Background review is still verifying; extended once by ${Math.max(1, Math.round(reviewExtensionMs / 60000))} minutes.`, "info", parentSessionID);
+        await showToast(
+          `Background review is still verifying; extended once by ${Math.max(1, Math.round(reviewExtensionMs / 60000))} minutes.`,
+          "info",
+          parentSessionID,
+          { category: "extended" },
+        );
         return;
       }
       await abortReview();
@@ -1025,7 +1064,9 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       const allFiles = await changedFileNames();
       const files = allFiles.filter((f) => !isIgnoredFile(f));
       if (allFiles.length && !files.length) {
-        if (viaCommand) await showToast("Only ignored files changed, review skipped.", "info", sessionID);
+        if (viaCommand) {
+          await showToast("Only ignored files changed, review skipped.", "info", sessionID, { category: "skip" });
+        }
         return;
       }
       const diffLines = await diffLineCount();
@@ -1034,6 +1075,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
           `Diff too large for review (${diffLines} lines > ${maxDiffLines}), skipped.`,
           "warning",
           sessionID,
+          { category: "skip" },
         );
         return;
       }
@@ -1065,6 +1107,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
           : "Code changed, running background review...",
         "info",
         sessionID,
+        { category: "started" },
       );
 
       await sendPrompt(reviewSessionID, reviewPrompt, {
@@ -1163,29 +1206,45 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
 
     let message;
     let variant;
+    let toastMeta;
     if (verdict === "NO-SHIP") {
       const outcome =
         parentSessionID && report ? await injectFindings(parentSessionID, report) : "failed";
-      message =
+      const summary = formatNoShipSummary(report) ?? "NO-SHIP: background review found issues.";
+      const outcomeNote =
         outcome === "injected"
-          ? `NO-SHIP: findings sent back to the session for fixes (cycle ${feedbackCycles.get(parentSessionID)}/${MAX_REREVIEW_CYCLES}).`
+          ? `findings sent back to the session for fixes (cycle ${feedbackCycles.get(parentSessionID)}/${MAX_REREVIEW_CYCLES}).`
           : outcome === "cycle-cap"
-            ? `NO-SHIP: re-review cycle cap (${MAX_REREVIEW_CYCLES}) reached, see review session for remaining findings.`
-            : "NO-SHIP: background review found issues, see session for details.";
+            ? `re-review cycle cap (${MAX_REREVIEW_CYCLES}) reached, see review session for remaining findings.`
+            : "see session for details.";
+      message = `${summary} ${outcomeNote}`;
       variant = "warning";
+      // injectFindings already sent a real, tracked prompt turn (session.
+      // hook("prompt") -> chat.message) when outcome is "injected"; this
+      // notice is then just a toast-carried record and stays quiet (resume:
+      // false), same as SHIP. When it could not (cycle-cap, failed), this
+      // notice is the ONLY thing reaching the session, so it carries the
+      // full report (`detail`, kept out of the short toast-facing
+      // `message`) and resume: true starts the fix cycle itself.
+      toastMeta =
+        outcome === "injected"
+          ? { resume: false, category: "no-ship" }
+          : { resume: true, category: "no-ship", detail: typeof report === "string" ? report : undefined };
     } else if (verdict === "SHIP") {
       message = "SHIP: background review passed.";
       variant = "success";
+      toastMeta = { resume: false, category: "ship" };
     } else {
       message = "Background review finished, see session for details.";
       variant = "success";
+      toastMeta = { resume: false, category: "done" };
     }
 
     // Set after the NO-SHIP cycle above resolves, so the metadata snapshot
     // (reviewMetadataFor) carries the just-incremented cycle count, not the
     // stale pre-injection one.
     void setReviewTitle(reviewSessionID, verdict ?? "done", parentSessionID);
-    await showToast(message, variant, parentSessionID);
+    await showToast(message, variant, parentSessionID, toastMeta);
   }
 
   // Returns true when the verdict-less review session was sent back to work
@@ -1219,6 +1278,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       `Review ended without a verdict; nudged it to collect critic results (${count + 1}/${MAX_VERDICT_NUDGES}).`,
       "warning",
       parentSessionID,
+      { category: "nudge" },
     );
     return true;
   }
@@ -1263,11 +1323,16 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       const latest = await fetchLatestVersion(install.channel);
       if (!latest || compareSemver(latest, current) <= 0) return;
       if (install.pinned) {
-        await showToast(`Update available: ${latest} (pinned to ${current}, update the pin in opencode.json).`, "info");
+        await showToast(
+          `Update available: ${latest} (pinned to ${current}, update the pin in opencode.json).`,
+          "info",
+          undefined,
+          { category: "update" },
+        );
         return;
       }
       if (!autoUpdate) {
-        await showToast(`Update available: ${current} -> ${latest}.`, "info");
+        await showToast(`Update available: ${current} -> ${latest}.`, "info", undefined, { category: "update" });
         return;
       }
       const updated = await updateCacheWorkspace(install.workspaceDir, latest);
@@ -1276,6 +1341,8 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
           ? `Updated ${current} -> ${latest}; restart opencode to apply.`
           : `Update available: ${latest} (auto-install failed; delete ~/.cache/opencode/packages/${PKG_NAME}* to force a reinstall).`,
         updated ? "success" : "warning",
+        undefined,
+        { category: "update" },
       );
     } catch {
       // Update checking is best-effort and must never break the plugin.

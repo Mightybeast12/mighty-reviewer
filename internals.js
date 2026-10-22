@@ -28,6 +28,44 @@ function readPackageVersion() {
 // items, and the review-progress snapshot kept on the review session itself.
 export const METADATA_KEY = "mightyReviewer";
 
+// ---------------------------------------------------------------- review sessions
+//
+// Shared by sidebar.js (the panel) and tui.js (the phase-toast watcher), so
+// both read the review session's title the same way: the title index.js
+// gives review sessions, with phase suffixes appended as
+// "Adversarial review - <phase>" (setReviewTitle).
+
+export const REVIEW_TITLE = "Adversarial review";
+
+export function isReviewSession(info) {
+  return typeof info?.title === "string" && info.title.startsWith(REVIEW_TITLE);
+}
+
+export function phaseOf(title) {
+  const rest = title.slice(REVIEW_TITLE.length).replace(/^\s*-\s*/, "").trim();
+  return rest || "starting";
+}
+
+export const TERMINAL_PHASES = new Set(["SHIP", "NO-SHIP", "done", "timed out"]);
+
+// Final assistant text of a session, or null when there is none yet.
+// `order` says whether `messages` is oldest-first or newest-first; either
+// way the search walks newest-first so the latest assistant turn wins.
+export function extractAssistantReport(messages, order) {
+  const list = order === "asc" ? [...messages].reverse() : messages;
+  for (const message of list) {
+    if (message?.type !== "assistant" && message?.info?.role !== "assistant") continue;
+    const parts = message.content ?? message.parts ?? [];
+    const text = parts
+      .filter((part) => part?.type === "text" && typeof part.text === "string")
+      .map((part) => part.text)
+      .join("\n")
+      .trim();
+    if (text) return text;
+  }
+  return null;
+}
+
 // npm dist-tag names never contain range operators or whitespace; anything
 // else ("^0.4.0", "~1.x") must not be silently retargeted to latest.
 const DIST_TAG = /^[A-Za-z][0-9A-Za-z._-]*$/;
@@ -263,6 +301,60 @@ const VERIFIED_START_HEADING = /^findings\b/i;
  * wrong number.
  */
 export function countVerifiedFindings(report, rawTotal) {
+  const detail = verifiedFindingsDetail(report);
+  if (!detail) return null;
+  const count = sumCounts(detail.counts);
+  return Number.isFinite(rawTotal) ? Math.min(count, Math.max(0, rawTotal)) : count;
+}
+
+/**
+ * Same scoping as countVerifiedFindings (the Findings section only, the
+ * same refuted/dropped/mechanical-gates asides excluded, sub-bullets never
+ * counted), but keeping the per-severity counts and the raw line behind
+ * each counted finding instead of collapsing them into one total. Used by
+ * the NO-SHIP summary line (formatNoShipSummary) and by the TUI's phase
+ * toast (tui.js), both of which need "how many of each severity" rather
+ * than just "how many".
+ */
+export function topVerifiedFinding(report) {
+  const detail = verifiedFindingsDetail(report);
+  if (!detail) return null;
+  const topLine = detail.lines.P0[0] ?? detail.lines.P1[0] ?? null;
+  return { counts: detail.counts, topLine };
+}
+
+// A finding line's own text, with its markdown decoration and leading
+// severity tag stripped, clipped to `max` characters (ellipsis on the end,
+// never the middle) so a toast or synthetic-message summary line stays
+// short regardless of how verbose the model's finding title was.
+export function clipFindingTitle(line, max = 80) {
+  if (typeof line !== "string" || !line) return "";
+  const stripped = stripDecoration(line).trim();
+  const withoutTag = stripped.replace(/^\[?P[0-3]\]?[\s:*_.\u2013-]*/i, "").trim();
+  const text = withoutTag || stripped;
+  return text.length > max ? `${text.slice(0, max - 1).trimEnd()}\u2026` : text;
+}
+
+/**
+ * The one-line NO-SHIP summary index.js leads its synthetic notice with:
+ * the top finding (first P0, else first P1, from the Findings section)
+ * plus the verified P0/P1/P2 counts. Null when `report` is not a usable
+ * string, so the caller can fall back to a generic message instead of
+ * showing "undefined".
+ */
+export function formatNoShipSummary(report) {
+  const detail = topVerifiedFinding(report);
+  if (!detail) return null;
+  const { counts, topLine } = detail;
+  const title = topLine ? clipFindingTitle(topLine) : "no finding details captured";
+  return `NO-SHIP: ${title} (${counts.P0} P0, ${counts.P1} P1, ${counts.P2} P2) \u00b7 fixes requested`;
+}
+
+// Scans the review's own merged report for VERIFIED_START_HEADING /
+// VERIFIED_STOP_HEADING scoping (see countVerifiedFindings' doc comment),
+// then tags every top-level finding line in that range with its severity.
+// Null when `report` is not a string, or parsing throws.
+function verifiedFindingsDetail(report) {
   if (typeof report !== "string") return null;
   try {
     const lines = report.split("\n");
@@ -283,7 +375,8 @@ export function countVerifiedFindings(report, rawTotal) {
       }
     }
     let fenced = false;
-    let count = 0;
+    const counts = emptyCounts();
+    const findingLines = emptyLines();
     for (let i = start; i < end; i++) {
       const raw = lines[i];
       if (FENCE.test(raw)) {
@@ -291,9 +384,13 @@ export function countVerifiedFindings(report, rawTotal) {
         continue;
       }
       if (fenced || !raw.trim()) continue;
-      if (isTopLevelFindingLine(raw)) count += 1;
+      const severity = topLevelFindingSeverity(raw);
+      if (severity) {
+        counts[severity] += 1;
+        findingLines[severity].push(raw.trim());
+      }
     }
-    return Number.isFinite(rawTotal) ? Math.min(count, Math.max(0, rawTotal)) : count;
+    return { counts, lines: findingLines };
   } catch {
     return null;
   }
@@ -323,13 +420,15 @@ function isSubBullet(raw) {
 // parser above: a finding is a top-level line (heading, item, or table row,
 // never a sub-bullet) whose own text leads with a P0-P3 tag, same shape as
 // the critic parser's "tagged" lines, but without its group-heading or
-// Severity-field shapes, which the review's report does not use.
-function isTopLevelFindingLine(raw) {
-  if (isSubBullet(raw) || !STRUCTURAL.test(raw)) return false;
+// Severity-field shapes, which the review's report does not use. Returns
+// the severity ("P0".."P3") when `raw` is such a line, else null.
+function topLevelFindingSeverity(raw) {
+  if (isSubBullet(raw) || !STRUCTURAL.test(raw)) return null;
   const line = stripDecoration(raw);
   const lead = LEADING_TAG.exec(line);
-  if (lead) return !NOT_A_FINDING.test(line.slice(lead[0].length));
-  return !!BRACKET_TAG.exec(line);
+  if (lead) return NOT_A_FINDING.test(line.slice(lead[0].length)) ? null : lead[1].toUpperCase();
+  const bracket = BRACKET_TAG.exec(line);
+  return bracket ? bracket[1].toUpperCase() : null;
 }
 
 function headingLevel(raw) {

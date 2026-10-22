@@ -100,22 +100,22 @@ While you are in a session that has a review, the right sidebar shows a small pa
 
 ```
 ┌───────────────────────────────────────────────────────┐
-│ ▼ Mighty Reviewer v0.9.3                       NO-SHIP│
+│ ▼ Mighty Reviewer v0.9.4                       NO-SHIP│
 │ ✓ review        7 files +240/-31   1m42               │
-│   ✓ adversarial-risk    1 P0  ·  ·  2 P3  12k         │
-│   ✓ design-principles          clean   8k             │
-│   ✓ security-checklist  ·  ·  3 P2  ·  11k            │
-│   ✓ ai-slop                    no report              │
+│  ✓ risk                      1 P0    ·    · 2 P3   12k│
+│  ✓ design                    clean                  8k│
+│  ✓ security                     ·    · 3 P2    ·   11k│
+│  ✓ slop                            no report          │
 │                                                       │
-│ total            1 P0  ·  3 P2  2 P3 · verified 4 of 6│
+│total 1 P0 · 3 P2 2 P3 · verified 4 of 6               │
 │ cycle 1/2 · fixes sent to session                     │
 └───────────────────────────────────────────────────────┘
 ```
 
 - A spinner marks anything still running, `✓` marks a critic that has returned. Click the header to unfold the panel and see the per-critic rows again; it folds back to the header line with the verdict once the review finishes (`SHIP`, `NO-SHIP`, `done`, or `timed out`).
-- The `review` row shows the diff scope from the reviewed session (`<files> files +<added>/-<deleted>`, omitted if unavailable) and elapsed time, right-aligned: ticking while the review runs, fixed once it finishes (`42s`, `1m42`, `1h05`). The phase (`critics 2/4`, `verifying`, ...) is shown only while running, and only once it says something the row doesn't already (an early "starting"/"gates" phase is skipped).
-- Each critic row shows a constant-position severity run across P0-P3: a colored `<n> P<k>` where it found something (P0/P1 red, P2 amber, P3 muted), a faint `·` where it found nothing, `clean` in place of the whole run when every slot is zero, `no report` when the critic ended without any text, and `not run` for a critic the review never got to. The faint number at the row's right edge is that critic's token total.
-- These are each critic's own findings, before the review session verifies and merges them. The `total` row (shown once at least one critic has reported) sums the same severity run across critics, raw; once the review itself finishes and its own report can be read, it appends `· verified N of M`, where N is what survived the review's adversarial verification and dedup, and M is the raw total that preceded it.
+- The `review` row shows the diff scope (`<files> files +<added>/-<deleted>`), tried from the reviewed session's own summary first, then the review session's, then a per-file diff fetch, omitted (with a one-time `console.debug` of why) if none of the three has anything, and elapsed time, right-aligned: ticking while the review runs, fixed once it finishes (`42s`, `1m42`, `1h05`). The phase (`critics 2/4`, `verifying`, ...) is shown only while running, and only once it says something the row doesn't already (an early "starting"/"gates" phase is skipped).
+- Each critic row's label is a short name (`risk`, `design`, `security`, `slop`, mapped from `adversarial-risk`, `design-principles`, `security-checklist`, and `ai-slop`; an unrecognized subagent falls back to its own id, cut from the end with an ellipsis if it's too long to fit, never from the middle). The detail block next to it is fixed-width, so one row's findings never squeeze a different row's label: a constant-position severity run across P0-P3 (a colored `<n> P<k>` where it found something: P0/P1 red, P2 amber, P3 muted; a faint `·` where it found nothing), `clean` in place of the whole run when every slot is zero, `no report` when the critic ended without any text, and `not run` for a critic the review never got to. The right-aligned number at the row's edge is that critic's token total.
+- These are each critic's own findings, before the review session verifies and merges them. The `total` row (shown once at least one critic has reported) sums the same severity run across critics, raw; once the review itself finishes and its own report can be read, it appends `· verified N of M`, where N is what survived the review's adversarial verification and dedup (counted from the report's own Findings section only, never anything the review refuted, dropped, or listed as mechanical gates, and capped at M so it can never show more than the critics raised), and M is the raw total that preceded it.
 - A `cycle N/max` line appears once the NO-SHIP -> fix -> re-review loop (`MAX_REREVIEW_CYCLES`) has run at least once for this session, with `· fixes sent to session` appended while the latest verdict is NO-SHIP.
 - While there is no review yet for the session you are viewing, the panel stays folded with `idle` like the other sidebar panels, showing the latest queued notice for it underneath (e.g. "diff too large for review, skipped") instead of staying silent.
 - Click the `review` row or a critic row to open that session. Clicking a critic row also opens a findings panel for it (P0/P1 lines plus the review's status); run the **`/review-findings`** command for the same panel over every critic at once. On a host without a panel system, clicking a critic row still just opens its session. In the findings panel, esc or q closes the panel, f toggles fullscreen.

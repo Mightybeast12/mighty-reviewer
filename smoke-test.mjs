@@ -6,6 +6,8 @@ import {
   compareSemver,
   describeInstall,
   countFindings,
+  countVerifiedFindings,
+  criticLabel,
   formatCompactElapsed,
   formatTokenCount,
   severityTokens,
@@ -898,6 +900,71 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     severityTokens({}).map((token) => token.label),
     ["\u00b7", "\u00b7", "\u00b7", "\u00b7"],
     "a missing counts object reads as all zero, not a crash",
+  );
+}
+
+// 25. countVerifiedFindings (internals.js): the review session's own merged
+//     report, unlike a critic's, can carry extra sections (what the
+//     adversarial-verification step refuted or dropped, a mechanical-gates
+//     summary) that must never be counted as findings, and its detail
+//     sub-bullets must never be counted as findings of their own. This is
+//     the fix for the sidebar showing "verified 7 of 4": a review report
+//     that lists 2 real findings plus a "Refuted / dropped" aside and a
+//     "Mechanical gates" aside used to count all of it.
+{
+  const report = [
+    "## Findings",
+    "",
+    "### P1 - auth.js:12",
+    "Hardcoded secret in the connection string.",
+    "- file: auth.js:12",
+    "- Severity: P1",
+    "",
+    "- **P2** Missing input validation",
+    "  - file: api.js:10",
+    "  - fix: validate before use",
+    "",
+    "## Refuted / dropped",
+    "",
+    "- P2 - false positive: already validated upstream, not reachable",
+    "- P3 - speculative, dropped",
+    "",
+    "## Mechanical gates",
+    "",
+    "- lint: clean",
+    "",
+    "NO-SHIP",
+  ].join("\n");
+  assert.equal(
+    countVerifiedFindings(report, 4),
+    2,
+    "only the Findings section's top-level tags count; refuted/mechanical sections and sub-bullets are excluded",
+  );
+  assert.equal(countVerifiedFindings(report, 1), 1, "verified count is capped at the critics' raw total");
+  assert.equal(countVerifiedFindings(report, 0), 0, "capped at zero when the critics raised nothing at all");
+
+  const noHeading = ["Looks fine overall.", "- P1 auth.js:5 hardcoded secret", "NO-SHIP"].join("\n");
+  assert.equal(countVerifiedFindings(noHeading, 4), 1, "a report with no explicit Findings heading still counts from the top");
+
+  assert.equal(countVerifiedFindings(null, 4), null, "a non-string report omits the suffix instead of showing a number");
+  assert.equal(countVerifiedFindings(42, 4), null, "a non-string report omits the suffix instead of showing a number");
+  assert.equal(countVerifiedFindings("clean, no findings.", 4), 0, "a clean report counts zero, not null");
+}
+
+// 26. criticLabel (internals.js): the four known critics get fixed short
+//     row labels so their row width never depends on the real agent id;
+//     an unmapped id is cut from the END with an ellipsis, never the
+//     middle, so the row never shows something like "secur...ecklist".
+{
+  assert.equal(criticLabel("adversarial-risk"), "risk");
+  assert.equal(criticLabel("design-principles"), "design");
+  assert.equal(criticLabel("security-checklist"), "security");
+  assert.equal(criticLabel("ai-slop"), "slop");
+  assert.equal(criticLabel("subagent"), "subagent", "a short unknown id passes through unchanged");
+  assert.equal(
+    criticLabel("some-very-long-ad-hoc-verification-subagent-name"),
+    "some-very-l\u2026",
+    "a long unknown id is cut from the end with an ellipsis, never the middle",
   );
 }
 

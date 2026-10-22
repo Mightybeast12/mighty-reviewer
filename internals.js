@@ -232,6 +232,106 @@ export function countFindings(report) {
   return { counts: useTagged ? tagged : fields, lines: useTagged ? taggedLines : fieldLines };
 }
 
+// A heading named one of these starts a section that is never counted as
+// findings: what the adversarial-verification step in index.js's review
+// prompt refuted or dropped, an aside about what is not a finding, a
+// mechanical-gates summary, or a skip note. The review's final report is
+// free-form (its prompt only mandates "the FULL findings report", not any
+// particular heading), so these sections, when a model adds them for
+// transparency, can list the very things that must NOT be counted again.
+const VERIFIED_STOP_HEADING = /^(?:refuted|dropped|not\s+findings|verified\s+clean|skipped|mechanical\s+gates)\b/i;
+// An explicit "Findings" heading marks where counting may start; without
+// one (the common case, since it is not required), counting starts at the
+// top of the report instead.
+const VERIFIED_START_HEADING = /^findings\b/i;
+
+/**
+ * Counts the review session's own merged report (index.js's final SHIP /
+ * NO-SHIP turn), which is shaped very differently from a single critic's
+ * report: it is a flat, severity-ranked list of surviving findings,
+ * sometimes followed by sections a model adds for transparency about what
+ * it refuted, dropped, judged not a finding, found clean, or skipped
+ * (VERIFIED_STOP_HEADING above). Those sections, and any sub-bullet detail
+ * line under a finding (file/fix/evidence lines), must never be counted:
+ * only a line that itself starts with a P0-P3 tag, at the top level
+ * (a heading, a top-level list item, or a table row, never an indented
+ * sub-bullet), counts as one finding. The result is capped at `rawTotal`
+ * (the critics' combined raw count), since the review can only drop or
+ * merge findings, never invent new ones out of thin air, so "verified N of
+ * M" can never show N > M. Returns null when `report` is not a string, or
+ * parsing throws, so the caller can omit the suffix instead of showing a
+ * wrong number.
+ */
+export function countVerifiedFindings(report, rawTotal) {
+  if (typeof report !== "string") return null;
+  try {
+    const lines = report.split("\n");
+    let start = 0;
+    for (let i = 0; i < lines.length; i++) {
+      const label = headingLabel(lines[i]);
+      if (label !== null && VERIFIED_START_HEADING.test(label)) {
+        start = i + 1;
+        break;
+      }
+    }
+    let end = lines.length;
+    for (let i = start; i < lines.length; i++) {
+      const label = headingLabel(lines[i]);
+      if (label !== null && VERIFIED_STOP_HEADING.test(label)) {
+        end = i;
+        break;
+      }
+    }
+    let fenced = false;
+    let count = 0;
+    for (let i = start; i < end; i++) {
+      const raw = lines[i];
+      if (FENCE.test(raw)) {
+        fenced = !fenced;
+        continue;
+      }
+      if (fenced || !raw.trim()) continue;
+      if (isTopLevelFindingLine(raw)) count += 1;
+    }
+    return Number.isFinite(rawTotal) ? Math.min(count, Math.max(0, rawTotal)) : count;
+  } catch {
+    return null;
+  }
+}
+
+// A heading's bare text, whether written as an ATX heading ("### Refuted")
+// or a whole bold line ("**Refuted**"), stripped of its markdown markers
+// and trailing colon; null when the line is neither (including a bold
+// SPAN inside a list item, e.g. "- **P2** ...", which TOP_LEVEL_ITEM
+// already recognizes as an item, not a heading).
+function headingLabel(raw) {
+  const atx = /^\s*#{1,6}\s+(.*)$/.exec(raw);
+  if (atx) return atx[1].trim();
+  if (TOP_LEVEL_ITEM.test(raw)) return null;
+  const bold = /^\s*(?:\*\*|__)(.+?)(?:\*\*|__)\s*:?\s*$/.exec(raw);
+  return bold ? bold[1].trim() : null;
+}
+
+// A nested detail line (file/fix/evidence sub-bullets under a finding),
+// indented two spaces or more, is never a finding of its own no matter
+// what text it starts with.
+function isSubBullet(raw) {
+  return /^ {2,}(?:[-*+]|\d+[.)])\s/.test(raw);
+}
+
+// The simpler rule the review's own report needs, versus the critic-report
+// parser above: a finding is a top-level line (heading, item, or table row,
+// never a sub-bullet) whose own text leads with a P0-P3 tag, same shape as
+// the critic parser's "tagged" lines, but without its group-heading or
+// Severity-field shapes, which the review's report does not use.
+function isTopLevelFindingLine(raw) {
+  if (isSubBullet(raw) || !STRUCTURAL.test(raw)) return false;
+  const line = stripDecoration(raw);
+  const lead = LEADING_TAG.exec(line);
+  if (lead) return !NOT_A_FINDING.test(line.slice(lead[0].length));
+  return !!BRACKET_TAG.exec(line);
+}
+
 function headingLevel(raw) {
   const match = /^\s*(#+)\s/.exec(raw);
   return match ? match[1].length : 0;
@@ -300,4 +400,33 @@ export function severityTokens(counts) {
     const count = counts?.[severity] ?? 0;
     return { severity, count, label: count > 0 ? `${count} ${severity}` : "\u00b7" };
   });
+}
+
+// index.js AGENT_DEFINITIONS, "-critic" suffix already dropped by the
+// caller, mapped to the short label the sidebar row shows.
+const CRITIC_LABELS = {
+  "adversarial-risk": "risk",
+  "design-principles": "design",
+  "security-checklist": "security",
+  "ai-slop": "slop",
+};
+
+// Long enough that none of the four known critics above ever need it.
+const CRITIC_LABEL_MAX = 12;
+
+/**
+ * Maps a critic's agent id to the sidebar row's short label. The four known
+ * critics get fixed short names, so their row width never depends on their
+ * (much longer) real id. Anything else, such as an ad hoc verification
+ * subagent the review spawns outside the four critics, keeps its own id
+ * unless that would not fit the row, in which case it is cut from the END
+ * and marked with an ellipsis, never from the middle, so the start of the
+ * name, the part most likely to say what it is, survives.
+ */
+export function criticLabel(name) {
+  const mapped = CRITIC_LABELS[name];
+  if (mapped) return mapped;
+  const label = String(name ?? "");
+  if (label.length <= CRITIC_LABEL_MAX) return label;
+  return `${label.slice(0, CRITIC_LABEL_MAX - 1)}\u2026`;
 }

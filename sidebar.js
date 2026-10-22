@@ -35,7 +35,18 @@
 import { createElement, insert, setProp } from "@opentui/solid";
 import { createMemo, createSignal, onCleanup } from "solid-js";
 
-import { countFindings, formatCompactElapsed, formatTokenCount, severityTokens, SEVERITIES, METADATA_KEY, PKG_NAME, PKG_VERSION } from "./internals.js";
+import {
+  countFindings,
+  countVerifiedFindings,
+  criticLabel,
+  formatCompactElapsed,
+  formatTokenCount,
+  severityTokens,
+  SEVERITIES,
+  METADATA_KEY,
+  PKG_NAME,
+  PKG_VERSION,
+} from "./internals.js";
 
 // Must match the title index.js gives review sessions; phase suffixes are
 // appended as "Adversarial review - <phase>".
@@ -53,6 +64,16 @@ const EARLY_PHASES = new Set(["starting", "gates"]);
 const EXPECTED_CRITICS = ["adversarial-risk", "design-principles", "security-checklist", "ai-slop"];
 const FINDINGS_PANEL = "mighty-reviewer.findings";
 const REVIEW_FINDINGS_COMMAND = "mighty-reviewer.review-findings";
+
+// A critic row's detail block (severity run or "clean"/"no report", plus
+// the token count) is padded to these fixed widths, so its total width
+// never changes between a quiet row and a loud one: a long row's severity
+// run no longer squeezes a different row's label by a different amount,
+// which used to truncate critic names inconsistently, and the token count
+// always lands on the same column.
+const SEVERITY_CELL_WIDTH = 4; // fits "N PX" at a single-digit N; "·" pads to it
+const SEVERITY_RUN_WIDTH = SEVERITY_CELL_WIDTH * SEVERITIES.length + (SEVERITIES.length - 1);
+const TOKEN_WIDTH = 5; // right-aligned, fits up to "999k"
 
 const BORDER = { type: "single" };
 const FRAME_MS = 100;
@@ -244,6 +265,10 @@ function createStore(ctx) {
   const reviewReports = new Map();
   const notices = new Map();
   const lastTry = new Map();
+  // Review ids that already got their "no diff summary" console.debug, so a
+  // review stuck without one (every poll tick calls readReview) logs why
+  // exactly once instead of spamming the console.
+  const diffSummaryDebugged = new Set();
 
   const throttled = (key, everyMs) => {
     const at = Date.now();
@@ -328,14 +353,16 @@ function createStore(ctx) {
     return total > 0 ? total : null;
   };
 
-  // The review's own merged/verified report, counted the same way as a
-  // critic's, so the totals row can show "verified N of <raw total>".
-  const verifiedCountOf = (reviewID) => {
+  // The review's own merged/verified report, counted by countVerifiedFindings
+  // (its Findings section only, capped at the critics' raw total) so the
+  // totals row can show "verified N of <raw total>" without N ever
+  // exceeding M.
+  const verifiedCountOf = (reviewID, rawTotal) => {
     if (reviewReports.has(reviewID)) return reviewReports.get(reviewID);
     const cachedMessages = safe(() => data.session.message.list(reviewID)) ?? [];
     const cachedReport = reportFrom(cachedMessages, "asc");
     if (cachedReport !== null) {
-      const verified = sumCounts(countFindings(cachedReport).counts);
+      const verified = countVerifiedFindings(cachedReport, rawTotal);
       reviewReports.set(reviewID, verified);
       return verified;
     }
@@ -344,7 +371,7 @@ function createStore(ctx) {
         .then((messages) => {
           const report = reportFrom(messages, "desc");
           if (report !== null) {
-            reviewReports.set(reviewID, sumCounts(countFindings(report).counts));
+            reviewReports.set(reviewID, countVerifiedFindings(report, rawTotal));
             bump();
           }
         })
@@ -356,6 +383,30 @@ function createStore(ctx) {
   const fetchMessages = async (sessionID) => {
     const response = await ctx.client.message.list({ sessionID, limit: 10, order: "desc" });
     return Array.isArray(response) ? response : (response?.data ?? []);
+  };
+
+  // The review row's diff scope, tried in order: the parent (coding)
+  // session's own Session.summary, which is what normally has it; the
+  // review session's summary, on the rare host that attaches one there
+  // instead; and data.session.diff(reviewID) (a per-file diff list, summed
+  // into file/addition/deletion counts) when neither session carries a
+  // summary at all. Once none of the three has anything, nothing is shown,
+  // and why is logged once (not every poll tick) via console.debug.
+  const diffSummaryFor = (review, parentSession) => {
+    const fromParent = summaryText(parentSession?.summary);
+    if (fromParent) return fromParent;
+    const fromReview = summaryText(review.summary);
+    if (fromReview) return fromReview;
+    const diff = safe(() => data.session.diff?.(review.id));
+    const fromDiff = summaryText(diffStatsOf(diff));
+    if (fromDiff) return fromDiff;
+    if (!diffSummaryDebugged.has(review.id)) {
+      diffSummaryDebugged.add(review.id);
+      console.debug(
+        `[${PKG_NAME}] review ${review.id}: no diff summary (parent session summary: ${describeMissing(parentSession?.summary)}, review session summary: ${describeMissing(review.summary)}, session.diff(): ${describeMissing(diff)})`,
+      );
+    }
+    return null;
   };
 
   const onEvent = (type, event) => {
@@ -447,14 +498,12 @@ function createStore(ctx) {
 
     const parentID = review.metadata?.[METADATA_KEY]?.parentID;
     const parentSession = parentID ? safe(() => data.session.get(parentID)) : null;
-    const diffSummary = parentSession?.summary
-      ? `${parentSession.summary.files} files +${parentSession.summary.additions}/-${parentSession.summary.deletions}`
-      : null;
+    const diffSummary = diffSummaryFor(review, parentSession);
 
     const rawCounts = totalCounts(critics);
     let verifiedSuffix = null;
     if (rawCounts && finished) {
-      const verified = verifiedCountOf(review.id);
+      const verified = verifiedCountOf(review.id, sumCounts(rawCounts));
       if (verified !== null) verifiedSuffix = ` · verified ${verified} of ${sumCounts(rawCounts)}`;
     }
 
@@ -568,6 +617,40 @@ function totalCounts(critics) {
   return any ? sums : null;
 }
 
+// A Session.summary-shaped object (files/additions/deletions), whether it
+// came straight off a session or was summed from a raw diff below, as the
+// review row's one-line diff scope; null when there is nothing to show.
+function summaryText(summary) {
+  if (!summary || typeof summary.files !== "number") return null;
+  return `${summary.files} files +${summary.additions ?? 0}/-${summary.deletions ?? 0}`;
+}
+
+// data.session.diff(sessionID) is a per-file diff list (SnapshotFileDiff[]
+// in the host), possibly wrapped as { data: [...] } like the other list
+// endpoints this file already calls; summed into the same file/additions/
+// deletions shape Session.summary uses. Null when the shape is not a list
+// at all, so the caller knows this fallback had nothing either.
+function diffStatsOf(diff) {
+  const files = Array.isArray(diff) ? diff : Array.isArray(diff?.data) ? diff.data : Array.isArray(diff?.files) ? diff.files : null;
+  if (!files) return null;
+  let additions = 0;
+  let deletions = 0;
+  for (const file of files) {
+    additions += Number(file?.additions) || 0;
+    deletions += Number(file?.deletions) || 0;
+  }
+  return { files: files.length, additions, deletions };
+}
+
+// Short reason fragments for the "no diff summary" debug line: distinguishes
+// a value that was simply absent from one a fallback attempt returned but
+// that carried nothing usable.
+function describeMissing(value) {
+  if (value === undefined) return "unavailable";
+  if (value === null) return "empty";
+  return "no usable fields";
+}
+
 // Same parse as tui.js's noticeFrom, applied to the raw inbox item instead of
 // the wrapped event envelope: a synthetic item carrying our metadata key.
 function noticeFromItem(item) {
@@ -664,7 +747,7 @@ function renderPanel(review, colors, now, ui) {
     critic.pending
       ? row({
           glyph: glyphOf(false, false, colors, now),
-          label: critic.name,
+          label: criticLabel(critic.name),
           detail: review.finished ? [text({ fg: colors.muted, wrapMode: "none" }, ["not run"])] : null,
           indent: 2,
           colors,
@@ -673,7 +756,7 @@ function renderPanel(review, colors, now, ui) {
         })
       : row({
           glyph: glyphOf(critic.running, critic.result !== null || review.finished, colors, now),
-          label: critic.name,
+          label: criticLabel(critic.name),
           detail: critic.running ? null : resultDetail(critic.result, colors),
           indent: 2,
           colors,
@@ -780,14 +863,16 @@ function elapsedLabel(review, now) {
 // "1 P0  ·  ·  2 P3" with each severity in a constant position (its color
 // when counted, faint when zero), "clean" when the critic reported nothing,
 // "no report" when it ended without any text, each (but "no report")
-// followed by the critic session's token total.
+// followed by the critic session's token total, right-aligned so every
+// row's detail block is exactly the same width (SEVERITY_RUN_WIDTH plus the
+// token field) no matter how many severities it is showing.
 function resultDetail(result, colors) {
   if (!result) return null;
-  if (result.noReport) return [text({ fg: colors.muted, wrapMode: "none" }, ["no report"])];
+  if (result.noReport) return [text({ fg: colors.muted, wrapMode: "none" }, ["no report".padEnd(SEVERITY_RUN_WIDTH)])];
   const cells = [];
   const hasFindings = SEVERITIES.some((severity) => result.counts[severity] > 0);
   if (!hasFindings) {
-    cells.push(text({ fg: colors.success, wrapMode: "none" }, ["clean"]));
+    cells.push(text({ fg: colors.success, wrapMode: "none" }, ["clean".padEnd(SEVERITY_RUN_WIDTH)]));
   } else {
     const severityColor = severityColors(colors);
     severityTokens(result.counts).forEach((token, index) => {
@@ -798,13 +883,13 @@ function resultDetail(result, colors) {
             wrapMode: "none",
             marginLeft: index === 0 ? 0 : 1,
           },
-          [token.label],
+          [token.label.padStart(SEVERITY_CELL_WIDTH)],
         ),
       );
     });
   }
   const tokenLabel = formatTokenCount(result.tokens);
-  if (tokenLabel) cells.push(text({ fg: colors.muted, wrapMode: "none", marginLeft: 1 }, [tokenLabel]));
+  if (tokenLabel) cells.push(text({ fg: colors.muted, wrapMode: "none", marginLeft: 1 }, [tokenLabel.padStart(TOKEN_WIDTH)]));
   return cells;
 }
 
@@ -814,11 +899,14 @@ function resultDetail(result, colors) {
 function totalsLine(review, colors) {
   if (!review.rawCounts) return null;
   const severityColor = severityColors(colors);
-  const cells = [text({ fg: colors.muted, wrapMode: "none" }, ["total"])];
-  severityTokens(review.rawCounts).forEach((token) => {
+  const cells = [
+    text({ fg: colors.muted, wrapMode: "none" }, ["total"]),
+    text({ fg: colors.muted, wrapMode: "none" }, [" "]),
+  ];
+  severityTokens(review.rawCounts).forEach((token, index) => {
     cells.push(
       text(
-        { fg: token.count > 0 ? severityColor[token.severity] : colors.muted, wrapMode: "none", marginLeft: 1 },
+        { fg: token.count > 0 ? severityColor[token.severity] : colors.muted, wrapMode: "none", marginLeft: index === 0 ? 0 : 1 },
         [token.label],
       ),
     );

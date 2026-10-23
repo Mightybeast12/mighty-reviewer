@@ -29,15 +29,14 @@
  */
 
 import { execFile } from "node:child_process";
+import os from "node:os";
 import path from "node:path";
 
 import { PKG_NAME, METADATA_KEY } from "./internals.js";
 
 const TOOL_NAME_TO_V1 = { shell: "bash", subagent: "task" };
-// Critics and the review session never need anything outside the project;
-// see the session.create note on why "ask" is worse than "deny" here.
-const EXTERNAL_DIRECTORY_DENY = { action: "external_directory", resource: "*", effect: "deny" };
 const TOOL_NAME_TO_V2 = { bash: "shell", task: "subagent", write: "edit", patch: "edit" };
+const DEFAULT_EXTERNAL_FALLBACK = "deny";
 const IDLE_EVENTS = new Set([
   "session.idle",
   "session.execution.succeeded",
@@ -67,7 +66,7 @@ export function createV2Setup(factory) {
         ctx.agent.transform((editor) => {
           for (const [id, definition] of Object.entries(cfg.agent)) {
             if (editor.get(id)) continue;
-            editor.update(id, (agent) => applyAgentDefinition(agent, definition));
+            editor.update(id, (agent) => applyAgentDefinition(agent, definition, options));
           }
         }),
       );
@@ -182,7 +181,7 @@ export function createV2Setup(factory) {
   };
 }
 
-function applyAgentDefinition(agent, definition) {
+function applyAgentDefinition(agent, definition, options) {
   if (definition.description !== undefined) agent.description = definition.description;
   if (definition.mode !== undefined) agent.mode = definition.mode;
   if (definition.prompt !== undefined) agent.system = definition.prompt;
@@ -191,9 +190,46 @@ function applyAgentDefinition(agent, definition) {
   }
   const model = parseModelRef(definition.model);
   if (model) agent.model = model;
-  agent.permissions.push(...toolsToPermissions(definition.tools), EXTERNAL_DIRECTORY_DENY);
+  agent.permissions.push(...toolsToPermissions(definition.tools), ...buildExternalDirectoryPermissions(options));
 }
 
+function expandHome(dir) {
+  if (dir === "~") return os.homedir();
+  if (dir.startsWith("~/")) return path.join(os.homedir(), dir.slice(2));
+  return dir;
+}
+
+// A bare directory ("~/dev") only grants that literal path; appending "/*"
+// lets the rule's glob cover everything underneath it. An entry that
+// already contains a glob character is left alone so a caller can hand-tune
+// a narrower pattern (e.g. "~/dev/*-service").
+function toExternalDirectoryResource(dir) {
+  const expanded = expandHome(dir);
+  if (/[*?[\]{}]/.test(expanded)) return expanded;
+  return expanded.endsWith("/") ? `${expanded}*` : `${expanded}/*`;
+}
+
+// OpenCode 2 resolves a permission Ruleset last-match-wins, not first-match:
+// of every rule whose action and resource glob match the request, the one
+// at the highest array index decides the effect. Confirmed against
+// @opencode/schema's Agent.Info default Ruleset, which places the narrow
+// "*.env.example" allow after, and overriding, the broader "*.env.*" ask it
+// would otherwise lose to.
+//
+// Because "*" matches everything, the externalFallback rule has to be
+// listed FIRST and the per-directory allows AFTER it. The opposite order
+// would put the fallback at the highest index, so its "*" would always be
+// the winning match and the allow rules would never fire.
+export function buildExternalDirectoryPermissions(options) {
+  const directories = Array.isArray(options?.externalDirectories) ? options.externalDirectories : [];
+  const fallback = options?.externalFallback === "ask" ? "ask" : DEFAULT_EXTERNAL_FALLBACK;
+  const rules = [{ action: "external_directory", resource: "*", effect: fallback }];
+  for (const dir of directories) {
+    if (typeof dir !== "string" || !dir) continue;
+    rules.push({ action: "external_directory", resource: toExternalDirectoryResource(dir), effect: "allow" });
+  }
+  return rules;
+}
 
 function toolsToPermissions(tools) {
   const rules = [];
@@ -293,12 +329,18 @@ function createLegacyClient(ctx, options) {
           ...(model ? { model } : {}),
           // The review session is headless: a permission prompt has nobody to
           // answer it and stalls the review until the watchdog fires
-          // (observed: ~5 min per out-of-project read). Denying
-          // external_directory turns that stall into an immediate error the
-          // orchestrator can route around.
+          // (observed: ~5 min per out-of-project read). The default
+          // externalFallback ("deny") turns that stall into an immediate
+          // error the orchestrator can route around; externalDirectories
+          // lets a config-repo review read the repos it references without
+          // opening the whole filesystem. Setting externalFallback to "ask"
+          // is a deliberate trade-off a user can opt into (e.g. to approve a
+          // one-off path interactively) at the cost of reintroducing that
+          // same headless stall for anything not covered by
+          // externalDirectories.
           permissions: [
             ...toolsToPermissions({ edit: false, write: false, patch: false }),
-            EXTERNAL_DIRECTORY_DENY,
+            ...buildExternalDirectoryPermissions(options),
           ],
         });
         return { data: created };

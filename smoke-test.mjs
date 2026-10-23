@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import os from "node:os";
 import module, { MightyReviewer } from "./index.js";
 import tuiPlugin from "./tui.js";
+import { buildExternalDirectoryPermissions } from "./v2.js";
 import {
   extractVerdict,
   compareSemver,
@@ -1173,6 +1175,52 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
   assert.equal(toasts.length, beforeDedup + 1, "a notice for an unrelated session is never deduped");
 
   await cleanup();
+}
+
+// External-directory permissions (v2.js): default stays deny-everything
+// (backward compatible with the old hardcoded EXTERNAL_DIRECTORY_DENY), and
+// the fallback rule is built FIRST with the per-directory allows AFTER it,
+// since OpenCode 2 resolves permission rulesets last-match-wins.
+{
+  const defaultRules = buildExternalDirectoryPermissions({});
+  assert.deepEqual(
+    defaultRules,
+    [{ action: "external_directory", resource: "*", effect: "deny" }],
+    "no externalDirectories/externalFallback set: single deny-all rule, same as the old hardcoded default",
+  );
+
+  const home = os.homedir();
+  const rules = buildExternalDirectoryPermissions({
+    externalDirectories: ["~/dev", "/srv/shared/*-logs"],
+    externalFallback: "ask",
+  });
+  assert.equal(rules.length, 3, "two directories plus the fallback produce three rules");
+  assert.deepEqual(
+    rules[0],
+    { action: "external_directory", resource: "*", effect: "ask" },
+    "fallback rule is listed first so the more specific allows (higher array index) win under last-match-wins",
+  );
+  assert.deepEqual(
+    rules[1],
+    { action: "external_directory", resource: `${home}/dev/*`, effect: "allow" },
+    "~ expands to the home directory and gets a trailing /* glob appended",
+  );
+  assert.deepEqual(
+    rules[2],
+    { action: "external_directory", resource: "/srv/shared/*-logs", effect: "allow" },
+    "an entry that already has a glob is kept as-is, not given another /* suffix",
+  );
+
+  assert.deepEqual(
+    buildExternalDirectoryPermissions({ externalDirectories: ["~/dev"] })[0],
+    { action: "external_directory", resource: "*", effect: "deny" },
+    "externalFallback defaults to deny even when externalDirectories is set",
+  );
+  assert.deepEqual(
+    buildExternalDirectoryPermissions({ externalFallback: "nonsense" })[0],
+    { action: "external_directory", resource: "*", effect: "deny" },
+    "an unrecognized externalFallback value falls back to deny, not ask",
+  );
 }
 
 console.log("ALL SMOKE TESTS PASSED");

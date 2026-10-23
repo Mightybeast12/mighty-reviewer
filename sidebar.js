@@ -195,10 +195,16 @@ export function mountSidebar(ctx) {
   // the same store, so it needs no extra session tracking of its own.
   // `footerAnimating` is separate from the sidebar panel's `animating` so
   // either slot alone keeps the frame timer ticking.
+  // Mounted with `after`, as a sibling of the host's status box, not
+  // `append` inside it: the host box has flexGrow 1 and squeezes appended
+  // children to zero width while a turn runs. The root sizes to its content
+  // (no fixed width) so that, while no review is running, the empty box
+  // claims no columns; a `width: "100%"` here crushed the host's own
+  // spinner and "esc interrupt" hint down to a few truncated cells.
   const disposeFooterStatus = ctx.ui.slot({
-    append: "prompt.footer.status",
+    after: "prompt.footer.status",
     render: (input) => {
-      const root = box({ width: "100%", flexDirection: "row" });
+      const root = box({ flexDirection: "row", flexShrink: 0 });
       insert(root, () => {
         store.tick();
         const sessionID = input?.sessionID ?? routeSessionID(ctx);

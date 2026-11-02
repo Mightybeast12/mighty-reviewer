@@ -36,7 +36,7 @@ function usage() {
     echo "     (excluding vendor/ and node_modules/)"
     echo "  5. npm version <version> --no-git-tag-version"
     echo "  6. commit, tag v<version>, push origin main --tags"
-    echo "  7. poll gh run list until the latest run completes (10 min timeout)"
+    echo "  7. poll gh run list until the pushed commit's run completes (10 min timeout)"
     echo "  8. poll npm view <name> version until it matches <version> (5 min timeout)"
 }
 
@@ -158,12 +158,16 @@ function do_push() {
     git -C "$REPO_DIR" push origin main --tags
 }
 
+# gate_wait_for_ci <sha> - waits for the run of the pushed commit itself:
+# right after a push, an unfiltered `gh run list --limit 1` still returns
+# the previous commit's run.
 function gate_wait_for_ci() {
+    local sha="$1"
     local waited=0
-    log_info "Waiting for the latest GitHub Actions run to complete (timeout ${TIMEOUT_CI_SECS}s)..."
+    log_info "Waiting for the GitHub Actions run of $sha to complete (timeout ${TIMEOUT_CI_SECS}s)..."
     while true; do
         local run_json status conclusion url
-        if ! run_json="$(cd "$REPO_DIR" && gh run list --limit 1 --json status,conclusion,url 2>&1)"; then
+        if ! run_json="$(cd "$REPO_DIR" && gh run list --commit "$sha" --limit 1 --json status,conclusion,url 2>&1)"; then
             log_error "gh run list failed: $run_json"
             exit 1
         fi
@@ -171,9 +175,9 @@ function gate_wait_for_ci() {
         if [[ "$status" == "completed" ]]; then
             conclusion="$(json_get "$run_json" conclusion)"
             url="$(json_get "$run_json" url)"
-            log_info "Latest run completed: conclusion=$conclusion ($url)"
+            log_info "Run for $sha completed: conclusion=$conclusion ($url)"
             if [[ "$conclusion" != "success" ]]; then
-                log_error "Latest GitHub Actions run did not succeed (conclusion: $conclusion)"
+                log_error "The GitHub Actions run for $sha did not succeed (conclusion: $conclusion, $url)"
                 exit 1
             fi
             return 0
@@ -228,8 +232,9 @@ function main() {
     do_commit
     do_tag
     do_push
+    PUSHED_SHA="$(git -C "$REPO_DIR" rev-parse HEAD)"
 
-    gate_wait_for_ci
+    gate_wait_for_ci "$PUSHED_SHA"
     gate_wait_for_npm
 
     log_info "Released $PKG_NAME@$VERSION (tag v$VERSION pushed to origin/main, CI succeeded, npm published)"

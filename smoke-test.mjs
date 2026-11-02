@@ -1223,4 +1223,44 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
   );
 }
 
+// 32. scripts/release.sh's CI gate reads the run of the commit it pushed.
+// It read `gh run list --limit 1`, which right after a push is still the
+// previous commit's run (the sibling mighty-instincts 0.9.2 release, on
+// 2026-11-02, reported the previous run's success while its own run had
+// failed). A fake `gh` answers the unfiltered call with an older passing
+// run and the pushed sha's call with a failure; the gate must fail.
+// Control: the same sha passing, the gate passes. The script's last line
+// (`main "$@"`) is stripped so its functions can be sourced.
+{
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const { spawnSync } = await import("node:child_process");
+  const scratch = path.join(os.tmpdir(), "opencode", "reviewer-test");
+  fs.mkdirSync(scratch, { recursive: true });
+  const ghDir = fs.mkdtempSync(path.join(scratch, "release-gh-"));
+  const pushedSha = "0a9fc7dcca506e3bc7d7fbab9aaebaa765419d7b";
+  const fakeGh = [
+    "#!/usr/bin/env bash",
+    'args="$*"',
+    `if [[ "$args" == *"--commit ${pushedSha}"* ]]; then`,
+    '  echo "[{\\"status\\":\\"completed\\",\\"conclusion\\":\\"${FAKE_PUSHED_CONCLUSION}\\",\\"url\\":\\"https://ci/pushed\\"}]"',
+    "else",
+    '  echo "[{\\"status\\":\\"completed\\",\\"conclusion\\":\\"success\\",\\"url\\":\\"https://ci/previous\\"}]"',
+    "fi",
+  ].join("\n");
+  fs.writeFileSync(path.join(ghDir, "gh"), `${fakeGh}\n`, { mode: 0o755 });
+  const releaseScript = path.join(path.dirname(new URL(import.meta.url).pathname), "scripts", "release.sh");
+  const runGate = (conclusion) =>
+    spawnSync("bash", ["-c", `source <(sed '$d' "$1"); NODE_BIN="$2"; gate_wait_for_ci "$3"`, "gate", releaseScript, process.execPath, pushedSha], {
+      env: { ...process.env, PATH: `${ghDir}:${process.env.PATH}`, FAKE_PUSHED_CONCLUSION: conclusion },
+      encoding: "utf8",
+    });
+  const failing = runGate("failure");
+  assert.notEqual(failing.status, 0, `the CI gate fails when the pushed commit's own run failed (gate said: ${failing.stdout}${failing.stderr})`);
+  assert.ok(`${failing.stdout}${failing.stderr}`.includes("https://ci/pushed"), "the gate reports the pushed commit's run, not the previous one");
+  const passing = runGate("success");
+  assert.equal(passing.status, 0, `control: the gate passes when the pushed commit's run passed (gate said: ${passing.stdout}${passing.stderr})`);
+  fs.rmSync(ghDir, { recursive: true, force: true });
+}
+
 console.log("ALL SMOKE TESTS PASSED");

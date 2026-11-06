@@ -20,6 +20,8 @@
   ],
   "scripts": {
     "test": "node smoke-test.mjs && bun smoke-test.mjs",
+    "check": "bash scripts/check.sh",
+    "hooks": "git config core.hooksPath .githooks && echo hooks installed",
     "release": "bash scripts/release.sh"
   },
   "keywords": [

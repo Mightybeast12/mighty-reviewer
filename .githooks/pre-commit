@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# pre-commit - fast gate for a commit about to happen: syntax and dash
+# checks over the staged files only, no smoke test (that stays
+# release.sh's and CI's job, it is too slow to run on every commit).
+# Installed once per clone by running:
+#   npm run hooks
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+bash "$REPO_DIR/scripts/check.sh" --staged --only syntax,dashes

@@ -29,15 +29,17 @@ function usage() {
     echo "Usage: $0 <version> [commit-message]"
     echo ""
     echo "Gates, each aborting the release on failure:"
-    echo "  1. git tree clean apart from package.json"
-    echo "  2. node --check on every tracked .js file"
-    echo "  3. node smoke-test.mjs"
-    echo "  4. no em dash (U+2014) or en dash (U+2013) in tracked .js/.md/.json files"
-    echo "     (excluding vendor/ and node_modules/)"
-    echo "  5. npm version <version> --no-git-tag-version"
-    echo "  6. commit, tag v<version>, push origin main --tags"
-    echo "  7. poll gh run list until the pushed commit's run completes (10 min timeout)"
-    echo "  8. poll npm view <name> version until it matches <version> (5 min timeout)"
+    echo "  1. current branch is main, and HEAD matches origin/main after a fetch"
+    echo "  2. git tree clean apart from package.json"
+    echo "  3. scripts/check.sh (syntax under node --check, smoke test under"
+    echo "     node and bun, no em/en dash scan, skeleton drift against the"
+    echo "     sibling repo)"
+    echo "  4. npm version <version> --no-git-tag-version"
+    echo "  5. commit, tag v<version>, push origin main and v<version> explicitly"
+    echo "     (not --tags, so no other local tag or branch state can leak into"
+    echo "     the push)"
+    echo "  6. poll gh run list until the pushed commit's run completes (10 min timeout)"
+    echo "  7. poll npm view <name> version until it matches <version> (5 min timeout)"
 }
 
 function resolve_bin() {
@@ -76,6 +78,28 @@ function json_get() {
     ' "$1" "$2"
 }
 
+function gate_branch_and_sync() {
+    log_info "Checking the current branch is main and HEAD matches origin/main..."
+    local branch
+    branch="$(git -C "$REPO_DIR" rev-parse --abbrev-ref HEAD)"
+    if [[ "$branch" != "main" ]]; then
+        log_error "Current branch is '$branch', not main; releases must run from main"
+        exit 1
+    fi
+
+    log_info "Fetching origin main..."
+    git -C "$REPO_DIR" fetch origin main
+
+    local head_sha remote_sha
+    head_sha="$(git -C "$REPO_DIR" rev-parse HEAD)"
+    remote_sha="$(git -C "$REPO_DIR" rev-parse origin/main)"
+    if [[ "$head_sha" != "$remote_sha" ]]; then
+        log_error "HEAD ($head_sha) does not match origin/main ($remote_sha) after fetch; pull or push to sync main before releasing"
+        exit 1
+    fi
+    log_info "On main, HEAD matches origin/main ($head_sha)"
+}
+
 function gate_clean_tree() {
     log_info "Checking the working tree is clean apart from package.json..."
     local dirty
@@ -91,50 +115,10 @@ function gate_clean_tree() {
     log_info "Working tree is clean apart from package.json"
 }
 
-function gate_node_check() {
-    log_info "Running node --check on every tracked .js file..."
-    local file
-    while IFS= read -r file; do
-        [[ -z "$file" ]] && continue
-        "$NODE_BIN" --check "$REPO_DIR/$file"
-    done < <(git -C "$REPO_DIR" ls-files -- '*.js')
-    log_info "node --check passed on all tracked .js files"
-}
-
-function gate_smoke_test() {
-    log_info "Running smoke-test.mjs..."
-    (cd "$REPO_DIR" && "$NODE_BIN" smoke-test.mjs)
-    log_info "smoke-test.mjs passed"
-}
-
-function gate_no_dashes() {
-    log_info "Checking tracked .js/.md/.json files for em dashes (U+2014) or en dashes (U+2013)..."
-    local files
-    files="$(git -C "$REPO_DIR" ls-files -- '*.js' '*.md' '*.json' ':!:vendor/**' ':!:node_modules/**')"
-    if [[ -z "$files" ]]; then
-        log_info "No files to scan"
-        return 0
-    fi
-
-    local offenders=""
-    local file
-    while IFS= read -r file; do
-        [[ -z "$file" ]] && continue
-        if ! "$NODE_BIN" -e '
-            const fs = require("fs");
-            const text = fs.readFileSync(process.argv[1], "utf8");
-            process.exit(/[\u2014\u2013]/.test(text) ? 1 : 0);
-        ' "$REPO_DIR/$file"; then
-            offenders+="$file"$'\n'
-        fi
-    done <<< "$files"
-
-    if [[ -n "$offenders" ]]; then
-        log_error "Em dash or en dash found in:"
-        echo "$offenders" >&2
-        exit 1
-    fi
-    log_info "No em or en dashes found"
+function gate_checks() {
+    log_info "Running scripts/check.sh (syntax, smoke, dashes, skeleton)..."
+    bash "$SCRIPT_DIR/check.sh"
+    log_info "scripts/check.sh passed"
 }
 
 function do_version_bump() {
@@ -154,8 +138,8 @@ function do_tag() {
 }
 
 function do_push() {
-    log_info "Pushing main and tags to origin..."
-    git -C "$REPO_DIR" push origin main --tags
+    log_info "Pushing main and v$VERSION to origin (not --tags, so only this release's tag and the main branch move)..."
+    git -C "$REPO_DIR" push origin main "v$VERSION"
 }
 
 # gate_wait_for_ci <sha> - waits for the run of the pushed commit itself:
@@ -221,10 +205,9 @@ function main() {
 
     require_deps
 
+    gate_branch_and_sync
     gate_clean_tree
-    gate_node_check
-    gate_smoke_test
-    gate_no_dashes
+    gate_checks
 
     PKG_NAME="$("$NODE_BIN" -e "console.log(require(process.argv[1]).name)" "$REPO_DIR/package.json")"
 

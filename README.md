@@ -110,7 +110,7 @@ OpenCode 2 requires a package directory here (it resolves `index.js` and the TUI
 | **NO-SHIP**, real fix-cycle injection reached the coding session | Yes | No (that injection already started the fix cycle) |
 | **NO-SHIP**, injection failed or hit the re-review cycle cap | Yes | **Yes** (`resume: true`; nothing else will start the fix cycle) |
 
-The NO-SHIP notice always leads with a one-line summary before the full findings report: `NO-SHIP: <top finding> (<P0> P0, <P1> P1, <P2> P2) · fixes requested`.
+The NO-SHIP notice always leads with a one-line summary before the full findings report: `NO-SHIP: <top finding> (<P0> P0, <P1> P1, <P2> P2) · fixes requested`. On OpenCode 2 the TUI's chat row for a queued notice shows only that summary line plus, for SHIP and NO-SHIP, a short findings digest (one line per verified finding, severity order, capped at 6); the message the model reads still carries the full report.
 
 **Quiet mode.** Set `"quiet": true` to suppress every notice except NO-SHIP's. On OpenCode 2 this only changes what gets queued into the conversation: the toasts and footer line above do not depend on a queued notice, so live progress still shows up; you just stop getting a permanent record for anything other than NO-SHIP. On OpenCode 1, where a notice is a toast and nothing else, `quiet` suppresses the toast itself for everything except NO-SHIP.
 

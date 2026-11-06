@@ -12,6 +12,7 @@ import {
   topVerifiedFinding,
   clipFindingTitle,
   formatNoShipSummary,
+  formatFindingsDigest,
   criticLabel,
   formatCompactElapsed,
   formatTokenCount,
@@ -600,7 +601,7 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     fn(callback);
     return registration;
   };
-  let report = "report body\nNO-SHIP";
+  let report = "- **P1** report body\n\nNO-SHIP";
   const ctx = {
     options: { model: "prov/model-x", agent: "reviewer", idleDebounceMs: 0, enforceNoShip: true },
     location: { directory: "/tmp/v2-project", project: { directory: "/tmp/v2-project" } },
@@ -723,6 +724,11 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
   assert.equal(started[1].sessionID, "parent-v2");
   assert.equal(started[1].metadata.mightyReviewer.variant, "info");
   assert.equal(started[1].resume, false, "notices never wake the agent");
+  assert.equal(
+    started[1].description,
+    "mighty-reviewer \u00b7 Code changed, running background review...",
+    "a progress notice's description is just 'mighty-reviewer . message', no digest to show yet",
+  );
 
   // Review progress tracking sees v1 tool names for v2 tools.
   await hookCallbacks["tool.execute.before"]({ sessionID: "child-v2", tool: "shell", input: { command: "git diff" } });
@@ -739,6 +745,18 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
   const verdictNotice = calls.find(([kind, input]) => kind === "synthetic" && input.text.includes("NO-SHIP"));
   assert.ok(verdictNotice, "verdict notice delivered into the parent session");
   assert.equal(verdictNotice[1].metadata.mightyReviewer.variant, "warning");
+  assert.ok(
+    verdictNotice[1].description.startsWith("mighty-reviewer \u00b7 NO-SHIP"),
+    `the chat row's description leads with the verdict: ${verdictNotice[1].description}`,
+  );
+  assert.ok(
+    verdictNotice[1].description.includes("  P"),
+    `the chat row's description carries the findings digest: ${verdictNotice[1].description}`,
+  );
+  assert.ok(
+    verdictNotice[1].text.startsWith("mighty-reviewer: NO-SHIP"),
+    `the model-facing text is unchanged by the digest: ${verdictNotice[1].text}`,
+  );
   const status = await tools[0].execute({}, { sessionID: "parent-v2" });
   assert.ok(status.content.includes("verdict: NO-SHIP"), "review_status reports the verdict");
 
@@ -1016,6 +1034,69 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
 
   assert.equal(topVerifiedFinding(null), null, "a non-string report yields no finding detail");
   assert.equal(formatNoShipSummary(42), null, "a non-string report omits the summary instead of showing 'undefined'");
+}
+
+// 26b. formatFindingsDigest (internals.js): the human-facing findings
+//      digest v2.js puts into the synthetic notice's description (the
+//      only field the OpenCode 2 TUI renders), one line per verified
+//      finding in severity order P0/P1/P2/P3, capped at `max` with a
+//      trailing "+N more" line, same Findings-section scoping as
+//      countVerifiedFindings (Refuted etc. excluded, sub-bullets never
+//      counted).
+{
+  const report = [
+    "## Findings",
+    "",
+    "### [P0] Hardcoded secret in connection string",
+    "- file: db.js:10",
+    "",
+    "- **P1** Missing auth check on admin route",
+    "  - file: routes.js:22",
+    "",
+    "- **P2** Unused import",
+    "",
+    "NO-SHIP",
+  ].join("\n");
+
+  assert.equal(
+    formatFindingsDigest(report),
+    "  P0: Hardcoded secret in connection string\n  P1: Missing auth check on admin route\n  P2: Unused import",
+    "formatFindingsDigest lists every verified finding, severity order preserved",
+  );
+
+  assert.equal(
+    formatFindingsDigest(report, 2),
+    "  P0: Hardcoded secret in connection string\n  P1: Missing auth check on admin route\n  +1 more",
+    "max caps the digest and collapses the rest into a '+N more' line",
+  );
+
+  const noFindings = "Nothing to report.\n\nNO-SHIP";
+  assert.equal(formatFindingsDigest(noFindings), null, "a report with zero verified findings digests to null");
+
+  assert.equal(formatFindingsDigest(42), null, "a non-string report digests to null instead of throwing");
+  assert.equal(formatFindingsDigest(null), null, "a null report digests to null instead of throwing");
+
+  const withRefuted = [
+    "## Findings",
+    "",
+    "### [P0] Hardcoded secret in connection string",
+    "- file: db.js:10",
+    "",
+    "- **P1** Missing auth check on admin route",
+    "  - file: routes.js:22",
+    "",
+    "- **P2** Unused import",
+    "",
+    "## Refuted",
+    "- **P0** not real",
+    "",
+    "NO-SHIP",
+  ].join("\n");
+  assert.equal(
+    formatFindingsDigest(withRefuted),
+    "  P0: Hardcoded secret in connection string\n  P1: Missing auth check on admin route\n  P2: Unused import",
+    "a Refuted section's lines never make it into the digest",
+  );
 }
 
 // 27. quiet: true suppresses every notice except NO-SHIP's.

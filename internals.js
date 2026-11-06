@@ -350,6 +350,35 @@ export function formatNoShipSummary(report) {
   return `NO-SHIP: ${title} (${counts.P0} P0, ${counts.P1} P1, ${counts.P2} P2) \u00b7 fixes requested`;
 }
 
+/**
+ * The human-facing findings digest v2.js puts into a synthetic notice's
+ * `description`, the only field the OpenCode 2 TUI renders for a notice
+ * (it shows one chat row, "\u25c8 <description>", and never shows `text`); the
+ * full report keeps living in `text` for the model. One line per verified
+ * finding (verifiedFindingsDetail's scoping: the Findings section only,
+ * refuted/dropped/mechanical-gates asides and sub-bullets excluded), in
+ * severity order P0 then P1 then P2 then P3, preserving each finding's
+ * original order within its severity. Each line reads
+ * "  <severity>: <clipped title>". Capped at `max` lines; any remaining
+ * findings collapse into one final "  +<remaining> more" line. Null when
+ * verifiedFindingsDetail returns null (non-string report or parse failure)
+ * or when there are no verified findings at all, so the caller can omit
+ * the digest instead of showing an empty block.
+ */
+export function formatFindingsDigest(report, max = 6) {
+  const detail = verifiedFindingsDetail(report);
+  if (!detail) return null;
+  const all = SEVERITIES.flatMap((severity) =>
+    detail.lines[severity].map((line) => ({ severity, line })),
+  );
+  if (all.length === 0) return null;
+  const shown = all.slice(0, max);
+  const remaining = all.length - shown.length;
+  const findingLines = shown.map(({ severity, line }) => `  ${severity}: ${clipFindingTitle(line)}`);
+  if (remaining > 0) findingLines.push(`  +${remaining} more`);
+  return findingLines.join("\n");
+}
+
 // Scans the review's own merged report for VERIFIED_START_HEADING /
 // VERIFIED_STOP_HEADING scoping (see countVerifiedFindings' doc comment),
 // then tags every top-level finding line in that range with its severity.

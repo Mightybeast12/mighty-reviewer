@@ -285,15 +285,21 @@ function createLegacyClient(ctx, options) {
           console.info(`[${PKG_NAME}] ${message}`);
           return { data: true };
         }
-        // `detail` is extra text (e.g. the full NO-SHIP findings report)
-        // appended to the synthetic message body only, kept out of
-        // metadata.message so the toast and the sidebar's notice line
-        // (which read metadata.message) stay a short, single line.
+        // The OpenCode 2 TUI renders a synthetic item as a single chat row,
+        // "\u25c8 <description>" (SessionNoticeMessageV2), and never shows
+        // `text`. So `description` carries what the user should read: the
+        // message plus the findings digest (formatFindingsDigest in
+        // internals.js, multi-line, no truncation); `text` carries what
+        // the model should read: the message plus the full `detail`
+        // report; and `metadata.message` stays the short single line the
+        // toast and the sidebar's notice line read.
         const detail = typeof body?.detail === "string" && body.detail ? `\n\n${body.detail}` : "";
+        const title = body?.title ?? PKG_NAME;
+        const digest = typeof body?.digest === "string" && body.digest ? `\n${body.digest}` : "";
         await ctx.session.synthetic({
           sessionID,
-          text: `${body?.title ?? PKG_NAME}: ${message}${detail}`,
-          description: PKG_NAME,
+          text: `${title}: ${message}${detail}`,
+          description: `${title} \u00b7 ${message}${digest}`,
           metadata: { [METADATA_KEY]: { message, variant: body?.variant ?? "info" } },
           delivery: "queue",
           // Quiet by default: the TUI's phase toaster (tui.js) already

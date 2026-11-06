@@ -58,7 +58,12 @@
  *             cap, the notice is the only thing reaching the session, so it
  *             carries the full report and is posted with resume: true so
  *             the fix cycle starts without waiting on the user's next turn.
- *             { quiet: true } suppresses every notice except NO-SHIP's.
+ *             { quiet: true } suppresses every notice except NO-SHIP's. On
+ *             OpenCode 2 the TUI only ever renders the synthetic item's
+ *             description, so that chat row carries "mighty-reviewer ·
+ *             <message>" and, for SHIP / NO-SHIP, a findings digest
+ *             (formatFindingsDigest), while the full report keeps living in
+ *             the model-facing text.
  * Progress:   the review's phase is inferred from tool activity inside the
  *             review session (bash -> mechanical gates, task dispatch ->
  *             critics running N/M, all tasks returned -> verifying) and
@@ -126,7 +131,15 @@ import { readFile, writeFile, rename, rm, stat } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import path from "node:path";
 
-import { PKG_NAME, compareSemver, describeInstall, extractVerdict, formatNoShipSummary, METADATA_KEY } from "./internals.js";
+import {
+  PKG_NAME,
+  compareSemver,
+  describeInstall,
+  extractVerdict,
+  formatFindingsDigest,
+  formatNoShipSummary,
+  METADATA_KEY,
+} from "./internals.js";
 import { createV2Setup } from "./v2.js";
 
 const REVIEW_MARKER = "<!--adversarial-review-auto-->";
@@ -872,14 +885,26 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
   // feedback report, not just a status blurb. meta.resume and meta.detail
   // forward to v2.js's synthetic post (resume: true starts a model turn
   // immediately; detail is extra text appended after `message`, kept out
-  // of the toast itself).
+  // of the toast itself). meta.digest is the findings digest (see
+  // formatFindingsDigest in internals.js); v2.js puts it into the visible
+  // chat row, under `message`, since that is the only field the OpenCode 2
+  // TUI renders for a notice.
   async function showToast(message, variant, sessionID, meta = {}) {
-    const { resume = false, detail, category = null } = meta;
+    const { resume = false, detail, digest, category = null } = meta;
     if (quiet && category !== "no-ship") return;
     if (category === "progress" && client.v2) return;
     try {
       await client.tui.showToast(
-        { body: { title: "mighty-reviewer", message, variant, resume, ...(detail ? { detail } : {}) } },
+        {
+          body: {
+            title: "mighty-reviewer",
+            message,
+            variant,
+            resume,
+            ...(detail ? { detail } : {}),
+            ...(digest ? { digest } : {}),
+          },
+        },
         sessionID,
       );
     } catch {
@@ -1207,6 +1232,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
     let message;
     let variant;
     let toastMeta;
+    const digest = formatFindingsDigest(report);
     if (verdict === "NO-SHIP") {
       const outcome =
         parentSessionID && report ? await injectFindings(parentSessionID, report) : "failed";
@@ -1225,15 +1251,22 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       // false), same as SHIP. When it could not (cycle-cap, failed), this
       // notice is the ONLY thing reaching the session, so it carries the
       // full report (`detail`, kept out of the short toast-facing
-      // `message`) and resume: true starts the fix cycle itself.
+      // `message`) and resume: true starts the fix cycle itself. digest
+      // (see formatFindingsDigest) is forwarded in every outcome, since it
+      // is what the OpenCode 2 chat row actually shows the user.
       toastMeta =
         outcome === "injected"
-          ? { resume: false, category: "no-ship" }
-          : { resume: true, category: "no-ship", detail: typeof report === "string" ? report : undefined };
+          ? { resume: false, category: "no-ship", ...(digest ? { digest } : {}) }
+          : {
+              resume: true,
+              category: "no-ship",
+              detail: typeof report === "string" ? report : undefined,
+              ...(digest ? { digest } : {}),
+            };
     } else if (verdict === "SHIP") {
-      message = "SHIP: background review passed.";
+      message = digest ? "SHIP: background review passed, with notes." : "SHIP: background review passed.";
       variant = "success";
-      toastMeta = { resume: false, category: "ship" };
+      toastMeta = { resume: false, category: "ship", ...(digest ? { digest } : {}) };
     } else {
       message = "Background review finished, see session for details.";
       variant = "success";

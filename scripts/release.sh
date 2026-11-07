@@ -122,13 +122,22 @@ function gate_checks() {
 }
 
 function do_version_bump() {
+    local old_version
+    old_version="$("$NODE_BIN" -e "console.log(require(process.argv[1]).version)" "$REPO_DIR/package.json")"
     log_info "Bumping package.json to $VERSION..."
     (cd "$REPO_DIR" && "$NPM_BIN" version "$VERSION" --no-git-tag-version)
+    # A repo that names its version outside package.json (a README
+    # example, a CHANGELOG heading) keeps those in scripts/bump-version.sh;
+    # the skeleton only calls it when it exists.
+    if [[ -f "$SCRIPT_DIR/bump-version.sh" ]]; then
+        log_info "Running scripts/bump-version.sh $old_version $VERSION..."
+        bash "$SCRIPT_DIR/bump-version.sh" "$old_version" "$VERSION"
+    fi
 }
 
 function do_commit() {
     log_info "Committing: $COMMIT_MESSAGE"
-    git -C "$REPO_DIR" add package.json
+    git -C "$REPO_DIR" add -u
     git -C "$REPO_DIR" commit -m "$COMMIT_MESSAGE"
 }
 

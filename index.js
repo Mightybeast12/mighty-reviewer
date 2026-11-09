@@ -482,6 +482,7 @@ function buildReviewPrompt(languageHints, projectRules, timeoutMs) {
     "   - Exact location (file:line).",
     "   - What is wrong, concretely.",
     "   - The suggested minimal fix (described, NOT applied).",
+    "   Start each finding's own line with its severity tag (for example `- P1 src/x.js:12 ...`) and keep the mechanical-gates summary in its own section, outside the findings list.",
     "   If there are no findings, say so in one line.",
     "7. End with ONE terse verdict covering ALL reviews, stated as exactly the single word SHIP or the single word NO-SHIP on its own line:",
     "   - If any mechanical gate failed, or any VERIFIED P0/P1 finding survived, the verdict is NO-SHIP. Do NOT fix anything yourself; the findings list above is the fix list.",

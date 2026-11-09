@@ -273,10 +273,14 @@ export function countFindings(report) {
 // A heading named one of these starts a section that is never counted as
 // findings: what the adversarial-verification step in index.js's review
 // prompt refuted or dropped, an aside about what is not a finding, a
-// mechanical-gates summary, or a skip note. The review's final report is
-// free-form (its prompt only mandates "the FULL findings report", not any
-// particular heading), so these sections, when a model adds them for
-// transparency, can list the very things that must NOT be counted again.
+// mechanical-gates summary, or a skip note. It skips only that section
+// (down to the next heading at its own level or shallower), not the rest
+// of the report after it, since a model often puts a "Mechanical gates"
+// aside as a bold line INSIDE the Findings section, ahead of the real
+// findings, not after them. The review's final report is free-form (its
+// prompt only mandates "the FULL findings report", not any particular
+// heading), so these sections, when a model adds them for transparency,
+// can list the very things that must NOT be counted again.
 const VERIFIED_STOP_HEADING = /^(?:refuted|dropped|not\s+findings|verified\s+clean|skipped|mechanical\s+gates)\b/i;
 // An explicit "Findings" heading marks where counting may start; without
 // one (the common case, since it is not required), counting starts at the
@@ -289,16 +293,19 @@ const VERIFIED_START_HEADING = /^findings\b/i;
  * report: it is a flat, severity-ranked list of surviving findings,
  * sometimes followed by sections a model adds for transparency about what
  * it refuted, dropped, judged not a finding, found clean, or skipped
- * (VERIFIED_STOP_HEADING above). Those sections, and any sub-bullet detail
- * line under a finding (file/fix/evidence lines), must never be counted:
- * only a line that itself starts with a P0-P3 tag, at the top level
- * (a heading, a top-level list item, or a table row, never an indented
- * sub-bullet), counts as one finding. The result is capped at `rawTotal`
- * (the critics' combined raw count), since the review can only drop or
- * merge findings, never invent new ones out of thin air, so "verified N of
- * M" can never show N > M. Returns null when `report` is not a string, or
- * parsing throws, so the caller can omit the suffix instead of showing a
- * wrong number.
+ * (VERIFIED_STOP_HEADING above, which can also show up as a bold aside
+ * inside the Findings section rather than after it). Those sections, and
+ * any sub-bullet detail line under a finding (file/fix/evidence lines),
+ * must never be counted: a line counts as one finding either when it
+ * itself starts with a P0-P3 tag, at the top level (a heading, a top-level
+ * list item, or a table row, never an indented sub-bullet), or when it is
+ * a top-level item listed under a bare severity group label ("**P1**",
+ * "### P2", "P1:") that carries no tag of its own. The result is capped at
+ * `rawTotal` (the critics' combined raw count), since the review can only
+ * drop or merge findings, never invent new ones out of thin air, so
+ * "verified N of M" can never show N > M. Returns null when `report` is
+ * not a string, or parsing throws, so the caller can omit the suffix
+ * instead of showing a wrong number.
  */
 export function countVerifiedFindings(report, rawTotal) {
   const detail = verifiedFindingsDetail(report);
@@ -323,15 +330,17 @@ export function topVerifiedFinding(report) {
   return { counts: detail.counts, topLine };
 }
 
-// A finding line's own text, with its markdown decoration and leading
-// severity tag stripped, clipped to `max` characters (ellipsis on the end,
-// never the middle) so a toast or synthetic-message summary line stays
-// short regardless of how verbose the model's finding title was.
+// A finding line's own text, with its markdown decoration, leading
+// severity tag, and any leftover bold markers (from a grouped item like
+// "1. **Title.** ...", whose closing "**" survives decoration stripping)
+// removed, clipped to `max` characters (ellipsis on the end, never the
+// middle) so a toast or synthetic-message summary line stays short
+// regardless of how verbose the model's finding title was.
 export function clipFindingTitle(line, max = 80) {
   if (typeof line !== "string" || !line) return "";
   const stripped = stripDecoration(line).trim();
   const withoutTag = stripped.replace(/^\[?P[0-3]\]?[\s:*_.\u2013-]*/i, "").trim();
-  const text = withoutTag || stripped;
+  const text = (withoutTag || stripped).replace(/\*\*/g, "").replace(/ {2,}/g, " ").trim();
   return text.length > max ? `${text.slice(0, max - 1).trimEnd()}\u2026` : text;
 }
 
@@ -379,10 +388,13 @@ export function formatFindingsDigest(report, max = 6) {
   return findingLines.join("\n");
 }
 
-// Scans the review's own merged report for VERIFIED_START_HEADING /
-// VERIFIED_STOP_HEADING scoping (see countVerifiedFindings' doc comment),
-// then tags every top-level finding line in that range with its severity.
-// Null when `report` is not a string, or parsing throws.
+// Scans the review's own merged report for VERIFIED_START_HEADING scoping
+// (see countVerifiedFindings' doc comment), then tags every top-level
+// finding line from there to the end of the report with its severity,
+// skipping any VERIFIED_STOP_HEADING section wherever it appears (its own
+// heading's section only, not the rest of the report) and crediting items
+// listed under a bare severity group label to that label's severity. Null
+// when `report` is not a string, or parsing throws.
 function verifiedFindingsDetail(report) {
   if (typeof report !== "string") return null;
   try {
@@ -395,28 +407,55 @@ function verifiedFindingsDetail(report) {
         break;
       }
     }
-    let end = lines.length;
-    for (let i = start; i < lines.length; i++) {
-      const label = headingLabel(lines[i]);
-      if (label !== null && VERIFIED_STOP_HEADING.test(label)) {
-        end = i;
-        break;
-      }
-    }
     let fenced = false;
+    let skipLevel = null;
+    let section = null;
+    let sectionLevel = 0;
     const counts = emptyCounts();
     const findingLines = emptyLines();
-    for (let i = start; i < end; i++) {
+    for (let i = start; i < lines.length; i++) {
       const raw = lines[i];
       if (FENCE.test(raw)) {
         fenced = !fenced;
         continue;
       }
       if (fenced || !raw.trim()) continue;
+
+      const label = headingLabel(raw);
+      let level = 0;
+      if (label !== null) {
+        level = headingLevel(raw) || 99;
+        if (VERIFIED_STOP_HEADING.test(label)) {
+          skipLevel = level;
+          section = null;
+          continue;
+        }
+        if (skipLevel !== null && level > skipLevel) continue;
+        skipLevel = null;
+      }
+
+      const isItem = TOP_LEVEL_ITEM.test(raw);
+      const line = stripDecoration(raw);
+      const group = isGroupLine(raw, isItem) ? GROUP_LABEL.exec(line) : null;
+      if (group) {
+        section = EMPTY_LABEL.test(line) ? null : group[1].toUpperCase();
+        sectionLevel = level || 99;
+        continue;
+      }
+      // A non-group heading at the current group's level or above ends it;
+      // one deeper than the group stays inside it (and may itself be a
+      // tagged finding, caught below).
+      if (label !== null && level <= sectionLevel) section = null;
+
+      if (skipLevel !== null) continue;
+
       const severity = topLevelFindingSeverity(raw);
       if (severity) {
         counts[severity] += 1;
         findingLines[severity].push(raw.trim());
+      } else if (section !== null && isItem && !isSubBullet(raw)) {
+        counts[section] += 1;
+        findingLines[section].push(raw.trim());
       }
     }
     return { counts, lines: findingLines };
@@ -448,9 +487,11 @@ function isSubBullet(raw) {
 // The simpler rule the review's own report needs, versus the critic-report
 // parser above: a finding is a top-level line (heading, item, or table row,
 // never a sub-bullet) whose own text leads with a P0-P3 tag, same shape as
-// the critic parser's "tagged" lines, but without its group-heading or
-// Severity-field shapes, which the review's report does not use. Returns
-// the severity ("P0".."P3") when `raw` is such a line, else null.
+// the critic parser's "tagged" lines, but without its Severity-field shape,
+// which the review's report does not use. The group-heading shape (a bare
+// "**P1**" label with untagged items under it) IS used by the review's
+// report, but is handled by the caller, verifiedFindingsDetail, not here.
+// Returns the severity ("P0".."P3") when `raw` is such a line, else null.
 function topLevelFindingSeverity(raw) {
   if (isSubBullet(raw) || !STRUCTURAL.test(raw)) return null;
   const line = stripDecoration(raw);

@@ -1099,6 +1099,89 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
   );
 }
 
+// 26c. verifiedFindingsDetail (internals.js): the review model's real report
+//      shape, caught in production. A bold "**Mechanical gates**" aside
+//      inside the Findings section used to be read as the END of the whole
+//      report (VERIFIED_STOP_HEADING stopped the scan instead of just
+//      skipping its own section), dropping every finding that followed.
+//      Findings grouped under a bare severity label ("**P1**", "### P2",
+//      "P1:") as numbered or bulleted items carried no per-line severity
+//      tag, so they were never recognized either. Together these made the
+//      NO-SHIP summary read "no finding details captured" and the
+//      chat-row digest come back null.
+{
+  const grouped = [
+    "## Findings",
+    "",
+    "Verdict is NO-SHIP because the smoke test fails. No P0 findings.",
+    "",
+    "**Mechanical gates**",
+    "- `scripts/check.sh --only syntax,smoke,dashes`: syntax passes, smoke fails.",
+    "- No project typecheck or linter is configured.",
+    "",
+    "**P1**",
+    "1. **Smoke failure.** `smoke-test.mjs:3352` asserts the old reply text.",
+    "   - The new dispatcher says something else (`lib/evolve-command.js:462`).",
+    "   - Fix: update the assertion.",
+    "2. **README documents `/evolve` behaviour that no longer exists.** `README.md` is not in the diff.",
+    "   - Fix: rewrite the README table.",
+    "",
+    "**P2**",
+    "3. **Observer run gate copied in two places.** `lib/board.js:263-287` re-implements `thresholdsMet()`.",
+    "   - Fix: extract one pure gate function.",
+    "",
+    "NO-SHIP",
+  ].join("\n");
+  assert.deepEqual(
+    topVerifiedFinding(grouped).counts,
+    { P0: 0, P1: 2, P2: 1, P3: 0 },
+    "findings grouped under a bare severity label count under that severity, and a mechanical-gates aside is skipped, not treated as end-of-report",
+  );
+  assert.equal(countVerifiedFindings(grouped, 10), 3, "the two P1s and the one P2 all count");
+  assert.equal(
+    formatNoShipSummary(grouped),
+    "NO-SHIP: Smoke failure. `smoke-test.mjs:3352` asserts the old reply text. (0 P0, 2 P1, 1 P2) \u00b7 fixes requested",
+    "the top finding's title has its closing ** stripped, not left dangling",
+  );
+  assert.equal(
+    formatFindingsDigest(grouped),
+    "  P1: Smoke failure. `smoke-test.mjs:3352` asserts the old reply text.\n  P1: README documents `/evolve` behaviour that no longer exists. `README.md` is not\u2026\n  P2: Observer run gate copied in two places. `lib/board.js:263-287` re-implements `t\u2026",
+    "the digest lists all three grouped findings in severity order, each clipped to 80 chars",
+  );
+
+  const atxGrouped = [
+    "## Findings",
+    "### Mechanical gates",
+    "- lint: clean",
+    "### P1",
+    "- First grouped finding",
+    "- Second grouped finding",
+    "### Refuted",
+    "- P0 not real",
+    "### P3",
+    "- A nit",
+    "NO-SHIP",
+  ].join("\n");
+  assert.deepEqual(
+    topVerifiedFinding(atxGrouped).counts,
+    { P0: 0, P1: 2, P2: 0, P3: 1 },
+    "ATX group headings work the same as bold ones; a Refuted section is skipped, and the P3 group after it still counts",
+  );
+
+  const cleared = "## Findings\n\n**P1**: none\n- not a finding\n\n- **P2** Real one\n\nNO-SHIP";
+  assert.deepEqual(
+    topVerifiedFinding(cleared).counts,
+    { P0: 0, P1: 0, P2: 1, P3: 0 },
+    "'**P1**: none' clears the group so the following item counts under nothing",
+  );
+
+  assert.equal(
+    clipFindingTitle("1. **Smoke failure.** `x.js:1` asserts"),
+    "Smoke failure. `x.js:1` asserts",
+    "clipFindingTitle strips ** left over from a grouped numbered item's bold title",
+  );
+}
+
 // 27. quiet: true suppresses every notice except NO-SHIP's.
 {
   const h = await makeHarness("findings\n\nNO-SHIP", { options: { quiet: true } });

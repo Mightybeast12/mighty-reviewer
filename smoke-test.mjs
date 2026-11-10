@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import os from "node:os";
 import module, { MightyReviewer } from "./index.js";
 import tuiPlugin from "./tui.js";
@@ -276,21 +277,26 @@ const makeHarness = async (report, { promptAsyncResult, options, clientV2 } = {}
 }
 
 // 11. review_status tool reports running then done with verdict + report.
+//     Every answer opens with the version this process is running, in the
+//     spec form opencode.json pins (backlog B1), so the orchestrator can
+//     tell a stale session from the pin without the TUI sidebar. The idle
+//     answer used to be the bare sentence; it now follows that line.
+const RUNNING_LINE = `running: mighty-reviewer@${JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8")).version}`;
 {
   const h = await makeHarness("some findings\n\nNO-SHIP");
   const status = h.hooks.tool.review_status;
   assert.equal(
     await status.execute({}, { sessionID: "status-parent" }),
-    "No review has run for this session yet.",
+    `${RUNNING_LINE}\nNo review has run for this session yet.`,
   );
   await h.hooks["command.execute.before"]({ command: "mighty-review", sessionID: "status-parent" }, { parts: [] });
   await h.tick();
-  assert.ok(
-    (await status.execute({}, { sessionID: "status-parent" })).includes("in progress"),
-    "running state reported",
-  );
+  const running = await status.execute({}, { sessionID: "status-parent" });
+  assert.equal(running.split("\n")[0], RUNNING_LINE, "running state names the running version first");
+  assert.ok(running.includes("in progress"), "running state reported");
   await h.childIdle("child-1");
   const done = await status.execute({}, { sessionID: "status-parent" });
+  assert.equal(done.split("\n")[0], RUNNING_LINE, "done state names the running version first");
   assert.ok(done.includes("verdict: NO-SHIP"), "verdict reported");
   assert.ok(done.includes("some findings"), "report included");
 }
@@ -684,6 +690,7 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
   assert.equal(tools[0].name, "review_status");
   const idle = await tools[0].execute({}, { sessionID: "parent-v2" });
   assert.ok(idle.content.includes("No review"), "review_status answers through v2 tool result");
+  assert.equal(idle.content.split("\n")[0], RUNNING_LINE, "v2 review_status names the running version first");
 
   // The reviewer snapshots real git state through $ (Bun's tag, or the Node
   // fallback), so give it a clean repo before the turn and dirty it after

@@ -81,7 +81,7 @@ OpenCode 2 requires a package directory here (it resolves `index.js` and the TUI
 
    A watchdog aborts any review child still running after 10 minutes.
 
-3. **Delivery**: toasts report when the review starts and the final verdict. Full findings live in the child session titled "Adversarial review". The coding agent (and you) can also query the verdict via the **`review_status` tool**, which returns running/done, the verdict, and the findings report. See [What you see during a review](#what-you-see-during-a-review) for exactly what shows up, when, and whether it starts a turn.
+3. **Delivery**: toasts report when the review starts and the final verdict. Full findings live in the child session titled "Adversarial review". The coding agent (and you) can also query the verdict via the **`review_status` tool**, which returns running/done, the verdict, and the findings report, after a first line naming the version the session runs (`running: mighty-reviewer@<version>`, the form `opencode.json` pins, so a stale session shows against the pin). See [What you see during a review](#what-you-see-during-a-review) for exactly what shows up, when, and whether it starts a turn.
 
    **Progress tracking**: while the review runs, its phase is inferred from tool activity in the review session and surfaced three ways:
    - `review_status` reports the current phase and elapsed time (e.g. "waiting on critics (2/4 returned), elapsed 3m 40s") instead of a bare "in progress",

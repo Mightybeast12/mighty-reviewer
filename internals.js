@@ -11,8 +11,9 @@ import path from "node:path";
 import { createRequire } from "node:module";
 
 export const PKG_NAME = "mighty-reviewer";
-// Shown in the sidebar header; read from package.json so it cannot drift
-// from the published version. Empty when the lookup fails (odd loaders).
+// Shown in the sidebar header and on the first line of every review_status
+// answer; read from package.json so it cannot drift from the published
+// version. Empty when the lookup fails (odd loaders).
 export const PKG_VERSION = readPackageVersion();
 
 function readPackageVersion() {

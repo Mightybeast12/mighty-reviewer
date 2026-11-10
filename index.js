@@ -102,7 +102,8 @@
  *             never flagged), giving a Bugbot-style suppression mechanism.
  * On demand:  the /mighty-review command triggers a review of the current
  *             working tree; the review_status tool lets the parent agent
- *             query the running/done state and verdict.
+ *             query the running/done state and verdict, after a first line
+ *             naming the running version ("running: mighty-reviewer@x.y.z").
  * Lifecycle:  session.idle handling is debounced (idleDebounceMs); each
  *             review child is armed with a watchdog that aborts it after
  *             timeoutMs (default 10 min). With { enforceNoShip: true }, git commit
@@ -133,6 +134,7 @@ import path from "node:path";
 
 import {
   PKG_NAME,
+  PKG_VERSION,
   compareSemver,
   describeInstall,
   extractVerdict,
@@ -153,6 +155,9 @@ const MAX_REREVIEW_CYCLES = 2;
 // send time, making "can never loop forever" true by mechanism.
 const MAX_TOTAL_INJECTIONS = 10;
 const MAX_FEEDBACK_CHARS = 8000;
+// First line of every review_status answer: the version this process runs,
+// in the spec form opencode.json pins, so a caller can compare the two.
+const RUNNING_LINE = `running: ${PKG_NAME}@${PKG_VERSION || "unknown"}`;
 
 // A review session can go idle WITHOUT a verdict: some orchestrator agents
 // launch the critics as background tasks and end their turn immediately,
@@ -1348,6 +1353,19 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
     void spawnReview(sessionID);
   }
 
+  function describeReviewState(state) {
+    if (!state) return "No review has run for this session yet.";
+    if (state.status === "running") {
+      const elapsed = formatElapsed(Date.now() - (state.startedAt ?? state.updatedAt));
+      return `Review still in progress: ${describePhase(state)} (elapsed ${elapsed}; reviews are aborted after ${Math.max(1, Math.round(reviewTimeoutMs / 60000))} minutes).`;
+    }
+    return [
+      `verdict: ${state.verdict ?? "unknown (no verdict line found)"}`,
+      "",
+      state.report ?? "(no report captured)",
+    ].join("\n");
+  }
+
   async function checkForUpdate() {
     try {
       const install = describeInstall(import.meta.url);
@@ -1416,21 +1434,12 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
     tool: {
       review_status: {
         description:
-          "Get the status of the mighty-reviewer background review for the current session: running, or done with the SHIP/NO-SHIP verdict and the findings report. Call after finishing code changes to check whether the review passed.",
+          "Get the status of the mighty-reviewer background review for the current session: running, or done with the SHIP/NO-SHIP verdict and the findings report. Call after finishing code changes to check whether the review passed. The first line names the plugin version this session runs (running: mighty-reviewer@x.y.z).",
         args: {},
         async execute(_args, ctx) {
           const sessionID = ctx?.sessionID;
           const state = sessionID ? reviewStates.get(sessionID) : undefined;
-          if (!state) return "No review has run for this session yet.";
-          if (state.status === "running") {
-            const elapsed = formatElapsed(Date.now() - (state.startedAt ?? state.updatedAt));
-            return `Review still in progress: ${describePhase(state)} (elapsed ${elapsed}; reviews are aborted after ${Math.max(1, Math.round(reviewTimeoutMs / 60000))} minutes).`;
-          }
-          return [
-            `verdict: ${state.verdict ?? "unknown (no verdict line found)"}`,
-            "",
-            state.report ?? "(no report captured)",
-          ].join("\n");
+          return `${RUNNING_LINE}\n${describeReviewState(state)}`;
         },
       },
     },

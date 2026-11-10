@@ -1405,7 +1405,19 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
     return `${state.root} ${state.baseRef}...${state.headRef} (${shortRange(state)})`;
   }
 
+  // A running entry whose end can no longer be recorded: older than its own
+  // deadline, or its deadline timer died with the instance that set it (a
+  // reload disposes that instance; the module-level entry outlives it).
+  function isStaleBranchReview(state) {
+    if (state.status !== "running") return false;
+    if (Date.now() - state.startedAt > branchTimeoutMs) return true;
+    return Boolean(state.timer && !state.timerOwner?.has(state.timer));
+  }
+
   function describeBranchReview(state) {
+    if (isStaleBranchReview(state)) {
+      return `Branch review of ${describeBranchRange(state)} looks stale: started ${formatElapsed(Date.now() - state.startedAt)} ago, and its end was never recorded (a reload or a lost idle event). Call review_branch with rerun: true to restart it.`;
+    }
     if (state.status === "running") {
       return `Branch review of ${describeBranchRange(state)} still running (elapsed ${formatElapsed(Date.now() - state.startedAt)}; aborted after ${Math.max(1, Math.round(branchTimeoutMs / 60000))} minutes). Advisory: nothing is blocked or sent back.`;
     }
@@ -1421,8 +1433,9 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
     const lines = [];
     for (const state of branchReviews.values()) {
       if (state.requestedBy !== sessionID) continue;
-      const outcome =
-        state.status === "running"
+      const outcome = isStaleBranchReview(state)
+        ? `stale (started ${formatElapsed(Date.now() - state.startedAt)} ago), rerun: true restarts it`
+        : state.status === "running"
           ? `running, elapsed ${formatElapsed(Date.now() - state.startedAt)}`
           : `done: ${state.verdict ?? "no verdict"}`;
       lines.push(`- ${describeBranchRange(state)}: ${outcome}`);
@@ -1472,7 +1485,10 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
 
     const key = branchKey(range);
     const existing = branchReviews.get(key);
-    if (existing && (existing.status === "running" || args?.rerun !== true)) return describeBranchReview(existing);
+    if (existing && (args?.rerun !== true || (existing.status === "running" && !isStaleBranchReview(existing)))) {
+      return describeBranchReview(existing);
+    }
+    const orphanSessionID = existing?.status === "running" ? existing.reviewSessionID : null;
 
     // Claimed before the first await, so a parallel call for the same range
     // reads this entry instead of starting a second review.
@@ -1486,8 +1502,19 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       verdict: null,
       report: null,
       timer: null,
+      timerOwner: null,
     };
     branchReviews.set(key, state);
+
+    if (orphanSessionID) {
+      // The stale review this rerun replaces may still be running somewhere.
+      branchReviewSessions.delete(orphanSessionID);
+      try {
+        await client.session.abort({ path: { id: orphanSessionID } });
+      } catch {
+        // Abort is best-effort.
+      }
+    }
 
     try {
       const rules = await projectRules(range.root);
@@ -1499,6 +1526,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       if (!reviewSessionID) throw new Error("session.create returned no id");
       state.reviewSessionID = reviewSessionID;
       branchReviewSessions.set(reviewSessionID, key);
+      state.timerOwner = ownedTimers;
       state.timer = ownTimer(
         setTimeout(async () => {
           if (!branchReviewSessions.has(reviewSessionID)) return;

@@ -1465,6 +1465,7 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
   fs.mkdirSync(scratch, { recursive: true });
   const repo = fs.realpathSync(fs.mkdtempSync(path.join(scratch, "branch-")));
   let hooks;
+  let reloaded;
   try {
     const git = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
     git("init", "-q");
@@ -1601,7 +1602,22 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     assert.ok(aborted.includes(`branch-review-${sessionsBefore + 1}`), `the session it created is aborted: ${aborted.join(",")}`);
     const retried = await call({ repo, base: baseSha, head: "lane/x" });
     assert.ok(retried.includes("Branch review started"), `no entry is left behind by the failed start: ${retried}`);
+
+    // A reload disposes the instance that started a review, and its end may
+    // never reach the next one: the entry reads as stale, and rerun: true
+    // replaces it (aborting the old session) instead of being refused.
+    const orphanID = `branch-review-${created.length}`;
+    hooks.dispose();
+    reloaded = await plugin({ client, directory: repo, worktree: repo, $: makeShell() }, { idleDebounceMs: 0, updateCheck: false });
+    const readStale = await reloaded.tool.review_branch.execute({ repo, base: baseSha, head: "lane/x" }, { sessionID: "orch-1" });
+    assert.ok(readStale.includes("stale") && readStale.includes("rerun: true"), `an orphaned running review reads as stale: ${readStale}`);
+    const listStale = await reloaded.tool.review_status.execute({}, { sessionID: "orch-1" });
+    assert.ok(/: stale \(started .* ago\), rerun: true restarts it/.test(listStale), `review_status lists it as stale: ${listStale}`);
+    const restarted = await reloaded.tool.review_branch.execute({ repo, base: baseSha, head: "lane/x", rerun: true }, { sessionID: "orch-1" });
+    assert.ok(restarted.includes("Branch review started"), `rerun: true replaces a stale review: ${restarted}`);
+    assert.ok(aborted.includes(orphanID), `and aborts its session: ${aborted.join(",")}`);
   } finally {
+    reloaded?.dispose();
     hooks?.dispose();
     fs.rmSync(repo, { recursive: true, force: true });
   }

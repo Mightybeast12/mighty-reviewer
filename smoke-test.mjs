@@ -1421,29 +1421,32 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
   const scratch = path.join(os.tmpdir(), "opencode", "reviewer-test");
   fs.mkdirSync(scratch, { recursive: true });
   const ghDir = fs.mkdtempSync(path.join(scratch, "release-gh-"));
-  const pushedSha = "0a9fc7dcca506e3bc7d7fbab9aaebaa765419d7b";
-  const fakeGh = [
-    "#!/usr/bin/env bash",
-    'args="$*"',
-    `if [[ "$args" == *"--commit ${pushedSha}"* ]]; then`,
-    '  echo "[{\\"status\\":\\"completed\\",\\"conclusion\\":\\"${FAKE_PUSHED_CONCLUSION}\\",\\"url\\":\\"https://ci/pushed\\"}]"',
-    "else",
-    '  echo "[{\\"status\\":\\"completed\\",\\"conclusion\\":\\"success\\",\\"url\\":\\"https://ci/previous\\"}]"',
-    "fi",
-  ].join("\n");
-  fs.writeFileSync(path.join(ghDir, "gh"), `${fakeGh}\n`, { mode: 0o755 });
-  const releaseScript = path.join(path.dirname(new URL(import.meta.url).pathname), "scripts", "release.sh");
-  const runGate = (conclusion) =>
-    spawnSync("bash", ["-c", `source <(sed '$d' "$1"); NODE_BIN="$2"; gate_wait_for_ci "$3"`, "gate", releaseScript, process.execPath, pushedSha], {
-      env: { ...process.env, PATH: `${ghDir}:${process.env.PATH}`, FAKE_PUSHED_CONCLUSION: conclusion },
-      encoding: "utf8",
-    });
-  const failing = runGate("failure");
-  assert.notEqual(failing.status, 0, `the CI gate fails when the pushed commit's own run failed (gate said: ${failing.stdout}${failing.stderr})`);
-  assert.ok(`${failing.stdout}${failing.stderr}`.includes("https://ci/pushed"), "the gate reports the pushed commit's run, not the previous one");
-  const passing = runGate("success");
-  assert.equal(passing.status, 0, `control: the gate passes when the pushed commit's run passed (gate said: ${passing.stdout}${passing.stderr})`);
-  fs.rmSync(ghDir, { recursive: true, force: true });
+  try {
+    const pushedSha = "0a9fc7dcca506e3bc7d7fbab9aaebaa765419d7b";
+    const fakeGh = [
+      "#!/usr/bin/env bash",
+      'args="$*"',
+      `if [[ "$args" == *"--commit ${pushedSha}"* ]]; then`,
+      '  echo "[{\\"status\\":\\"completed\\",\\"conclusion\\":\\"${FAKE_PUSHED_CONCLUSION}\\",\\"url\\":\\"https://ci/pushed\\"}]"',
+      "else",
+      '  echo "[{\\"status\\":\\"completed\\",\\"conclusion\\":\\"success\\",\\"url\\":\\"https://ci/previous\\"}]"',
+      "fi",
+    ].join("\n");
+    fs.writeFileSync(path.join(ghDir, "gh"), `${fakeGh}\n`, { mode: 0o755 });
+    const releaseScript = path.join(path.dirname(new URL(import.meta.url).pathname), "scripts", "release.sh");
+    const runGate = (conclusion) =>
+      spawnSync("bash", ["-c", `source <(sed '$d' "$1"); NODE_BIN="$2"; gate_wait_for_ci "$3"`, "gate", releaseScript, process.execPath, pushedSha], {
+        env: { ...process.env, PATH: `${ghDir}:${process.env.PATH}`, FAKE_PUSHED_CONCLUSION: conclusion },
+        encoding: "utf8",
+      });
+    const failing = runGate("failure");
+    assert.notEqual(failing.status, 0, `the CI gate fails when the pushed commit's own run failed (gate said: ${failing.stdout}${failing.stderr})`);
+    assert.ok(`${failing.stdout}${failing.stderr}`.includes("https://ci/pushed"), "the gate reports the pushed commit's run, not the previous one");
+    const passing = runGate("success");
+    assert.equal(passing.status, 0, `control: the gate passes when the pushed commit's run passed (gate said: ${passing.stdout}${passing.stderr})`);
+  } finally {
+    fs.rmSync(ghDir, { recursive: true, force: true });
+  }
 }
 
 // 33. Branch review (backlog B5, experiment E1, shadow): review_branch
@@ -1461,108 +1464,112 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
   const scratch = path.join(os.tmpdir(), "opencode", "reviewer-test");
   fs.mkdirSync(scratch, { recursive: true });
   const repo = fs.realpathSync(fs.mkdtempSync(path.join(scratch, "branch-")));
-  const git = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
-  git("init", "-q");
-  git("config", "user.email", "smoke@example.invalid");
-  git("config", "user.name", "smoke");
-  fs.writeFileSync(path.join(repo, "a.js"), "export const a = 1;\n");
-  git("add", "a.js");
-  git("commit", "-q", "-m", "base");
-  const baseSha = git("rev-parse", "HEAD");
-  git("checkout", "-q", "-b", "lane/x");
-  fs.writeFileSync(path.join(repo, "b.py"), "def b():\n    return 2\n");
-  fs.writeFileSync(path.join(repo, "package-lock.json"), "{}\n");
-  git("add", "b.py", "package-lock.json");
-  git("commit", "-q", "-m", "lane work");
-  const headSha = git("rev-parse", "HEAD");
+  let hooks;
+  try {
+    const git = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
+    git("init", "-q");
+    git("config", "user.email", "smoke@example.invalid");
+    git("config", "user.name", "smoke");
+    fs.writeFileSync(path.join(repo, "a.js"), "export const a = 1;\n");
+    git("add", "a.js");
+    git("commit", "-q", "-m", "base");
+    const baseSha = git("rev-parse", "HEAD");
+    git("checkout", "-q", "-b", "lane/x");
+    fs.writeFileSync(path.join(repo, "b.py"), "def b():\n    return 2\n");
+    fs.writeFileSync(path.join(repo, "package-lock.json"), "{}\n");
+    git("add", "b.py", "package-lock.json");
+    git("commit", "-q", "-m", "lane work");
+    const headSha = git("rev-parse", "HEAD");
 
-  let report = "- P1 b.py:2 returns a constant\n\nNO-SHIP";
-  const promptCalls = [];
-  const toasts = [];
-  const created = [];
-  const titles = [];
-  const aborted = [];
-  let n = 0;
-  const client = {
-    v2: true,
-    tui: { showToast: async ({ body }) => toasts.push(body) },
-    session: {
-      get: async ({ path: p }) => ({ data: { id: p.id } }),
-      create: async ({ body }) => {
-        created.push(body);
-        return { data: { id: `branch-review-${++n}` } };
+    let report = "- P1 b.py:2 returns a constant\n\nNO-SHIP";
+    const promptCalls = [];
+    const toasts = [];
+    const created = [];
+    const titles = [];
+    const aborted = [];
+    let n = 0;
+    const client = {
+      v2: true,
+      tui: { showToast: async ({ body }) => toasts.push(body) },
+      session: {
+        get: async ({ path: p }) => ({ data: { id: p.id } }),
+        create: async ({ body }) => {
+          created.push(body);
+          return { data: { id: `branch-review-${++n}` } };
+        },
+        update: async ({ path: p, body }) => titles.push({ id: p.id, title: body.title }),
+        abort: async ({ path: p }) => aborted.push(p.id),
+        promptAsync: async ({ path: p, body }) => {
+          promptCalls.push({ id: p.id, text: body.parts[0].text });
+        },
+        messages: async () => [{ info: { role: "assistant" }, parts: [{ type: "text", text: report }] }],
       },
-      update: async ({ path: p, body }) => titles.push({ id: p.id, title: body.title }),
-      abort: async ({ path: p }) => aborted.push(p.id),
-      promptAsync: async ({ path: p, body }) => {
-        promptCalls.push({ id: p.id, text: body.parts[0].text });
-      },
-      messages: async () => [{ info: { role: "assistant" }, parts: [{ type: "text", text: report }] }],
-    },
-    app: { log: async () => {} },
-  };
-  const hooks = await plugin({ client, directory: repo, worktree: repo, $: makeShell() }, { idleDebounceMs: 0, updateCheck: false, enforceNoShip: true });
-  const branch = hooks.tool?.review_branch;
-  assert.ok(branch && typeof branch.execute === "function", "review_branch is registered on OpenCode 2");
-  assert.deepEqual(branch.inputSchema?.required, ["base"], "review_branch takes a base (repo and head are optional)");
-  const v1Hooks = await plugin({ client: { ...client, v2: undefined }, directory: repo, worktree: repo, $: makeShell() }, { idleDebounceMs: 0, updateCheck: false });
-  assert.equal(v1Hooks.tool.review_branch, undefined, "not on OpenCode 1: its tool args need the host's zod schemas");
+      app: { log: async () => {} },
+    };
+    hooks = await plugin({ client, directory: repo, worktree: repo, $: makeShell() }, { idleDebounceMs: 0, updateCheck: false, enforceNoShip: true });
+    const branch = hooks.tool?.review_branch;
+    assert.ok(branch && typeof branch.execute === "function", "review_branch is registered on OpenCode 2");
+    assert.deepEqual(branch.inputSchema?.required, ["base"], "review_branch takes a base (repo and head are optional)");
+    const v1Hooks = await plugin({ client: { ...client, v2: undefined }, directory: repo, worktree: repo, $: makeShell() }, { idleDebounceMs: 0, updateCheck: false });
+    assert.equal(v1Hooks.tool.review_branch, undefined, "not on OpenCode 1: its tool args need the host's zod schemas");
 
-  const call = (args, sessionID = "orch-1") => branch.execute(args, { sessionID });
-  assert.ok((await call({ repo, base: "--output" })).includes("not a valid git ref"), "an option-shaped ref is refused before git sees it");
-  assert.ok((await call({ repo: "relative/dir", base: "main" })).includes("absolute path"), "a relative repo path is refused");
-  assert.ok((await call({ repo: scratch, base: "HEAD" })).includes("not a git repository"), "a folder outside any repository is refused");
-  assert.ok((await call({ repo, base: "no-such-ref" })).includes("does not name a commit"), "an unknown ref is refused");
-  assert.ok((await call({ repo, base: headSha, head: headSha })).includes("nothing to review"), "an empty range starts nothing");
-  assert.equal(created.length, 0, "no refused request created a session");
+    const call = (args, sessionID = "orch-1") => branch.execute(args, { sessionID });
+    assert.ok((await call({ repo, base: "--output" })).includes("not a valid git ref"), "an option-shaped ref is refused before git sees it");
+    assert.ok((await call({ repo: "relative/dir", base: "main" })).includes("absolute path"), "a relative repo path is refused");
+    assert.ok((await call({ repo: scratch, base: "HEAD" })).includes("not a git repository"), "a folder outside any repository is refused");
+    assert.ok((await call({ repo, base: "no-such-ref" })).includes("does not name a commit"), "an unknown ref is refused");
+    assert.ok((await call({ repo, base: headSha, head: headSha })).includes("nothing to review"), "an empty range starts nothing");
+    assert.equal(created.length, 0, "no refused request created a session");
 
-  const started = await call({ repo, base: baseSha.slice(0, 12), head: "lane/x" });
-  assert.ok(started.includes("Branch review started"), `a valid range starts a review: ${started}`);
-  assert.ok(started.includes(`${baseSha.slice(0, 12)}...${headSha.slice(0, 12)}`), "the reply pins the range to commits");
-  assert.equal(created.length, 1, "one review session");
-  assert.ok(!created[0].title.startsWith(REVIEW_TITLE), `its title is not the automatic review's, so the TUI never toasts it: ${created[0].title}`);
-  assert.equal(created[0].parentID, undefined, "created as a root session, so it can dispatch the critics");
-  const prompt = promptCalls.find((c) => c.id === "branch-review-1")?.text ?? "";
-  assert.ok(prompt.includes("<!--adversarial-review-auto-->"), "the prompt carries the review marker (never reviewed as a coding turn)");
-  assert.ok(prompt.includes(`git -C ${repo} diff ${baseSha}...${headSha}`), "the prompt names the exact committed range");
-  assert.ok(prompt.includes("never the working tree"), "and tells the review not to read the working tree's own changes");
-  assert.ok(prompt.includes("Python"), "language hints come from the range's files");
-  assert.ok(started.includes("1 file, 2 changed lines"), `the lockfile in the range is not counted: ${started}`);
+    const started = await call({ repo, base: baseSha.slice(0, 12), head: "lane/x" });
+    assert.ok(started.includes("Branch review started"), `a valid range starts a review: ${started}`);
+    assert.ok(started.includes(`${baseSha.slice(0, 12)}...${headSha.slice(0, 12)}`), "the reply pins the range to commits");
+    assert.equal(created.length, 1, "one review session");
+    assert.ok(!created[0].title.startsWith(REVIEW_TITLE), `its title is not the automatic review's, so the TUI never toasts it: ${created[0].title}`);
+    assert.equal(created[0].parentID, undefined, "created as a root session, so it can dispatch the critics");
+    const prompt = promptCalls.find((c) => c.id === "branch-review-1")?.text ?? "";
+    assert.ok(prompt.includes("<!--adversarial-review-auto-->"), "the prompt carries the review marker (never reviewed as a coding turn)");
+    assert.ok(prompt.includes(`git -C ${repo} diff ${baseSha}...${headSha}`), "the prompt names the exact committed range");
+    assert.ok(prompt.includes("never the working tree"), "and tells the review not to read the working tree's own changes");
+    assert.ok(prompt.includes("Python"), "language hints come from the range's files");
+    assert.ok(started.includes("1 file, 2 changed lines"), `the lockfile in the range is not counted: ${started}`);
 
-  const again = await call({ repo, base: baseSha, head: headSha });
-  assert.ok(again.includes("still running"), `the same range asked again reads its state instead of starting a second review: ${again}`);
-  assert.equal(created.length, 1, "no second session for the same range");
-  const statusRunning = await hooks.tool.review_status.execute({}, { sessionID: "orch-1" });
-  assert.ok(statusRunning.includes("Branch reviews (advisory)") && statusRunning.includes("lane/x"), `review_status lists the session's branch reviews: ${statusRunning}`);
+    const again = await call({ repo, base: baseSha, head: headSha });
+    assert.ok(again.includes("still running"), `the same range asked again reads its state instead of starting a second review: ${again}`);
+    assert.equal(created.length, 1, "no second session for the same range");
+    const statusRunning = await hooks.tool.review_status.execute({}, { sessionID: "orch-1" });
+    assert.ok(statusRunning.includes("Branch reviews (advisory)") && statusRunning.includes("lane/x"), `review_status lists the session's branch reviews: ${statusRunning}`);
 
-  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "branch-review-1" } } });
-  await new Promise((r) => setTimeout(r, 50));
-  const done = await call({ repo, base: baseSha, head: headSha });
-  assert.ok(done.includes("verdict: NO-SHIP") && done.includes("b.py:2 returns a constant"), `done: verdict and report read back: ${done}`);
-  assert.equal(promptCalls.filter((c) => c.id === "orch-1").length, 0, "a NO-SHIP branch review sends nothing back into the requesting session");
-  assert.equal(toasts.length, 0, "and posts no notice at all");
-  assert.ok(titles.every((t) => !String(t.title).startsWith(REVIEW_TITLE)), "and never takes the automatic review's title");
-  const statusDone = await hooks.tool.review_status.execute({}, { sessionID: "orch-1" });
-  assert.ok(statusDone.includes("NO-SHIP"), "review_status shows the branch verdict");
-  assert.ok(statusDone.startsWith("plugin: mighty-reviewer@"), "after the version line");
-  await hooks["tool.execute.before"]({ sessionID: "orch-1", tool: "bash" }, { args: { command: "git commit -m x" } });
-  // (no throw: under enforceNoShip a branch NO-SHIP blocks no commit)
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: "branch-review-1" } } });
+    await new Promise((r) => setTimeout(r, 50));
+    const done = await call({ repo, base: baseSha, head: headSha });
+    assert.ok(done.includes("verdict: NO-SHIP") && done.includes("b.py:2 returns a constant"), `done: verdict and report read back: ${done}`);
+    assert.equal(promptCalls.filter((c) => c.id === "orch-1").length, 0, "a NO-SHIP branch review sends nothing back into the requesting session");
+    assert.equal(toasts.length, 0, "and posts no notice at all");
+    assert.ok(titles.every((t) => !String(t.title).startsWith(REVIEW_TITLE)), "and never takes the automatic review's title");
+    const statusDone = await hooks.tool.review_status.execute({}, { sessionID: "orch-1" });
+    assert.ok(statusDone.includes("NO-SHIP"), "review_status shows the branch verdict");
+    assert.ok(statusDone.startsWith("plugin: mighty-reviewer@"), "after the version line");
+    await hooks["tool.execute.before"]({ sessionID: "orch-1", tool: "bash" }, { args: { command: "git commit -m x" } });
+    // (no throw: under enforceNoShip a branch NO-SHIP blocks no commit)
 
-  // A verdict-less idle is nudged once more, quietly; rerun starts afresh.
-  const rerun = await call({ repo, base: baseSha, head: headSha, rerun: true });
-  assert.ok(rerun.includes("Branch review started"), "rerun: true starts a new review of the same range");
-  report = "I launched the critics in the background.";
-  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "branch-review-2" } } });
-  await new Promise((r) => setTimeout(r, 50));
-  assert.ok(promptCalls.some((c) => c.id === "branch-review-2" && c.text.includes("verdict")), "a verdict-less branch idle is nudged for its verdict");
-  assert.equal(toasts.length, 0, "the nudge is silent too");
-  assert.ok((await call({ repo, base: baseSha, head: headSha })).includes("still running"), "and the review stays running");
-  report = "- P2 b.py:1 naming\n\nSHIP";
-  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "branch-review-2" } } });
-  await new Promise((r) => setTimeout(r, 50));
-  assert.ok((await call({ repo, base: baseSha, head: headSha })).includes("verdict: SHIP"), "the nudged review finishes with its verdict");
-  hooks.dispose();
-  fs.rmSync(repo, { recursive: true, force: true });
+    // A verdict-less idle is nudged once more, quietly; rerun starts afresh.
+    const rerun = await call({ repo, base: baseSha, head: headSha, rerun: true });
+    assert.ok(rerun.includes("Branch review started"), "rerun: true starts a new review of the same range");
+    report = "I launched the critics in the background.";
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: "branch-review-2" } } });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.ok(promptCalls.some((c) => c.id === "branch-review-2" && c.text.includes("verdict")), "a verdict-less branch idle is nudged for its verdict");
+    assert.equal(toasts.length, 0, "the nudge is silent too");
+    assert.ok((await call({ repo, base: baseSha, head: headSha })).includes("still running"), "and the review stays running");
+    report = "- P2 b.py:1 naming\n\nSHIP";
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: "branch-review-2" } } });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.ok((await call({ repo, base: baseSha, head: headSha })).includes("verdict: SHIP"), "the nudged review finishes with its verdict");
+  } finally {
+    hooks?.dispose();
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
 }
 
 console.log("ALL SMOKE TESTS PASSED");

@@ -280,8 +280,12 @@ const makeHarness = async (report, { promptAsyncResult, options, clientV2 } = {}
 //     Every answer opens with the version this process is running, in the
 //     spec form opencode.json pins (backlog B1), so the orchestrator can
 //     tell a stale session from the pin without the TUI sidebar. The idle
-//     answer used to be the bare sentence; it now follows that line.
-const RUNNING_LINE = `running: mighty-reviewer@${JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8")).version}`;
+//     answer used to be the bare sentence; it now follows that line. The
+//     label is "plugin:", never a word the review states use: "running"
+//     there read as a review in progress on a done answer.
+const RUNNING_LINE = `plugin: mighty-reviewer@${JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8")).version}`;
+const noRunningWord = (answer, label) =>
+  assert.ok(!/\brunning\b/i.test(answer), `${label} carries no 'running' word, so it never reads as a review in progress: ${answer.slice(0, 120)}`);
 {
   const h = await makeHarness("some findings\n\nNO-SHIP");
   const status = h.hooks.tool.review_status;
@@ -289,6 +293,7 @@ const RUNNING_LINE = `running: mighty-reviewer@${JSON.parse(readFileSync(new URL
     await status.execute({}, { sessionID: "status-parent" }),
     `${RUNNING_LINE}\nNo review has run for this session yet.`,
   );
+  noRunningWord(await status.execute({}, { sessionID: "status-parent" }), "the idle answer");
   await h.hooks["command.execute.before"]({ command: "mighty-review", sessionID: "status-parent" }, { parts: [] });
   await h.tick();
   const running = await status.execute({}, { sessionID: "status-parent" });
@@ -297,6 +302,7 @@ const RUNNING_LINE = `running: mighty-reviewer@${JSON.parse(readFileSync(new URL
   await h.childIdle("child-1");
   const done = await status.execute({}, { sessionID: "status-parent" });
   assert.equal(done.split("\n")[0], RUNNING_LINE, "done state names the running version first");
+  noRunningWord(done, "the done answer");
   assert.ok(done.includes("verdict: NO-SHIP"), "verdict reported");
   assert.ok(done.includes("some findings"), "report included");
 }

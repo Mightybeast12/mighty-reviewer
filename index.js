@@ -116,6 +116,15 @@
  *             package.json and runs `bun install` there, then toasts to
  *             restart. Pinned installs (mighty-reviewer@x.y.z) and local
  *             file installs are never auto-updated; pins get a toast only.
+ * Branch:     on OpenCode 2, the review_branch tool reviews a committed range
+ *             of a given repository (what head adds since its merge base
+ *             with base), pinned to commits when asked, in a root session
+ *             titled "Branch review ..." with the same critics. Advisory
+ *             (shadow): no notice, no feedback injection, no enforceNoShip
+ *             block; the verdict and report are read back through
+ *             review_branch with the same arguments and listed by
+ *             review_status. Options: branchMaxDiffLines (default 6000),
+ *             branchTimeoutMs (default twice timeoutMs).
  * Scope:      Only ROOT sessions are reviewed. Child sessions (subagents
  *             spawned via the task tool, other plugins' background sessions)
  *             are never reviewed on their own; edits they make are credited
@@ -123,7 +132,8 @@
  *             produces one review for the parent turn, not N+1 and not 0.
  * Options:    { disabled, model, criticModel, agent, maxDiffLines, ignore,
  *             idleDebounceMs, timeoutMs, enforceNoShip, progressToasts, quiet,
- *             updateCheck, autoUpdate } via the plugin tuple form.
+ *             updateCheck, autoUpdate, branchMaxDiffLines, branchTimeoutMs }
+ *             via the plugin tuple form.
  * Opt-out:    set MIGHTY_REVIEWER_DISABLE=1, or pass { disabled: true }
  *             via the plugin tuple form in opencode.json.
  */
@@ -143,6 +153,7 @@ import {
   METADATA_KEY,
 } from "./internals.js";
 import { createV2Setup } from "./v2.js";
+import { BRANCH_TITLE, branchKey, resolveBranchRange, shortRange } from "./branch.js";
 
 const REVIEW_MARKER = "<!--adversarial-review-auto-->";
 const FEEDBACK_MARKER = "<!--adversarial-review-feedback-->";
@@ -169,6 +180,9 @@ const RUNNING_LINE = `plugin: ${PKG_NAME}@${PKG_VERSION || "unknown"}`;
 const MAX_VERDICT_NUDGES = 2;
 
 const DEFAULT_MAX_DIFF_LINES = 2000;
+// A lane's committed range is larger than one coding turn's diff.
+const DEFAULT_BRANCH_MAX_DIFF_LINES = 6000;
+const MAX_BRANCH_REPORT_CHARS = 32000;
 const DEFAULT_IDLE_DEBOUNCE_MS = 1000;
 // Half-time check: a review still in its mechanical gates at this point is
 // stuck in setup (observed: hunting type packages outside the project) and
@@ -432,14 +446,19 @@ function languageHintsFor(files) {
   return hints;
 }
 
-function buildReviewPrompt(languageHints, projectRules, timeoutMs) {
+// `scope` is null for the automatic review of a coding turn's working tree,
+// or a pinned branch range (branch.js resolveBranchRange) for review_branch.
+function buildReviewPrompt(languageHints, projectRules, timeoutMs, scope = null) {
+  const range = scope ? `${scope.baseSha}...${scope.headSha}` : null;
   return [
     REVIEW_MARKER,
-    "You are reviewing, in the background, a coding turn that just finished in another session. Run an ADVERSARIAL self-review of that work before it is considered done.",
+    scope
+      ? `You are reviewing, in the background, the committed changes of a branch: everything ${scope.headRef} adds since its merge base with ${scope.baseRef}, pinned to \`${range}\` in the repository ${scope.root}. Run an ADVERSARIAL review of that range. It is advisory: whoever asked reads your report and verdict back; nothing is sent to a coding session.`
+      : "You are reviewing, in the background, a coding turn that just finished in another session. Run an ADVERSARIAL self-review of that work before it is considered done.",
     "",
-    "HARD CONSTRAINT: this review is strictly READ-ONLY. You must NEVER edit, write, create, delete, or fix any source file, and never run commands that modify source files or git state (no formatters with --write, no git add/commit/stash). Read-only checks that only write to build caches (e.g. `cargo check`, `tsc --noEmit`) are allowed. Your ONLY deliverable is a report.",
+    "HARD CONSTRAINT: this review is strictly READ-ONLY. You must NEVER edit, write, create, delete, or fix any source file, and never run commands that modify source files or git state (no formatters with --write, no git add/commit/stash/checkout/switch). Read-only checks that only write to build caches (e.g. `cargo check`, `tsc --noEmit`) are allowed. Your ONLY deliverable is a report.",
     "",
-    "HARD SCOPE: stay inside the project directory. Never read, list, or search paths outside it (the home directory, other repositories, global caches, another project's node_modules): access outside the project is denied for this session and a denied call is a wasted call. Never install tooling, write a tsconfig, or hunt for type packages. Skip any session-start protocol, skill load, or observation-log step that instruction files ask of coding sessions: this is a review session, not a coding session, and those steps do not apply here.",
+    `HARD SCOPE: stay inside ${scope ? `the reviewed repository (${scope.root}) and the project directory` : "the project directory"}. Never read, list, or search paths outside it (the home directory, other repositories, global caches, another project's node_modules): access outside the project is denied for this session and a denied call is a wasted call. Never install tooling, write a tsconfig, or hunt for type packages. Skip any session-start protocol, skill load, or observation-log step that instruction files ask of coding sessions: this is a review session, not a coding session, and those steps do not apply here.`,
     `TIME BUDGET: the review is aborted after ${Math.max(1, Math.round(timeoutMs / 60000))} minutes. Dispatch the four critics by your fourth tool call at the latest; mechanical gates that would take longer than that are recorded as 'not run' and skipped.`,
     "",
     ...(projectRules
@@ -452,8 +471,15 @@ function buildReviewPrompt(languageHints, projectRules, timeoutMs) {
         ]
       : []),
     "Do this:",
-    "1. Run `git diff` (and include untracked files) to see exactly what changed. EXCLUDE noise files from the entire review: lockfiles (package-lock.json, yarn.lock, Cargo.lock, go.sum, ...), generated/minified output (dist/, build/, *.min.js, *.map, *.snap), and vendored code (node_modules/, vendor/). If nothing else changed, report that and stop with SHIP.",
+    scope
+      ? `1. Run \`git -C ${scope.root} diff --name-only ${range}\` and \`git -C ${scope.root} diff ${range}\` to see exactly what the range changed, and review that range only: never the working tree or its uncommitted changes. Read a changed file as of the head with \`git -C ${scope.root} show ${scope.headSha}:<path>\`. EXCLUDE noise files from the entire review: lockfiles (package-lock.json, yarn.lock, Cargo.lock, go.sum, ...), generated/minified output (dist/, build/, *.min.js, *.map, *.snap), and vendored code (node_modules/, vendor/). If nothing else changed, report that and stop with SHIP.`
+      : "1. Run `git diff` (and include untracked files) to see exactly what changed. EXCLUDE noise files from the entire review: lockfiles (package-lock.json, yarn.lock, Cargo.lock, go.sum, ...), generated/minified output (dist/, build/, *.min.js, *.map, *.snap), and vendored code (node_modules/, vendor/). If nothing else changed, report that and stop with SHIP.",
     "2. MECHANICAL GATES - run these BEFORE consulting any critic:",
+    ...(scope
+      ? [
+          `   Run them in ${scope.root} only when \`git -C ${scope.root} rev-parse HEAD\` prints ${scope.headSha} and \`git -C ${scope.root} status --porcelain\` prints nothing; otherwise record every gate as 'not run (the working tree is not the reviewed head)' and go straight to the critics.`,
+        ]
+      : []),
     "   - Detect the project's own typecheck/lint commands (package.json scripts, tsconfig.json, Makefile, pyproject.toml, go.mod, Cargo.toml) and run the cheapest applicable check (e.g. `tsc --noEmit`, `ruff check`, `go vet`, `cargo check`), scoped to changed files where the tool allows. Only run a check the project itself configures: if the changed files have no project-configured typecheck or lint (for example a standalone script or plugin file with no package.json or tsconfig next to it), record 'no project typecheck configured' and move on immediately.",
     "   - Scan the changed files for leftover debug output (console.log, print-debugging, debugger statements) and commented-out code blocks.",
     "   - Check whether the diff touches linter/formatter/typechecker config (.eslintrc*, biome.json*, tsconfig*, .prettierrc*, ruff.toml, clippy.toml) in a way that WEAKENS rules.",
@@ -685,6 +711,16 @@ const reviewNudges = new Map();
 // Parent session IDs with a NO-SHIP verdict not yet superseded by a SHIP.
 const unresolvedNoShip = new Set();
 
+// Branch reviews (review_branch): pinned range key (branch.js branchKey) ->
+// { status, root, baseRef, headRef, baseSha, headSha, files, lines,
+// requestedBy, reviewSessionID, startedAt, finishedAt, verdict, report }.
+// Advisory: their verdicts never touch reviewStates, unresolvedNoShip or
+// the feedback loop.
+const branchReviews = new Map();
+
+// Branch review session ID -> its range key.
+const branchReviewSessions = new Map();
+
 // The cache workspace is process-global, so multiple factory instances
 // (multiple projects/worktrees) must schedule at most one update check.
 let updateCheckScheduled = false;
@@ -707,6 +743,12 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
   const extraIgnore = (options.ignore ?? []).map((p) => new RegExp(p));
   const reviewModel = parseModel(options.model);
   const reviewAgent = typeof options.agent === "string" && options.agent ? options.agent : null;
+  const branchMaxDiffLines =
+    Number.isFinite(options.branchMaxDiffLines) && options.branchMaxDiffLines > 0
+      ? options.branchMaxDiffLines
+      : DEFAULT_BRANCH_MAX_DIFF_LINES;
+  const branchTimeoutMs =
+    Number.isFinite(options.branchTimeoutMs) && options.branchTimeoutMs > 0 ? options.branchTimeoutMs : reviewTimeoutMs * 2;
 
   // sessionID -> parentID (or null for a root session). Asked of the server
   // once per session; the parent link never changes.
@@ -749,7 +791,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
   async function rootOf(sessionID) {
     let current = sessionID;
     for (let depth = 0; depth < 16; depth++) {
-      if (spawnedReviewSessions.has(current)) return null;
+      if (spawnedReviewSessions.has(current) || branchReviewSessions.has(current)) return null;
       const parent = await parentOf(current);
       if (!parent) return current;
       current = parent;
@@ -777,9 +819,9 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
     );
   }
 
-  async function projectRules() {
+  async function projectRules(dir = cwd) {
     try {
-      const text = (await readFile(`${cwd}/${RULES_FILE}`, "utf8")).trim();
+      const text = (await readFile(`${dir}/${RULES_FILE}`, "utf8")).trim();
       if (!text) return null;
       return text.length > MAX_RULES_CHARS
         ? `${text.slice(0, MAX_RULES_CHARS)}\n[rules truncated]`
@@ -1308,6 +1350,8 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       return false;
     }
     reviewNudges.set(reviewSessionID, { count: count + 1, lastReport: report });
+    // A branch review is advisory: no phase state, title or notice to update.
+    if (branchReviewSessions.has(reviewSessionID)) return true;
     const parentSessionID = reviewParents.get(reviewSessionID);
     const state = parentSessionID ? reviewStates.get(parentSessionID) : undefined;
     if (state?.status === "running") {
@@ -1353,6 +1397,135 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
     reviewedSessions.add(sessionID);
 
     void spawnReview(sessionID);
+  }
+
+  // ------------------------------------------------------------ branch review
+
+  function describeBranchRange(state) {
+    return `${state.root} ${state.baseRef}...${state.headRef} (${shortRange(state)})`;
+  }
+
+  function describeBranchReview(state) {
+    if (state.status === "running") {
+      return `Branch review of ${describeBranchRange(state)} still running (elapsed ${formatElapsed(Date.now() - state.startedAt)}; aborted after ${Math.max(1, Math.round(branchTimeoutMs / 60000))} minutes). Advisory: nothing is blocked or sent back.`;
+    }
+    return [
+      `Branch review of ${describeBranchRange(state)}, finished after ${formatElapsed((state.finishedAt ?? Date.now()) - state.startedAt)}:`,
+      `verdict: ${state.verdict ?? "unknown (no verdict line found)"}`,
+      "",
+      state.report ?? "(no report captured)",
+    ].join("\n");
+  }
+
+  function branchReviewsListFor(sessionID) {
+    const lines = [];
+    for (const state of branchReviews.values()) {
+      if (state.requestedBy !== sessionID) continue;
+      const outcome =
+        state.status === "running"
+          ? `running, elapsed ${formatElapsed(Date.now() - state.startedAt)}`
+          : `done: ${state.verdict ?? "no verdict"}`;
+      lines.push(`- ${describeBranchRange(state)}: ${outcome}`);
+    }
+    return lines.length ? ["", "", "Branch reviews (advisory):", ...lines].join("\n") : "";
+  }
+
+  function finishBranchReview(reviewSessionID, verdict, report) {
+    const key = branchReviewSessions.get(reviewSessionID);
+    branchReviewSessions.delete(reviewSessionID);
+    reviewNudges.delete(reviewSessionID);
+    sessionBaselines.delete(reviewSessionID);
+    sessionWroteCode.delete(reviewSessionID);
+    const state = key ? branchReviews.get(key) : undefined;
+    if (!state || state.reviewSessionID !== reviewSessionID) return;
+    if (state.timer) {
+      clearTimeout(state.timer);
+      ownedTimers.delete(state.timer);
+    }
+    Object.assign(state, {
+      status: "done",
+      verdict,
+      report:
+        typeof report === "string" && report.length > MAX_BRANCH_REPORT_CHARS
+          ? `${report.slice(0, MAX_BRANCH_REPORT_CHARS)}\n[report truncated]`
+          : report,
+      finishedAt: Date.now(),
+      timer: null,
+    });
+  }
+
+  async function handleBranchIdle(reviewSessionID) {
+    const report = await lastAssistantText(reviewSessionID);
+    const verdict = extractVerdict(report);
+    if (!verdict && (await nudgeForVerdict(reviewSessionID, report))) return;
+    finishBranchReview(reviewSessionID, verdict, report);
+  }
+
+  async function startBranchReview(args, sessionID) {
+    const range = await resolveBranchRange($, args, { defaultRepo: cwd, isIgnoredFile });
+    if (range.error) return `Branch review not started: ${range.error}`;
+    if (range.empty) return `Branch review not started: nothing to review, ${range.headRef} adds no commit over ${range.baseRef} in ${range.root}.`;
+    if (range.ignoredOnly) return `Branch review not started: only ignored files (lockfiles, generated or vendored output) changed in ${shortRange(range)}.`;
+    if (range.lines > branchMaxDiffLines) {
+      return `Branch review not started: ${shortRange(range)} changes ${range.lines} lines, over branchMaxDiffLines (${branchMaxDiffLines}).`;
+    }
+
+    const key = branchKey(range);
+    const existing = branchReviews.get(key);
+    if (existing && (existing.status === "running" || args?.rerun !== true)) return describeBranchReview(existing);
+
+    let reviewSessionID;
+    try {
+      const rules = await projectRules(range.root);
+      const reviewPrompt = buildReviewPrompt(languageHintsFor(range.files), rules, branchTimeoutMs, range);
+      const created = await client.session.create({
+        body: { title: `${BRANCH_TITLE} ${range.baseRef}...${range.headRef}` },
+      });
+      reviewSessionID = created?.data?.id ?? created?.id;
+      if (!reviewSessionID) throw new Error("session.create returned no id");
+      const state = {
+        ...range,
+        status: "running",
+        requestedBy: sessionID,
+        reviewSessionID,
+        startedAt: Date.now(),
+        finishedAt: null,
+        verdict: null,
+        report: null,
+        timer: null,
+      };
+      branchReviews.set(key, state);
+      branchReviewSessions.set(reviewSessionID, key);
+      state.timer = ownTimer(
+        setTimeout(async () => {
+          if (!branchReviewSessions.has(reviewSessionID)) return;
+          finishBranchReview(reviewSessionID, null, `Branch review timed out after ${Math.round(branchTimeoutMs / 60000)} minutes and was aborted.`);
+          try {
+            await client.session.abort({ path: { id: reviewSessionID } });
+          } catch {
+            // Abort is best-effort.
+          }
+        }, branchTimeoutMs),
+      );
+      await sendPrompt(reviewSessionID, reviewPrompt, {
+        tools: { ...ORCHESTRATOR_TOOLS },
+        ...(reviewAgent ? { agent: reviewAgent } : {}),
+        ...(reviewModel ? { model: reviewModel } : {}),
+      });
+      return `Branch review started for ${describeBranchRange(state)}: ${range.files.length} file${range.files.length === 1 ? "" : "s"}, ${range.lines} changed lines. Advisory: nothing is blocked or sent back. Read it with review_branch and the same arguments, or review_status.`;
+    } catch (err) {
+      if (reviewSessionID) {
+        const key2 = branchReviewSessions.get(reviewSessionID);
+        branchReviewSessions.delete(reviewSessionID);
+        const state = key2 ? branchReviews.get(key2) : undefined;
+        if (state?.timer) {
+          clearTimeout(state.timer);
+          ownedTimers.delete(state.timer);
+        }
+        if (state?.reviewSessionID === reviewSessionID) branchReviews.delete(key2);
+      }
+      return `Branch review not started: ${String(err?.message ?? err)}`;
+    }
   }
 
   function describeReviewState(state) {
@@ -1441,9 +1614,34 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
         async execute(_args, ctx) {
           const sessionID = ctx?.sessionID;
           const state = sessionID ? reviewStates.get(sessionID) : undefined;
-          return `${RUNNING_LINE}\n${describeReviewState(state)}`;
+          return `${RUNNING_LINE}\n${describeReviewState(state)}${sessionID ? branchReviewsListFor(sessionID) : ""}`;
         },
       },
+      // OpenCode 2 only: its tool input is a JSON schema (inputSchema, read
+      // by v2.js), where OpenCode 1 would need the host's zod schemas.
+      ...(client.v2
+        ? {
+            review_branch: {
+              description:
+                "Advisory (shadow) review of a committed git range: what head adds since its merge base with base, in repo. Runs the same critics as the automatic review in a background session and never blocks, notifies or sends findings back. Call it again with the same arguments to read it: still running, or done with the SHIP/NO-SHIP verdict and the findings report. review_status lists the branch reviews this session started.",
+              args: {},
+              inputSchema: {
+                type: "object",
+                properties: {
+                  repo: { type: "string", description: "Absolute path of the git repository or worktree (default: this project's directory)." },
+                  base: { type: "string", description: "Base branch, tag or commit (for a lane: main)." },
+                  head: { type: "string", description: "Head branch, tag or commit (default: HEAD of repo)." },
+                  rerun: { type: "boolean", description: "Start a fresh review even when a finished one exists for the same commits." },
+                },
+                required: ["base"],
+                additionalProperties: false,
+              },
+              async execute(args, ctx) {
+                return `${RUNNING_LINE}\n${await startBranchReview(args ?? {}, ctx?.sessionID ?? null)}`;
+              },
+            },
+          }
+        : {}),
     },
     "command.execute.before": async (input) => {
       if (input?.command !== COMMAND_NAME) return;
@@ -1520,6 +1718,12 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
 
       const sessionID = event?.properties?.sessionID;
       if (!sessionID) return;
+
+      // A branch review finishing: record its verdict, quietly (advisory).
+      if (branchReviewSessions.has(sessionID)) {
+        await handleBranchIdle(sessionID);
+        return;
+      }
 
       // This is one of our own background review sessions finishing, not a
       // user turn -> report the verdict via toast and stop, do not recurse.

@@ -12,6 +12,7 @@
   "files": [
     "index.js",
     "v2.js",
+    "branch.js",
     "tui.js",
     "sidebar.js",
     "internals.js",

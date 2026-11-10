@@ -178,6 +178,8 @@ All options go in the plugin entry in `opencode.json` (OpenCode 2 object form sh
 | `quiet` | `false` | Suppress every notice except NO-SHIP's (see [What you see during a review](#what-you-see-during-a-review)); the OpenCode 2 toasts and footer line are unaffected |
 | `updateCheck` | `true` | Check npm for a newer version a few seconds after startup |
 | `autoUpdate` | `true` | Install the newer version into opencode's plugin cache automatically (unpinned npm installs only); with `false` you get a notification toast instead |
+| `branchMaxDiffLines` | `6000` | OpenCode 2 only. Largest committed range (changed lines, lockfiles/generated excluded) `review_branch` reviews |
+| `branchTimeoutMs` | twice `timeoutMs` | OpenCode 2 only. Time budget of a branch review; at the deadline it is aborted and reads as timed out |
 
 ### Project review rules (`.mighty-reviewer.md`)
 
@@ -192,6 +194,10 @@ Drop a `.mighty-reviewer.md` file in the project root to teach the reviewer your
 ### On-demand review
 
 Run `/mighty-review` in any session to review the current working-tree changes immediately, without waiting for a coding turn.
+
+### Branch review (OpenCode 2, advisory)
+
+The `review_branch` tool reviews a committed range instead of a working tree: `review_branch({ repo, base, head })` takes an absolute repository or worktree path (default: the project), a base ref (for a lane: `main`) and a head ref (default `HEAD`), pins both to commits, and runs the same gates and critics over everything head adds since its merge base with base (`git diff <base>...<head>`), in a root session titled "Branch review ...". It is advisory: it posts no notice, sends no findings back into any session, and blocks nothing under `enforceNoShip`. Call it again with the same arguments to read it (still running, or the SHIP/NO-SHIP verdict and the full report); a finished range is answered from memory unless `rerun: true` is passed. `review_status` lists the branch reviews the session started. A repository outside the project needs `externalDirectories`. The mechanical gates run only when the repository's working tree is clean and at the reviewed head; otherwise they are recorded as not run.
 
 ### Updates
 

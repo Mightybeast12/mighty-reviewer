@@ -98,7 +98,7 @@ export function createV2Setup(factory) {
           editor.add({
             name,
             description: tool.description,
-            input: { type: "object", properties: {}, additionalProperties: false },
+            input: tool.inputSchema ?? { type: "object", properties: {}, additionalProperties: false },
             execute: async (args, toolContext) => ({
               content: String(await tool.execute(args, { sessionID: toolContext.sessionID })),
             }),
@@ -403,8 +403,9 @@ async function belongsToLocation(ctx, raw, sessionID) {
 
 // The reviewer runs git through Bun's `$` template tag. The OpenCode 2 host is
 // a Bun binary, so the real tag is available; the fallback covers test runs
-// under Node and only implements the subset the reviewer uses.
-function makeShell() {
+// under Node and only implements the subset the reviewer uses. Exported for
+// smoke-test.mjs, whose branch-review rows run real git.
+export function makeShell() {
   if (globalThis.Bun?.$) return globalThis.Bun.$;
   return (strings, ...values) => {
     const argv = [];

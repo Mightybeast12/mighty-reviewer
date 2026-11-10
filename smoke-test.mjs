@@ -3,10 +3,11 @@ import { readFileSync } from "node:fs";
 import os from "node:os";
 import module, { MightyReviewer } from "./index.js";
 import tuiPlugin from "./tui.js";
-import { buildExternalDirectoryPermissions } from "./v2.js";
+import { buildExternalDirectoryPermissions, makeShell } from "./v2.js";
 import {
   extractVerdict,
   compareSemver,
+  REVIEW_TITLE,
   describeInstall,
   countFindings,
   countVerifiedFindings,
@@ -692,8 +693,13 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
 
   assert.equal(commands.length, 1, "mighty-review command registered");
   assert.equal(commands[0].name, "mighty-review");
-  assert.equal(tools.length, 1, "review_status tool registered");
+  // Two tools since review_branch (section 33); its JSON input schema
+  // reaches the host, while review_status keeps the empty one.
+  assert.equal(tools.length, 2, "review_status and review_branch registered");
   assert.equal(tools[0].name, "review_status");
+  assert.deepEqual(tools[0].input.properties, {}, "review_status takes no input");
+  assert.equal(tools[1].name, "review_branch");
+  assert.deepEqual(tools[1].input.required, ["base"], "review_branch's input schema reaches the v2 host");
   const idle = await tools[0].execute({}, { sessionID: "parent-v2" });
   assert.ok(idle.content.includes("No review"), "review_status answers through v2 tool result");
   assert.equal(idle.content.split("\n")[0], RUNNING_LINE, "v2 review_status names the running version first");
@@ -1438,6 +1444,125 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
   const passing = runGate("success");
   assert.equal(passing.status, 0, `control: the gate passes when the pushed commit's run passed (gate said: ${passing.stdout}${passing.stderr})`);
   fs.rmSync(ghDir, { recursive: true, force: true });
+}
+
+// 33. Branch review (backlog B5, experiment E1, shadow): review_branch
+//     reviews a committed range of a given repository in the background,
+//     with the session's own review machinery but advisory only: it never
+//     injects findings, never blocks a commit, never posts a notice, and
+//     its session title is not the review title the TUI toasts on. Its
+//     verdict and report are read back through review_branch (same
+//     arguments) and listed by review_status. Runs with a real git repo
+//     and the shell the v2 adapter gives the factory under Node.
+{
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const { execFileSync } = await import("node:child_process");
+  const scratch = path.join(os.tmpdir(), "opencode", "reviewer-test");
+  fs.mkdirSync(scratch, { recursive: true });
+  const repo = fs.realpathSync(fs.mkdtempSync(path.join(scratch, "branch-")));
+  const git = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
+  git("init", "-q");
+  git("config", "user.email", "smoke@example.invalid");
+  git("config", "user.name", "smoke");
+  fs.writeFileSync(path.join(repo, "a.js"), "export const a = 1;\n");
+  git("add", "a.js");
+  git("commit", "-q", "-m", "base");
+  const baseSha = git("rev-parse", "HEAD");
+  git("checkout", "-q", "-b", "lane/x");
+  fs.writeFileSync(path.join(repo, "b.py"), "def b():\n    return 2\n");
+  fs.writeFileSync(path.join(repo, "package-lock.json"), "{}\n");
+  git("add", "b.py", "package-lock.json");
+  git("commit", "-q", "-m", "lane work");
+  const headSha = git("rev-parse", "HEAD");
+
+  let report = "- P1 b.py:2 returns a constant\n\nNO-SHIP";
+  const promptCalls = [];
+  const toasts = [];
+  const created = [];
+  const titles = [];
+  const aborted = [];
+  let n = 0;
+  const client = {
+    v2: true,
+    tui: { showToast: async ({ body }) => toasts.push(body) },
+    session: {
+      get: async ({ path: p }) => ({ data: { id: p.id } }),
+      create: async ({ body }) => {
+        created.push(body);
+        return { data: { id: `branch-review-${++n}` } };
+      },
+      update: async ({ path: p, body }) => titles.push({ id: p.id, title: body.title }),
+      abort: async ({ path: p }) => aborted.push(p.id),
+      promptAsync: async ({ path: p, body }) => {
+        promptCalls.push({ id: p.id, text: body.parts[0].text });
+      },
+      messages: async () => [{ info: { role: "assistant" }, parts: [{ type: "text", text: report }] }],
+    },
+    app: { log: async () => {} },
+  };
+  const hooks = await plugin({ client, directory: repo, worktree: repo, $: makeShell() }, { idleDebounceMs: 0, updateCheck: false, enforceNoShip: true });
+  const branch = hooks.tool?.review_branch;
+  assert.ok(branch && typeof branch.execute === "function", "review_branch is registered on OpenCode 2");
+  assert.deepEqual(branch.inputSchema?.required, ["base"], "review_branch takes a base (repo and head are optional)");
+  const v1Hooks = await plugin({ client: { ...client, v2: undefined }, directory: repo, worktree: repo, $: makeShell() }, { idleDebounceMs: 0, updateCheck: false });
+  assert.equal(v1Hooks.tool.review_branch, undefined, "not on OpenCode 1: its tool args need the host's zod schemas");
+
+  const call = (args, sessionID = "orch-1") => branch.execute(args, { sessionID });
+  assert.ok((await call({ repo, base: "--output" })).includes("not a valid git ref"), "an option-shaped ref is refused before git sees it");
+  assert.ok((await call({ repo: "relative/dir", base: "main" })).includes("absolute path"), "a relative repo path is refused");
+  assert.ok((await call({ repo: scratch, base: "HEAD" })).includes("not a git repository"), "a folder outside any repository is refused");
+  assert.ok((await call({ repo, base: "no-such-ref" })).includes("does not name a commit"), "an unknown ref is refused");
+  assert.ok((await call({ repo, base: headSha, head: headSha })).includes("nothing to review"), "an empty range starts nothing");
+  assert.equal(created.length, 0, "no refused request created a session");
+
+  const started = await call({ repo, base: baseSha.slice(0, 12), head: "lane/x" });
+  assert.ok(started.includes("Branch review started"), `a valid range starts a review: ${started}`);
+  assert.ok(started.includes(`${baseSha.slice(0, 12)}...${headSha.slice(0, 12)}`), "the reply pins the range to commits");
+  assert.equal(created.length, 1, "one review session");
+  assert.ok(!created[0].title.startsWith(REVIEW_TITLE), `its title is not the automatic review's, so the TUI never toasts it: ${created[0].title}`);
+  assert.equal(created[0].parentID, undefined, "created as a root session, so it can dispatch the critics");
+  const prompt = promptCalls.find((c) => c.id === "branch-review-1")?.text ?? "";
+  assert.ok(prompt.includes("<!--adversarial-review-auto-->"), "the prompt carries the review marker (never reviewed as a coding turn)");
+  assert.ok(prompt.includes(`git -C ${repo} diff ${baseSha}...${headSha}`), "the prompt names the exact committed range");
+  assert.ok(prompt.includes("never the working tree"), "and tells the review not to read the working tree's own changes");
+  assert.ok(prompt.includes("Python"), "language hints come from the range's files");
+  assert.ok(started.includes("1 file, 2 changed lines"), `the lockfile in the range is not counted: ${started}`);
+
+  const again = await call({ repo, base: baseSha, head: headSha });
+  assert.ok(again.includes("still running"), `the same range asked again reads its state instead of starting a second review: ${again}`);
+  assert.equal(created.length, 1, "no second session for the same range");
+  const statusRunning = await hooks.tool.review_status.execute({}, { sessionID: "orch-1" });
+  assert.ok(statusRunning.includes("Branch reviews (advisory)") && statusRunning.includes("lane/x"), `review_status lists the session's branch reviews: ${statusRunning}`);
+
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "branch-review-1" } } });
+  await new Promise((r) => setTimeout(r, 50));
+  const done = await call({ repo, base: baseSha, head: headSha });
+  assert.ok(done.includes("verdict: NO-SHIP") && done.includes("b.py:2 returns a constant"), `done: verdict and report read back: ${done}`);
+  assert.equal(promptCalls.filter((c) => c.id === "orch-1").length, 0, "a NO-SHIP branch review sends nothing back into the requesting session");
+  assert.equal(toasts.length, 0, "and posts no notice at all");
+  assert.ok(titles.every((t) => !String(t.title).startsWith(REVIEW_TITLE)), "and never takes the automatic review's title");
+  const statusDone = await hooks.tool.review_status.execute({}, { sessionID: "orch-1" });
+  assert.ok(statusDone.includes("NO-SHIP"), "review_status shows the branch verdict");
+  assert.ok(statusDone.startsWith("plugin: mighty-reviewer@"), "after the version line");
+  await hooks["tool.execute.before"]({ sessionID: "orch-1", tool: "bash" }, { args: { command: "git commit -m x" } });
+  // (no throw: under enforceNoShip a branch NO-SHIP blocks no commit)
+
+  // A verdict-less idle is nudged once more, quietly; rerun starts afresh.
+  const rerun = await call({ repo, base: baseSha, head: headSha, rerun: true });
+  assert.ok(rerun.includes("Branch review started"), "rerun: true starts a new review of the same range");
+  report = "I launched the critics in the background.";
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "branch-review-2" } } });
+  await new Promise((r) => setTimeout(r, 50));
+  assert.ok(promptCalls.some((c) => c.id === "branch-review-2" && c.text.includes("verdict")), "a verdict-less branch idle is nudged for its verdict");
+  assert.equal(toasts.length, 0, "the nudge is silent too");
+  assert.ok((await call({ repo, base: baseSha, head: headSha })).includes("still running"), "and the review stays running");
+  report = "- P2 b.py:1 naming\n\nSHIP";
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "branch-review-2" } } });
+  await new Promise((r) => setTimeout(r, 50));
+  assert.ok((await call({ repo, base: baseSha, head: headSha })).includes("verdict: SHIP"), "the nudged review finishes with its verdict");
+  hooks.dispose();
+  fs.rmSync(repo, { recursive: true, force: true });
 }
 
 console.log("ALL SMOKE TESTS PASSED");

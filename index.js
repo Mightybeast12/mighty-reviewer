@@ -1474,27 +1474,30 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
     const existing = branchReviews.get(key);
     if (existing && (existing.status === "running" || args?.rerun !== true)) return describeBranchReview(existing);
 
-    let reviewSessionID;
+    // Claimed before the first await, so a parallel call for the same range
+    // reads this entry instead of starting a second review.
+    const state = {
+      ...range,
+      status: "running",
+      requestedBy: sessionID,
+      reviewSessionID: null,
+      startedAt: Date.now(),
+      finishedAt: null,
+      verdict: null,
+      report: null,
+      timer: null,
+    };
+    branchReviews.set(key, state);
+
     try {
       const rules = await projectRules(range.root);
       const reviewPrompt = buildReviewPrompt(languageHintsFor(range.files), rules, branchTimeoutMs, range);
       const created = await client.session.create({
         body: { title: `${BRANCH_TITLE} ${range.baseRef}...${range.headRef}` },
       });
-      reviewSessionID = created?.data?.id ?? created?.id;
+      const reviewSessionID = created?.data?.id ?? created?.id;
       if (!reviewSessionID) throw new Error("session.create returned no id");
-      const state = {
-        ...range,
-        status: "running",
-        requestedBy: sessionID,
-        reviewSessionID,
-        startedAt: Date.now(),
-        finishedAt: null,
-        verdict: null,
-        report: null,
-        timer: null,
-      };
-      branchReviews.set(key, state);
+      state.reviewSessionID = reviewSessionID;
       branchReviewSessions.set(reviewSessionID, key);
       state.timer = ownTimer(
         setTimeout(async () => {
@@ -1514,16 +1517,19 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       });
       return `Branch review started for ${describeBranchRange(state)}: ${range.files.length} file${range.files.length === 1 ? "" : "s"}, ${range.lines} changed lines. Advisory: nothing is blocked or sent back. Read it with review_branch and the same arguments, or review_status.`;
     } catch (err) {
-      if (reviewSessionID) {
-        const key2 = branchReviewSessions.get(reviewSessionID);
-        branchReviewSessions.delete(reviewSessionID);
-        const state = key2 ? branchReviews.get(key2) : undefined;
-        if (state?.timer) {
-          clearTimeout(state.timer);
-          ownedTimers.delete(state.timer);
-        }
-        if (state?.reviewSessionID === reviewSessionID) branchReviews.delete(key2);
+      if (state.timer) {
+        clearTimeout(state.timer);
+        ownedTimers.delete(state.timer);
       }
+      if (state.reviewSessionID) {
+        branchReviewSessions.delete(state.reviewSessionID);
+        try {
+          await client.session.abort({ path: { id: state.reviewSessionID } });
+        } catch {
+          // Abort is best-effort.
+        }
+      }
+      if (branchReviews.get(key) === state) branchReviews.delete(key);
       return `Branch review not started: ${String(err?.message ?? err)}`;
     }
   }

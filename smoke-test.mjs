@@ -1488,6 +1488,8 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     const titles = [];
     const aborted = [];
     let n = 0;
+    let failPrompt = false;
+    let createGate = null;
     const client = {
       v2: true,
       tui: { showToast: async ({ body }) => toasts.push(body) },
@@ -1495,12 +1497,15 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
         get: async ({ path: p }) => ({ data: { id: p.id } }),
         create: async ({ body }) => {
           created.push(body);
-          return { data: { id: `branch-review-${++n}` } };
+          const id = `branch-review-${++n}`;
+          if (createGate) await createGate;
+          return { data: { id } };
         },
         update: async ({ path: p, body }) => titles.push({ id: p.id, title: body.title }),
         abort: async ({ path: p }) => aborted.push(p.id),
         promptAsync: async ({ path: p, body }) => {
           promptCalls.push({ id: p.id, text: body.parts[0].text });
+          if (failPrompt) throw new Error("prompt refused by the host");
         },
         messages: async () => [{ info: { role: "assistant" }, parts: [{ type: "text", text: report }] }],
       },
@@ -1521,8 +1526,24 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     assert.ok((await call({ repo, base: headSha, head: headSha })).includes("nothing to review"), "an empty range starts nothing");
     assert.equal(created.length, 0, "no refused request created a session");
 
-    const started = await call({ repo, base: baseSha.slice(0, 12), head: "lane/x" });
-    assert.ok(started.includes("Branch review started"), `a valid range starts a review: ${started}`);
+    // Two identical calls in parallel start one review; the second reads it.
+    // session.create is held open until either call has answered or both
+    // have reached it, so the race is decided by the code, not the clock.
+    let releaseCreate;
+    createGate = new Promise((resolve) => {
+      releaseCreate = resolve;
+    });
+    const pending = [1, 2].map(() => call({ repo, base: baseSha.slice(0, 12), head: "lane/x" }));
+    const bothCreating = (async () => {
+      for (let i = 0; i < 500 && created.length < 2; i++) await new Promise((r) => setTimeout(r, 10));
+    })();
+    await Promise.race([Promise.race(pending), bothCreating]);
+    createGate = null;
+    releaseCreate();
+    const parallel = await Promise.all(pending);
+    assert.equal(parallel.filter((r) => r.includes("Branch review started")).length, 1, `two parallel calls for one range start one review: ${parallel.join(" | ")}`);
+    assert.ok(parallel.some((r) => r.includes("still running")), "the other call reads the running review");
+    const started = parallel.find((r) => r.includes("Branch review started")) ?? "";
     assert.ok(started.includes(`${baseSha.slice(0, 12)}...${headSha.slice(0, 12)}`), "the reply pins the range to commits");
     assert.equal(created.length, 1, "one review session");
     assert.ok(!created[0].title.startsWith(REVIEW_TITLE), `its title is not the automatic review's, so the TUI never toasts it: ${created[0].title}`);
@@ -1566,6 +1587,20 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     await hooks.event({ event: { type: "session.idle", properties: { sessionID: "branch-review-2" } } });
     await new Promise((r) => setTimeout(r, 50));
     assert.ok((await call({ repo, base: baseSha, head: headSha })).includes("verdict: SHIP"), "the nudged review finishes with its verdict");
+
+    // A start that fails after its session exists aborts that session and
+    // leaves no entry behind, so the next call starts cleanly.
+    fs.writeFileSync(path.join(repo, "c.py"), "def c():\n    return 3\n");
+    git("add", "c.py");
+    git("commit", "-q", "-m", "more lane work");
+    const sessionsBefore = created.length;
+    failPrompt = true;
+    const failed = await call({ repo, base: baseSha, head: "lane/x" });
+    failPrompt = false;
+    assert.ok(failed.includes("Branch review not started: prompt refused by the host"), `a failed start says so: ${failed}`);
+    assert.ok(aborted.includes(`branch-review-${sessionsBefore + 1}`), `the session it created is aborted: ${aborted.join(",")}`);
+    const retried = await call({ repo, base: baseSha, head: "lane/x" });
+    assert.ok(retried.includes("Branch review started"), `no entry is left behind by the failed start: ${retried}`);
   } finally {
     hooks?.dispose();
     fs.rmSync(repo, { recursive: true, force: true });

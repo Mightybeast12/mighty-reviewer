@@ -1464,8 +1464,12 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
   const scratch = path.join(os.tmpdir(), "opencode", "reviewer-test");
   fs.mkdirSync(scratch, { recursive: true });
   const repo = fs.realpathSync(fs.mkdtempSync(path.join(scratch, "branch-")));
+  const outside = fs.realpathSync(fs.mkdtempSync(path.join(scratch, "branch-outside-")));
+  const link = `${repo}-link`;
   let hooks;
   let reloaded;
+  let extHooks;
+  let linkHooks;
   try {
     const git = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
     git("init", "-q");
@@ -1525,6 +1529,23 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     assert.ok((await call({ repo: scratch, base: "HEAD" })).includes("not a git repository"), "a folder outside any repository is refused");
     assert.ok((await call({ repo, base: "no-such-ref" })).includes("does not name a commit"), "an unknown ref is refused");
     assert.ok((await call({ repo, base: headSha, head: headSha })).includes("nothing to review"), "an empty range starts nothing");
+    // A repository the review session may not read (outside the project and
+    // every externalDirectories entry) would come back SHIP having read
+    // nothing, so it is refused up front.
+    const gitOut = (...args) => execFileSync("git", ["-C", outside, ...args], { encoding: "utf8" }).trim();
+    gitOut("init", "-q");
+    gitOut("config", "user.email", "smoke@example.invalid");
+    gitOut("config", "user.name", "smoke");
+    fs.writeFileSync(path.join(outside, "o.js"), "export const o = 1;\n");
+    gitOut("add", "o.js");
+    gitOut("commit", "-q", "-m", "outside base");
+    const outsideBase = gitOut("rev-parse", "HEAD");
+    fs.writeFileSync(path.join(outside, "o.js"), "export const o = 2;\n");
+    gitOut("commit", "-q", "-am", "outside change");
+    assert.ok(
+      (await call({ repo: outside, base: outsideBase })).includes("repo is outside the directories the review session may read"),
+      "a repository outside the readable directories is refused",
+    );
     assert.equal(created.length, 0, "no refused request created a session");
 
     // Two identical calls in parallel start one review; the second reads it.
@@ -1554,6 +1575,7 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     assert.ok(prompt.includes(`git -C ${repo} diff ${baseSha}...${headSha}`), "the prompt names the exact committed range");
     assert.ok(prompt.includes("never the working tree"), "and tells the review not to read the working tree's own changes");
     assert.ok(prompt.includes("Python"), "language hints come from the range's files");
+    assert.ok(prompt.includes("cannot read the range") && prompt.includes("never SHIP"), "a review that cannot read its range ends NO-SHIP, never SHIP");
     assert.ok(started.includes("1 file, 2 changed lines"), `the lockfile in the range is not counted: ${started}`);
 
     const again = await call({ repo, base: baseSha, head: headSha });
@@ -1616,9 +1638,26 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     const restarted = await reloaded.tool.review_branch.execute({ repo, base: baseSha, head: "lane/x", rerun: true }, { sessionID: "orch-1" });
     assert.ok(restarted.includes("Branch review started"), `rerun: true replaces a stale review: ${restarted}`);
     assert.ok(aborted.includes(orphanID), `and aborts its session: ${aborted.join(",")}`);
+
+    // externalDirectories opens the outside repository; a project reached
+    // through a symlink is compared by real path and handed to the review
+    // in the project's own spelling, the one its permission check knows.
+    extHooks = await plugin({ client, directory: repo, worktree: repo, $: makeShell() }, { idleDebounceMs: 0, updateCheck: false, externalDirectories: [scratch] });
+    const extStarted = await extHooks.tool.review_branch.execute({ repo: outside, base: outsideBase }, { sessionID: "orch-2" });
+    assert.ok(extStarted.includes("Branch review started"), `an externalDirectories entry makes the outside repo reviewable: ${extStarted}`);
+    fs.symlinkSync(repo, link);
+    linkHooks = await plugin({ client, directory: link, worktree: link, $: makeShell() }, { idleDebounceMs: 0, updateCheck: false });
+    const linkStarted = await linkHooks.tool.review_branch.execute({ repo, base: baseSha, head: headSha }, { sessionID: "orch-3" });
+    assert.ok(linkStarted.includes("Branch review started"), `the real path of a symlinked project is inside it: ${linkStarted}`);
+    const linkPrompt = promptCalls.at(-1)?.text ?? "";
+    assert.ok(linkPrompt.includes(`git -C ${link} diff ${baseSha}...${headSha}`), "and the review reads it under the project's own spelling");
   } finally {
+    linkHooks?.dispose();
+    extHooks?.dispose();
     reloaded?.dispose();
     hooks?.dispose();
+    fs.rmSync(link, { force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
     fs.rmSync(repo, { recursive: true, force: true });
   }
 }

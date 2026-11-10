@@ -5,6 +5,7 @@
  * nothing here starts one.
  */
 
+import fs from "node:fs";
 import path from "node:path";
 
 // Title of a branch review session. Deliberately not REVIEW_TITLE
@@ -92,3 +93,52 @@ export function shortRange(range) {
 export function branchKey(range) {
   return `${range.root}\u0000${range.baseSha}\u0000${range.headSha}`;
 }
+
+function realOrNull(dir) {
+  try {
+    return fs.realpathSync(dir);
+  } catch {
+    return null;
+  }
+}
+
+function isWithin(child, parent) {
+  return child === parent || child.startsWith(parent.endsWith(path.sep) ? parent : `${parent}${path.sep}`);
+}
+
+function globToRegExp(glob) {
+  const body = glob.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
+  return new RegExp(`^${body}$`);
+}
+
+/**
+ * The spelling under which the review session may read `root`, or null.
+ * The session reads its project directory (`cwd`) and whatever the
+ * external_directory rules allow (`resources`, v2.js
+ * toExternalDirectoryResource of each externalDirectories entry; anything
+ * else is denied). Both sides are compared by real path, so a project
+ * reached through a symlink still contains its own repository, and the
+ * answer is spelled under the allowing directory as configured, since the
+ * host's permission check may compare paths as written.
+ */
+export function readableRepoPath(root, { cwd, resources = [] }) {
+  const realRoot = realOrNull(root) ?? root;
+  const plainBases = [cwd];
+  const globs = [];
+  for (const resource of resources) {
+    if (typeof resource !== "string") continue;
+    const base = resource.endsWith("/*") ? resource.slice(0, -2) : null;
+    if (base && !/[*?[\]{}]/.test(base)) plainBases.push(base);
+    else globs.push(resource);
+  }
+  for (const base of plainBases) {
+    const realBase = typeof base === "string" ? realOrNull(base) : null;
+    if (realBase && isWithin(realRoot, realBase)) return path.join(base, path.relative(realBase, realRoot));
+  }
+  for (const glob of globs) {
+    const pattern = globToRegExp(glob);
+    if (pattern.test(`${realRoot}/x`) || pattern.test(`${root}/x`)) return root;
+  }
+  return null;
+}
+

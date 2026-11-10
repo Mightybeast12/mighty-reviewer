@@ -203,7 +203,7 @@ function expandHome(dir) {
 // lets the rule's glob cover everything underneath it. An entry that
 // already contains a glob character is left alone so a caller can hand-tune
 // a narrower pattern (e.g. "~/dev/*-service").
-function toExternalDirectoryResource(dir) {
+export function toExternalDirectoryResource(dir) {
   const expanded = expandHome(dir);
   if (/[*?[\]{}]/.test(expanded)) return expanded;
   return expanded.endsWith("/") ? `${expanded}*` : `${expanded}/*`;

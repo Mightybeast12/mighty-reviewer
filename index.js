@@ -152,8 +152,8 @@ import {
   formatNoShipSummary,
   METADATA_KEY,
 } from "./internals.js";
-import { createV2Setup } from "./v2.js";
-import { BRANCH_TITLE, branchKey, resolveBranchRange, shortRange } from "./branch.js";
+import { createV2Setup, toExternalDirectoryResource } from "./v2.js";
+import { BRANCH_TITLE, branchKey, readableRepoPath, resolveBranchRange, shortRange } from "./branch.js";
 
 const REVIEW_MARKER = "<!--adversarial-review-auto-->";
 const FEEDBACK_MARKER = "<!--adversarial-review-feedback-->";
@@ -472,7 +472,7 @@ function buildReviewPrompt(languageHints, projectRules, timeoutMs, scope = null)
       : []),
     "Do this:",
     scope
-      ? `1. Run \`git -C ${scope.root} diff --name-only ${range}\` and \`git -C ${scope.root} diff ${range}\` to see exactly what the range changed, and review that range only: never the working tree or its uncommitted changes. Read a changed file as of the head with \`git -C ${scope.root} show ${scope.headSha}:<path>\`. EXCLUDE noise files from the entire review: lockfiles (package-lock.json, yarn.lock, Cargo.lock, go.sum, ...), generated/minified output (dist/, build/, *.min.js, *.map, *.snap), and vendored code (node_modules/, vendor/). If nothing else changed, report that and stop with SHIP.`
+      ? `1. Run \`git -C ${scope.root} diff --name-only ${range}\` and \`git -C ${scope.root} diff ${range}\` to see exactly what the range changed, and review that range only: never the working tree or its uncommitted changes. Read a changed file as of the head with \`git -C ${scope.root} show ${scope.headSha}:<path>\`. If any of these commands fails or is denied, so that you cannot read the range, do not review from memory: report 'not run: cannot read the range' with the error and end with NO-SHIP, never SHIP. EXCLUDE noise files from the entire review: lockfiles (package-lock.json, yarn.lock, Cargo.lock, go.sum, ...), generated/minified output (dist/, build/, *.min.js, *.map, *.snap), and vendored code (node_modules/, vendor/). If nothing else changed, report that and stop with SHIP.`
       : "1. Run `git diff` (and include untracked files) to see exactly what changed. EXCLUDE noise files from the entire review: lockfiles (package-lock.json, yarn.lock, Cargo.lock, go.sum, ...), generated/minified output (dist/, build/, *.min.js, *.map, *.snap), and vendored code (node_modules/, vendor/). If nothing else changed, report that and stop with SHIP.",
     "2. MECHANICAL GATES - run these BEFORE consulting any critic:",
     ...(scope
@@ -1477,6 +1477,16 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
   async function startBranchReview(args, sessionID) {
     const range = await resolveBranchRange($, args, { defaultRepo: cwd, isIgnoredFile });
     if (range.error) return `Branch review not started: ${range.error}`;
+    const readable = readableRepoPath(range.root, {
+      cwd,
+      resources: (Array.isArray(options.externalDirectories) ? options.externalDirectories : [])
+        .filter((dir) => typeof dir === "string" && dir)
+        .map(toExternalDirectoryResource),
+    });
+    if (!readable) {
+      return `Branch review not started: repo is outside the directories the review session may read (${cwd} and externalDirectories, compared by real path); ${range.root} would come back unread. For a worktree of this project, pass the project itself with head set to the worktree's branch.`;
+    }
+    range.root = readable;
     if (range.empty) return `Branch review not started: nothing to review, ${range.headRef} adds no commit over ${range.baseRef} in ${range.root}.`;
     if (range.ignoredOnly) return `Branch review not started: only ignored files (lockfiles, generated or vendored output) changed in ${shortRange(range)}.`;
     if (range.lines > branchMaxDiffLines) {

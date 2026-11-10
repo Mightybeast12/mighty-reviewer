@@ -4,6 +4,7 @@ import os from "node:os";
 import module, { MightyReviewer } from "./index.js";
 import tuiPlugin from "./tui.js";
 import { buildExternalDirectoryPermissions, makeShell } from "./v2.js";
+import { evictFinishedBranchReviews } from "./branch.js";
 import {
   extractVerdict,
   compareSemver,
@@ -1470,6 +1471,8 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
   let reloaded;
   let extHooks;
   let linkHooks;
+  let limitHooks;
+  let fastHooks;
   try {
     const git = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
     git("init", "-q");
@@ -1525,6 +1528,8 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
 
     const call = (args, sessionID = "orch-1") => branch.execute(args, { sessionID });
     assert.ok((await call({ repo, base: "--output" })).includes("not a valid git ref"), "an option-shaped ref is refused before git sees it");
+    assert.ok((await call({ repo, base: "main\nHEAD" })).includes("not a valid git ref"), "a ref with a newline is refused");
+    assert.ok((await call({ repo, base: "main;id" })).includes("not a valid git ref"), "a ref with a ';' is refused");
     assert.ok((await call({ repo: "relative/dir", base: "main" })).includes("absolute path"), "a relative repo path is refused");
     assert.ok((await call({ repo: scratch, base: "HEAD" })).includes("not a git repository"), "a folder outside any repository is refused");
     assert.ok((await call({ repo, base: "no-such-ref" })).includes("does not name a commit"), "an unknown ref is refused");
@@ -1651,7 +1656,41 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     assert.ok(linkStarted.includes("Branch review started"), `the real path of a symlinked project is inside it: ${linkStarted}`);
     const linkPrompt = promptCalls.at(-1)?.text ?? "";
     assert.ok(linkPrompt.includes(`git -C ${link} diff ${baseSha}...${headSha}`), "and the review reads it under the project's own spelling");
+
+    // Ranges a review is not started for, and the deadline.
+    git("checkout", "-q", "-b", "lock-only", baseSha);
+    fs.writeFileSync(path.join(repo, "package-lock.json"), '{ "lockfileVersion": 3 }\n');
+    git("add", "package-lock.json");
+    git("commit", "-q", "-m", "lockfile only");
+    git("checkout", "-q", "-b", "lane/y", baseSha);
+    fs.writeFileSync(path.join(repo, "y.js"), "export const y = 1;\nexport const z = 2;\n");
+    git("add", "y.js");
+    git("commit", "-q", "-m", "y");
+    const ignoredOnly = await call({ repo, base: baseSha, head: "lock-only" });
+    assert.ok(ignoredOnly.includes("only ignored files"), `a range of ignored files only starts nothing: ${ignoredOnly}`);
+    limitHooks = await plugin({ client, directory: repo, worktree: repo, $: makeShell() }, { idleDebounceMs: 0, updateCheck: false, branchMaxDiffLines: 1 });
+    const tooLarge = await limitHooks.tool.review_branch.execute({ repo, base: baseSha, head: "lane/y" }, { sessionID: "orch-4" });
+    assert.ok(tooLarge.includes("changes 2 lines, over branchMaxDiffLines (1)"), `a range over branchMaxDiffLines starts nothing: ${tooLarge}`);
+    fastHooks = await plugin({ client, directory: repo, worktree: repo, $: makeShell() }, { idleDebounceMs: 0, updateCheck: false, branchTimeoutMs: 80 });
+    const fastStarted = await fastHooks.tool.review_branch.execute({ repo, base: baseSha, head: "lane/y" }, { sessionID: "orch-5" });
+    assert.ok(fastStarted.includes("Branch review started"), fastStarted);
+    const fastID = `branch-review-${created.length}`;
+    await new Promise((r) => setTimeout(r, 250));
+    const timedOut = await fastHooks.tool.review_branch.execute({ repo, base: baseSha, head: "lane/y" }, { sessionID: "orch-5" });
+    assert.ok(timedOut.includes("timed out") && timedOut.includes("verdict: unknown"), `past branchTimeoutMs the review reads as timed out: ${timedOut}`);
+    assert.ok(aborted.includes(fastID), "and its session is aborted");
+
+    // At most 50 entries: the oldest finished ones go first, a running one never.
+    const entries = new Map();
+    entries.set("running-old", { status: "running", startedAt: 0 });
+    for (let i = 1; i <= 51; i++) entries.set(`done-${i}`, { status: "done", startedAt: i, finishedAt: i });
+    evictFinishedBranchReviews(entries, 50);
+    assert.equal(entries.size, 50, "the map is cut back to 50");
+    assert.ok(entries.has("running-old"), "a running entry is never evicted");
+    assert.ok(!entries.has("done-1") && !entries.has("done-2") && entries.has("done-3"), "the two oldest finished entries go");
   } finally {
+    fastHooks?.dispose();
+    limitHooks?.dispose();
     linkHooks?.dispose();
     extHooks?.dispose();
     reloaded?.dispose();

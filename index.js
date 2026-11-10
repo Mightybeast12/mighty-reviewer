@@ -153,7 +153,7 @@ import {
   METADATA_KEY,
 } from "./internals.js";
 import { createV2Setup, toExternalDirectoryResource } from "./v2.js";
-import { BRANCH_TITLE, branchKey, readableRepoPath, resolveBranchRange, shortRange } from "./branch.js";
+import { BRANCH_TITLE, branchKey, evictFinishedBranchReviews, readableRepoPath, resolveBranchRange, shortRange } from "./branch.js";
 
 const REVIEW_MARKER = "<!--adversarial-review-auto-->";
 const FEEDBACK_MARKER = "<!--adversarial-review-feedback-->";
@@ -1515,6 +1515,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       timerOwner: null,
     };
     branchReviews.set(key, state);
+    evictFinishedBranchReviews(branchReviews);
 
     if (orphanSessionID) {
       // The stale review this rerun replaces may still be running somewhere.

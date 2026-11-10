@@ -142,3 +142,19 @@ export function readableRepoPath(root, { cwd, resources = [] }) {
   return null;
 }
 
+export const MAX_BRANCH_REVIEWS = 50;
+
+// Keeps `reviews` (range key -> entry) at most `max` entries by deleting
+// the finished ones that finished first; a running entry is never evicted,
+// so the map can exceed `max` only while more than `max` reviews run.
+export function evictFinishedBranchReviews(reviews, max = MAX_BRANCH_REVIEWS) {
+  if (reviews.size <= max) return;
+  const finished = [...reviews.entries()]
+    .filter(([, entry]) => entry.status !== "running")
+    .sort(([, a], [, b]) => (a.finishedAt ?? a.startedAt ?? 0) - (b.finishedAt ?? b.startedAt ?? 0));
+  for (const [key] of finished) {
+    if (reviews.size <= max) break;
+    reviews.delete(key);
+  }
+}
+

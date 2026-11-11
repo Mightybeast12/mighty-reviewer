@@ -501,7 +501,7 @@ function buildReviewPrompt(languageHints, projectRules, timeoutMs, scope = null)
     "2. MECHANICAL GATES - run these BEFORE consulting any critic:",
     ...(scope?.checkout
       ? [
-          `   Run them in the review checkout ${scope.checkout}, with that folder as every command's working directory, never in ${scope.root}. A fresh checkout has no installed dependencies or build outputs of its own: a gate that fails only for that (a missing node_modules, an unbuilt dependency) is recorded as 'not run (dependencies not installed in the review checkout)', never as a failure, and nothing is installed to make it run.`,
+          `   Run them in the review checkout ${scope.checkout}, with that folder as every command's working directory, never in ${scope.root}. A fresh checkout has no installed dependencies or build outputs of its own, and nothing is installed to make a gate run. A gate is recorded as 'not run (dependencies not installed in the review checkout: <its first error line, quoted>)' only when it fails because a package the head's manifest or lockfile declares is absent from disk. A missing relative path, a package the head does not declare, and any error that is not a bare missing-install error are failures.`,
         ]
       : scope
         ? [

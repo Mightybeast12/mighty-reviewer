@@ -1838,7 +1838,14 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     const prompt = prompts.at(-1).text;
     assert.ok(prompt.includes(`Run them in the review checkout ${dir}`), "the gates run in the checkout");
     assert.ok(!prompt.includes("not run (the working tree is not the reviewed head)"), "instead of being skipped for the working tree");
-    assert.ok(prompt.includes("'not run (dependencies not installed in the review checkout)'"), "a gate that needs installed dependencies reads as not run, not failed");
+    assert.ok(
+      prompt.includes("'not run (dependencies not installed in the review checkout: <its first error line, quoted>)' only when it fails because a package the head's manifest or lockfile declares is absent from disk"),
+      "a gate reads as not run only for a declared package missing from disk, with its first error line",
+    );
+    assert.ok(
+      prompt.includes("A missing relative path, a package the head does not declare, and any error that is not a bare missing-install error are failures."),
+      "a missing file, an undeclared package or any other error stays a failure",
+    );
     assert.ok(prompt.includes(`Read a changed file as of the head at ${dir}/<path>`), "the review reads the head's files there");
     assert.ok(prompt.includes(`Tell every critic that the head is checked out at ${dir}`), "and tells the critics to");
     assert.ok(prompt.includes(`run diagnostics on every changed file as checked out in ${dir}`), "5c runs diagnostics on the head's files");

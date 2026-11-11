@@ -1443,7 +1443,6 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
     if (checkout) await removeReviewWorktree($, state.root, checkout, state.parentDir).catch(() => false);
   }
 
-
   // A running entry whose end can no longer be recorded: older than its own
   // deadline, or its deadline timer died with the instance that set it (a
   // reload disposes that instance; the module-level entry outlives it).

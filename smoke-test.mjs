@@ -1706,8 +1706,8 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
 //     branchWorktreeDir (default: the system's temporary folder), never
 //     inside a work tree of the repository, and removes it after SHIP,
 //     NO-SHIP, a failed start, the deadline and a reload. The review
-//     session and the four critics may read that checkout, and the gates
-//     and 5c's diagnostics run there. Without the option a branch start is
+//     session may read that checkout (its critics' sessions inherit its
+//     rules), and the gates and 5c's diagnostics run there. Without the option a branch start is
 //     byte for byte 0.12.0's (test/branch-0.12.0.json, recorded on 0.12.0
 //     by test/branch-capture.mjs).
 {
@@ -1728,22 +1728,13 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
   assert.equal(defaultWorktreeParent(), path.join(os.tmpdir(), "mighty-reviewer-worktrees"), "the default checkout folder is in the system's temporary folder");
 
   // The v2 adapter: the review session's own allow comes after the
-  // fallback deny (OpenCode 2 rules are last-match-wins), and a critic
-  // grant is a transform on the named agents that its handle withdraws.
+  // fallback deny (OpenCode 2 rules are last-match-wins).
   {
     let legacy;
     const v2Created = [];
-    const transforms = [];
-    let withdrawn = 0;
     const ctx = {
       options: { externalDirectories: ["/x/dev"] },
       location: { directory: "/x/project" },
-      agent: {
-        transform: async (fn) => {
-          transforms.push(fn);
-          return { dispose: async () => withdrawn++ };
-        },
-      },
       session: { create: async (input) => (v2Created.push(input), { id: "v2-review" }) },
     };
     await createV2Setup(async ({ client: legacyClient }) => {
@@ -1760,13 +1751,6 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
       ...v2Created[0].permissions,
       { action: "external_directory", resource: "/w/checkout/*", effect: "allow" },
     ], "externalAllow appends the checkout's allow after the fallback deny");
-    const handle = await legacy.agent.allowExternal({ agents: ["critic-a", "critic-missing"], directories: ["/w/checkout"] });
-    const agents = new Map([["critic-a", { permissions: [{ action: "external_directory", resource: "*", effect: "deny" }] }]]);
-    transforms[0]({ get: (id) => agents.get(id), update: (id, fn) => fn(agents.get(id)) });
-    assert.deepEqual(agents.get("critic-a").permissions.at(-1), { action: "external_directory", resource: "/w/checkout/*", effect: "allow" }, "the grant adds the checkout's allow last to a critic");
-    assert.equal(agents.has("critic-missing"), false, "and never creates an agent that is not there");
-    await handle.dispose();
-    assert.equal(withdrawn, 1, "the handle withdraws the transform");
   }
 
   const box = fs.realpathSync(fs.mkdtempSync(path.join(scratch, "worktree-")));
@@ -1793,6 +1777,11 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     git("add", "y.js");
     git("commit", "-q", "-m", "y");
     git("checkout", "-q", "lane/x");
+    // A post-checkout hook the review's `git worktree add` must not run.
+    const hookMark = path.join(box, "hook-ran");
+    fs.mkdirSync(path.join(repo, ".test-hooks"));
+    fs.writeFileSync(path.join(repo, ".test-hooks", "post-checkout"), `#!/bin/sh\ntouch '${hookMark}'\n`, { mode: 0o755 });
+    git("config", "core.hooksPath", ".test-hooks");
     const before = git("worktree", "list", "--porcelain");
     const listed = () => git("worktree", "list", "--porcelain");
 
@@ -1802,18 +1791,10 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     const created = [];
     const prompts = [];
     const aborted = [];
-    const grants = [];
-    const withdrawn = [];
     const client = {
       v2: true,
       tui: { showToast: async () => {} },
       app: { log: async () => {} },
-      agent: {
-        allowExternal: async (grant) => {
-          grants.push(grant);
-          return { dispose: async () => withdrawn.push(grant) };
-        },
-      },
       session: {
         get: async ({ path: p }) => ({ data: { id: p.id } }),
         create: async ({ body }) => {
@@ -1838,22 +1819,22 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     assert.equal(hooks.tool.review_branch.inputSchema.properties.worktree?.type, "boolean", "review_branch takes worktree: true");
     const call = (args, h = hooks) => h.tool.review_branch.execute(args, { sessionID: "orch-wt" });
     const idle = (id, h = hooks) => h.event({ event: { type: "session.idle", properties: { sessionID: id } } });
-    const critics = ["adversarial-risk-critic", "ai-slop-critic", "design-principles-critic", "security-checklist-critic"];
 
     // During the review: a clean, detached checkout of the head, outside the
-    // repository, readable by the review session and the critics.
+    // repository, readable by the review session.
+    const allowOf = () => created.at(-1)?.externalAllow?.[0] ?? "";
     const started = await call({ repo, base: "base-x", head: "lane/x", worktree: true });
     assert.ok(started.includes("Branch review started"), started);
-    const dir = grants[0]?.directories?.[0] ?? "";
+    const dir = allowOf();
     assert.equal(path.dirname(dir), fs.realpathSync(parent), `the checkout is a direct child of branchWorktreeDir: ${dir}`);
     assert.ok(!dir.startsWith(`${repo}${path.sep}`), "never inside the reviewed repository's work tree");
     assert.equal(fs.statSync(parent).mode & 0o777, 0o700, "branchWorktreeDir is made private to this user");
     assert.ok(listed().includes(`worktree ${dir}\nHEAD ${headSha}\ndetached`), `listed as a detached worktree at the head: ${listed()}`);
     assert.equal(execFileSync("git", ["-C", dir, "status", "--porcelain"], { encoding: "utf8" }), "", "and clean");
     assert.ok(fs.existsSync(path.join(dir, "b.js")), "with the head's files");
+    assert.equal(fs.existsSync(hookMark), false, "made without running the repository's hooks");
     assert.ok(started.includes(dir), `the reply names the checkout: ${started}`);
-    assert.deepEqual([...grants[0].agents].sort(), critics, "the four critics may read the checkout");
-    assert.deepEqual(created.at(-1).externalAllow, [dir], "and so may the review session");
+    assert.deepEqual(created.at(-1).externalAllow, [dir], "the review session may read the checkout, and no other folder is opened");
     const prompt = prompts.at(-1).text;
     assert.ok(prompt.includes(`Run them in the review checkout ${dir}`), "the gates run in the checkout");
     assert.ok(!prompt.includes("not run (the working tree is not the reviewed head)"), "instead of being skipped for the working tree");
@@ -1866,23 +1847,21 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     // A start without the option is another review, never the worktree's.
     const plain = await call({ repo, base: "base-x", head: "lane/x" });
     assert.ok(plain.includes("Branch review started") && !plain.includes(dir), `the same range without worktree starts its own review: ${plain}`);
-    assert.equal(grants.length, 1, "with no grant");
-    assert.equal(created.at(-1).externalAllow, undefined, "and no allow");
+    assert.equal(created.at(-1).externalAllow, undefined, "and opens no folder");
     const status = await hooks.tool.review_status.execute({}, { sessionID: "orch-wt" });
     assert.equal((status.match(/\[worktree\]/g) ?? []).length, 1, `review_status tells the two apart: ${status}`);
 
-    // SHIP: removed, grant withdrawn, git's worktree list as before.
+    // SHIP: removed, git's worktree list as before.
     await idle("wt-review-1");
     assert.ok((await call({ repo, base: "base-x", head: "lane/x", worktree: true })).includes("verdict: SHIP"), "the worktree review reads SHIP");
     assert.ok(!fs.existsSync(dir) && !listed().includes(dir), "after SHIP the checkout is gone");
-    assert.deepEqual(withdrawn, [grants[0]], "and the critics' grant is withdrawn");
     await idle("wt-review-2");
     assert.equal(listed(), before, "git worktree list is back to what it was");
 
     // NO-SHIP.
     report = "- P1 b.js:1 constant\n\nNO-SHIP";
     assert.ok((await call({ repo, base: "base-x", head: "lane/x", worktree: true, rerun: true })).includes("Branch review started"), "rerun starts a new checkout");
-    const dir2 = grants.at(-1).directories[0];
+    const dir2 = allowOf();
     assert.ok(dir2 !== dir && fs.existsSync(dir2), "a fresh checkout per review");
     await idle(`wt-review-${n}`);
     assert.ok((await call({ repo, base: "base-x", head: "lane/x", worktree: true })).includes("verdict: NO-SHIP"), "the worktree review reads NO-SHIP");
@@ -1894,7 +1873,6 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     failPrompt = false;
     assert.ok(failed.includes("Branch review not started: prompt refused by the host"), failed);
     assert.ok(aborted.includes(`wt-review-${n}`), "the failed start's session is aborted");
-    assert.equal(withdrawn.length, grants.length, "every grant is withdrawn");
     assert.equal(listed(), before, "and no checkout is left");
 
     // The deadline.
@@ -1917,7 +1895,6 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     assert.ok(aborted.includes(doomedID), "and the review's session aborted");
     const afterReload = await call({ repo, base: "base-x", head: "lane/y", worktree: true });
     assert.ok(afterReload.includes("ended by a plugin reload") && !afterReload.includes("stale"), `it reads as ended, not stale: ${afterReload}`);
-    assert.equal(withdrawn.length, grants.length, "every grant is withdrawn");
 
     // Orphans: a start removes the checkouts in its folder whose process is
     // gone (also one whose folder a temp cleaner deleted) and this
@@ -1941,7 +1918,7 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     fs.rmSync(gone, { recursive: true, force: true });
     fs.rmSync(foreign, { recursive: true, force: true });
     assert.ok((await call({ repo, base: "base-x", head: "lane/y", worktree: true, rerun: true })).includes("Branch review started"));
-    const runningY = grants.at(-1).directories[0];
+    const runningY = allowOf();
     const runningYID = `wt-review-${n}`;
     assert.ok((await call({ repo, base: "base-x", head: "lane/x", worktree: true, rerun: true })).includes("Branch review started"));
     const sweptList = listed();

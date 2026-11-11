@@ -234,8 +234,6 @@ const RISK_AGENT = "adversarial-risk-critic";
 const DESIGN_AGENT = "design-principles-critic";
 const SECURITY_AGENT = "security-checklist-critic";
 const SLOP_AGENT = "ai-slop-critic";
-const CRITIC_AGENTS = [RISK_AGENT, DESIGN_AGENT, SECURITY_AGENT, SLOP_AGENT];
-
 const BRANCH_RELOAD_REPORT =
   "Branch review ended by a plugin reload before its verdict; its checkout was removed. Call review_branch with rerun: true to start it again.";
 
@@ -1436,18 +1434,12 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
     return `${state.root} ${state.baseRef}...${state.headRef} (${shortRange(state)})${state.worktree ? " [worktree]" : ""}`;
   }
 
-  // Ends what a worktree review holds: the critics' read grant and the
-  // checkout. Each is taken off the entry before the first await, so a
-  // second call (the deadline racing an idle, a reload) finds nothing left.
+  // Removes a worktree review's checkout. It is taken off the entry before
+  // the first await, so a second call (the deadline racing an idle, a
+  // reload) finds nothing left.
   async function releaseBranchWorktree(state) {
-    const { grant, checkout } = state;
-    state.grant = null;
+    const { checkout } = state;
     state.checkout = null;
-    try {
-      await grant?.dispose?.();
-    } catch {
-      // Withdrawing the grant is best-effort; it ends with the plugin anyway.
-    }
     if (checkout) await removeReviewWorktree($, state.root, checkout, state.parentDir).catch(() => false);
   }
 
@@ -1578,7 +1570,6 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       worktree: useWorktree,
       parentDir,
       checkout: null,
-      grant: null,
     };
     branchReviews.set(key, state);
     evictFinishedBranchReviews(branchReviews);
@@ -1600,8 +1591,6 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
         const made = await addReviewWorktree($, range, parentDir);
         if (made.error) throw new Error(made.error);
         checkout = state.checkout = made.dir;
-        state.grant = await client.agent?.allowExternal?.({ agents: CRITIC_AGENTS, directories: [checkout] });
-        if (!state.grant) throw new Error("this host cannot let the critics read a review checkout.");
         if (state.status !== "running") throw new Error("the plugin was reloaded during the start.");
       }
       const rules = await projectRules(range.root);

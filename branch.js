@@ -1,11 +1,13 @@
 /**
  * Branch review (the tooling reviewer's backlog B5, experiment E1): turning
  * a requested committed range of a repository into pinned commits and the
- * files and lines it changes. index.js owns the review session itself;
- * nothing here starts one.
+ * files and lines it changes, and (backlog B13, worktree: true) making and
+ * removing the review's own checkout of the head. index.js owns the review
+ * session itself; nothing here starts one.
  */
 
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 // Title of a branch review session. Deliberately not REVIEW_TITLE
@@ -140,6 +142,177 @@ export function readableRepoPath(root, { cwd, resources = [] }) {
     if (pattern.test(`${realRoot}/x`) || pattern.test(`${root}/x`)) return root;
   }
   return null;
+}
+
+// ------------------------------------------------- review worktree (B13)
+//
+// review_branch({ worktree: true }) reviews inside a detached checkout of
+// the head, made for that review and removed after it. Each checkout is a
+// direct child of one private folder, named <pid>-<head sha 12>-<stamp>, so
+// a later start can tell an orphan (its process is gone, or it is this
+// process's and no review holds it) from a checkout still in use.
+
+export const WORKTREE_DIR_NAME = "mighty-reviewer-worktrees";
+
+const WORKTREE_NAME = /^(\d+)-[0-9a-f]{12}-[0-9a-z]+$/;
+
+// The checkouts this process's reviews hold, from the moment their path is
+// chosen until they are removed. Kept on globalThis because OpenCode 2
+// imports the module afresh at a hot reload: module state does not survive
+// it, and the new copy must not take the old copy's checkouts for orphans.
+const LIVE_CHECKOUTS = (globalThis[Symbol.for("mighty-reviewer.reviewCheckouts")] ??= new Set());
+
+export function defaultWorktreeParent() {
+  return path.join(os.tmpdir(), WORKTREE_DIR_NAME);
+}
+
+function firstLine(err) {
+  const text = String(err?.stderr ?? "").trim() || String(err?.message ?? err);
+  return text.split("\n").find((line) => line.trim() && !line.startsWith("Command failed")) ?? text;
+}
+
+// The parent folder, made private to this user, by real path; or { error }.
+// Another user could otherwise plant a symlink or files where the critics
+// are allowed to read.
+function privateParent(parent) {
+  try {
+    fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
+    const info = fs.lstatSync(parent);
+    if (!info.isDirectory()) return { error: `${parent} is not a folder.` };
+    if (typeof process.getuid === "function" && info.uid !== process.getuid()) {
+      return { error: `${parent} belongs to another user.` };
+    }
+    if ((info.mode & 0o077) !== 0) {
+      return { error: `${parent} is open to other users (mode ${(info.mode & 0o777).toString(8)}); give review_branch a private folder.` };
+    }
+    return { dir: fs.realpathSync(parent) };
+  } catch (err) {
+    return { error: `cannot prepare ${parent}: ${firstLine(err)}` };
+  }
+}
+
+async function worktreePaths($, root) {
+  const listing = await gitText($`git -C ${root} worktree list --porcelain`);
+  return listing
+    .split("\n")
+    .filter((line) => line.startsWith("worktree "))
+    .map((line) => line.slice("worktree ".length));
+}
+
+function isOwnCheckout(dir, parentDir) {
+  return path.dirname(dir) === parentDir && WORKTREE_NAME.test(path.basename(dir));
+}
+
+function processAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err?.code === "EPERM";
+  }
+}
+
+/**
+ * Removes one checkout this module made (`dir`, a direct child of the real
+ * `parentDir`) and its entry in `root`'s worktree list, and nothing else:
+ * never `git worktree prune`, which would drop every stale entry of the
+ * repository. Returns true when neither the entry nor the folder is left.
+ */
+export async function removeReviewWorktree($, root, dir, parentDir) {
+  if (!isOwnCheckout(dir, parentDir)) return false;
+  try {
+    await $`git -C ${root} worktree remove --force ${dir}`.quiet();
+  } catch {
+    // Older git refuses an entry whose folder is gone: handled below.
+  }
+  if ((await worktreePaths($, root)).includes(dir)) {
+    const common = await gitText($`git -C ${root} rev-parse --path-format=absolute --git-common-dir`);
+    const admin = common ? path.join(common, "worktrees") : null;
+    for (const name of admin && fs.existsSync(admin) ? fs.readdirSync(admin) : []) {
+      let gitdir = "";
+      try {
+        gitdir = fs.readFileSync(path.join(admin, name, "gitdir"), "utf8").trim();
+      } catch {
+        continue;
+      }
+      if (gitdir === path.join(dir, ".git")) fs.rmSync(path.join(admin, name), { recursive: true, force: true });
+    }
+  }
+  fs.rmSync(dir, { recursive: true, force: true });
+  LIVE_CHECKOUTS.delete(dir);
+  return !fs.existsSync(dir) && !(await worktreePaths($, root)).includes(dir);
+}
+
+/**
+ * Removes the orphaned review checkouts of `root` in `parentDir`: those
+ * whose process is gone, and this process's that no review holds. Another
+ * live process's checkouts and every entry outside the folder are left
+ * alone.
+ */
+export async function sweepOrphanWorktrees($, root, parentDir) {
+  for (const dir of await worktreePaths($, root)) {
+    if (!isOwnCheckout(dir, parentDir)) continue;
+    const pid = Number(WORKTREE_NAME.exec(path.basename(dir))[1]);
+    const orphan = pid === process.pid ? !LIVE_CHECKOUTS.has(dir) : !processAlive(pid);
+    if (orphan) await removeReviewWorktree($, root, dir, parentDir);
+  }
+}
+
+// The real path `dir` has or would have once made: the real path of its
+// nearest existing ancestor joined with the rest.
+function realPathAhead(dir) {
+  const rest = [];
+  let probe = path.resolve(dir);
+  for (;;) {
+    const real = realOrNull(probe);
+    if (real) return path.join(real, ...rest.reverse());
+    const up = path.dirname(probe);
+    if (up === probe) return path.resolve(dir);
+    rest.push(path.basename(probe));
+    probe = up;
+  }
+}
+
+/**
+ * Checks and makes the folder review checkouts of `root` go in (`parent`,
+ * default: the system's temporary folder): absolute, never inside any work
+ * tree of the repository (checked before anything is made), and private to
+ * this user. Returns `{ dir }` (its real path) or `{ error }`.
+ */
+export async function prepareWorktreeParent($, root, parent = defaultWorktreeParent()) {
+  if (typeof parent !== "string" || !path.isAbsolute(parent)) {
+    return { error: `branchWorktreeDir must be an absolute path (got ${JSON.stringify(parent)}).` };
+  }
+  const ahead = realPathAhead(parent);
+  const trees = (await worktreePaths($, root)).map((tree) => realOrNull(tree) ?? tree);
+  const inside = trees.find((tree) => isWithin(ahead, tree));
+  if (inside) return { error: `the worktree folder ${parent} is inside a work tree of the reviewed repository (${inside}).` };
+  return privateParent(parent);
+}
+
+/**
+ * Makes a detached checkout of `headSha` for one review in `parentDir` (a
+ * real path from prepareWorktreeParent), without running the repository's
+ * hooks, after removing the orphans there. Returns `{ dir }` (a real path,
+ * held until removeReviewWorktree) or `{ error }`.
+ */
+export async function addReviewWorktree($, { root, headSha }, parentDir) {
+  await sweepOrphanWorktrees($, root, parentDir);
+  const stamp = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+  const dir = path.join(parentDir, `${process.pid}-${headSha.slice(0, 12)}-${stamp}`);
+  // Held before git lists it, so a parallel start's sweep leaves it alone.
+  LIVE_CHECKOUTS.add(dir);
+  try {
+    await $`git -C ${root} -c core.hooksPath=/dev/null worktree add --detach ${dir} ${headSha}`.quiet();
+  } catch (err) {
+    await removeReviewWorktree($, root, dir, parentDir);
+    return { error: `git worktree add failed: ${firstLine(err)}` };
+  }
+  if ((await gitText($`git -C ${dir} rev-parse HEAD`)) !== headSha) {
+    await removeReviewWorktree($, root, dir, parentDir);
+    return { error: `the checkout at ${dir} is not at ${headSha}.` };
+  }
+  return { dir };
 }
 
 export const MAX_BRANCH_REVIEWS = 50;

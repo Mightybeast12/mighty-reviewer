@@ -10,6 +10,7 @@
  *   session.get               ctx.session.get
  *   session.messages          ctx.session.context
  *   session.create            ctx.session.create (+ agent/model/permissions)
+ *   agent.allowExternal       ctx.agent.transform, withdrawn by its handle
  *   session.prompt(Async)     ctx.session.prompt (delivery: queue)
  *   session.update            ctx.session.update
  *   session.abort             ctx.session.interrupt
@@ -175,7 +176,7 @@ export function createV2Setup(factory) {
     return async () => {
       controller.abort();
       await watcher;
-      hooks.dispose?.();
+      await hooks.dispose?.();
       await Promise.allSettled(registrations.map((registration) => registration.dispose()));
     };
   };
@@ -231,6 +232,12 @@ export function buildExternalDirectoryPermissions(options) {
   return rules;
 }
 
+function externalAllowRules(directories) {
+  return (Array.isArray(directories) ? directories : [])
+    .filter((dir) => typeof dir === "string" && path.isAbsolute(dir))
+    .map((dir) => ({ action: "external_directory", resource: toExternalDirectoryResource(dir), effect: "allow" }));
+}
+
 function toolsToPermissions(tools) {
   const rules = [];
   const seen = new Set();
@@ -271,6 +278,21 @@ function createLegacyClient(ctx, options) {
 
   return {
     v2: true,
+    agent: {
+      // A critic session takes its rules from its agent, never from the
+      // review session that dispatched it, so reading a review checkout
+      // needs the allow on the critic agents themselves: a transform added
+      // for one review and withdrawn after it (the host recomputes its
+      // agents whenever a transform comes or goes).
+      allowExternal: async ({ agents, directories }) => {
+        const rules = externalAllowRules(directories);
+        return ctx.agent.transform((editor) => {
+          for (const id of agents) {
+            if (editor.get(id)) editor.update(id, (agent) => agent.permissions.push(...rules));
+          }
+        });
+      },
+    },
     app: {
       log: async ({ body }) => {
         const level = body?.level === "error" ? "error" : "info";
@@ -344,9 +366,12 @@ function createLegacyClient(ctx, options) {
           // one-off path interactively) at the cost of reintroducing that
           // same headless stall for anything not covered by
           // externalDirectories.
+          // externalAllow (review_branch's worktree: true) opens the
+          // review's own checkout, after the fallback deny it must beat.
           permissions: [
             ...toolsToPermissions({ edit: false, write: false, patch: false }),
             ...buildExternalDirectoryPermissions(options),
+            ...externalAllowRules(body?.externalAllow),
           ],
         });
         return { data: created };

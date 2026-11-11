@@ -123,8 +123,13 @@
  *             (shadow): no notice, no feedback injection, no enforceNoShip
  *             block; the verdict and report are read back through
  *             review_branch with the same arguments and listed by
- *             review_status. Options: branchMaxDiffLines (default 6000),
- *             branchTimeoutMs (default twice timeoutMs).
+ *             review_status. With worktree: true it reviews a detached
+ *             checkout of head made for it under branchWorktreeDir (default:
+ *             the system's temporary folder) and removed after the verdict,
+ *             a failed start, the deadline or a reload, so the critics read
+ *             head's files and the gates run there. Options:
+ *             branchMaxDiffLines (default 6000), branchTimeoutMs (default
+ *             twice timeoutMs), branchWorktreeDir.
  * Scope:      Only ROOT sessions are reviewed. Child sessions (subagents
  *             spawned via the task tool, other plugins' background sessions)
  *             are never reviewed on their own; edits they make are credited
@@ -132,7 +137,8 @@
  *             produces one review for the parent turn, not N+1 and not 0.
  * Options:    { disabled, model, criticModel, agent, maxDiffLines, ignore,
  *             idleDebounceMs, timeoutMs, enforceNoShip, progressToasts, quiet,
- *             updateCheck, autoUpdate, branchMaxDiffLines, branchTimeoutMs }
+ *             updateCheck, autoUpdate, branchMaxDiffLines, branchTimeoutMs,
+ *             branchWorktreeDir }
  *             via the plugin tuple form.
  * Opt-out:    set MIGHTY_REVIEWER_DISABLE=1, or pass { disabled: true }
  *             via the plugin tuple form in opencode.json.
@@ -153,7 +159,18 @@ import {
   METADATA_KEY,
 } from "./internals.js";
 import { createV2Setup, toExternalDirectoryResource } from "./v2.js";
-import { BRANCH_TITLE, branchKey, evictFinishedBranchReviews, readableRepoPath, resolveBranchRange, shortRange } from "./branch.js";
+import {
+  BRANCH_TITLE,
+  addReviewWorktree,
+  branchKey,
+  defaultWorktreeParent,
+  evictFinishedBranchReviews,
+  prepareWorktreeParent,
+  readableRepoPath,
+  removeReviewWorktree,
+  resolveBranchRange,
+  shortRange,
+} from "./branch.js";
 
 const REVIEW_MARKER = "<!--adversarial-review-auto-->";
 const FEEDBACK_MARKER = "<!--adversarial-review-feedback-->";
@@ -217,6 +234,10 @@ const RISK_AGENT = "adversarial-risk-critic";
 const DESIGN_AGENT = "design-principles-critic";
 const SECURITY_AGENT = "security-checklist-critic";
 const SLOP_AGENT = "ai-slop-critic";
+const CRITIC_AGENTS = [RISK_AGENT, DESIGN_AGENT, SECURITY_AGENT, SLOP_AGENT];
+
+const BRANCH_RELOAD_REPORT =
+  "Branch review ended by a plugin reload before its verdict; its checkout was removed. Call review_branch with rerun: true to start it again.";
 
 // Critic agents are review-only and never need a shell: deny the mutating
 // tools AND bash/task, so the read-only contract is enforced by mechanism.
@@ -458,7 +479,7 @@ function buildReviewPrompt(languageHints, projectRules, timeoutMs, scope = null)
     "",
     "HARD CONSTRAINT: this review is strictly READ-ONLY. You must NEVER edit, write, create, delete, or fix any source file, and never run commands that modify source files or git state (no formatters with --write, no git add/commit/stash/checkout/switch). Read-only checks that only write to build caches (e.g. `cargo check`, `tsc --noEmit`) are allowed. Your ONLY deliverable is a report.",
     "",
-    `HARD SCOPE: stay inside ${scope ? `the reviewed repository (${scope.root}) and the project directory` : "the project directory"}. Never read, list, or search paths outside it (the home directory, other repositories, global caches, another project's node_modules): access outside the project is denied for this session and a denied call is a wasted call. Never install tooling, write a tsconfig, or hunt for type packages. Skip any session-start protocol, skill load, or observation-log step that instruction files ask of coding sessions: this is a review session, not a coding session, and those steps do not apply here.`,
+    `HARD SCOPE: stay inside ${scope ? `the reviewed repository (${scope.root})${scope.checkout ? `, its review checkout (${scope.checkout})` : ""} and the project directory` : "the project directory"}. Never read, list, or search paths outside it (the home directory, other repositories, global caches, another project's node_modules): access outside the project is denied for this session and a denied call is a wasted call. Never install tooling, write a tsconfig, or hunt for type packages. Skip any session-start protocol, skill load, or observation-log step that instruction files ask of coding sessions: this is a review session, not a coding session, and those steps do not apply here.`,
     `TIME BUDGET: the review is aborted after ${Math.max(1, Math.round(timeoutMs / 60000))} minutes. Dispatch the four critics by your fourth tool call at the latest; mechanical gates that would take longer than that are recorded as 'not run' and skipped.`,
     "",
     ...(projectRules
@@ -472,19 +493,28 @@ function buildReviewPrompt(languageHints, projectRules, timeoutMs, scope = null)
       : []),
     "Do this:",
     scope
-      ? `1. Run \`git -C ${scope.root} diff --name-only ${range}\` and \`git -C ${scope.root} diff ${range}\` to see exactly what the range changed, and review that range only: never the working tree or its uncommitted changes. Read a changed file as of the head with \`git -C ${scope.root} show ${scope.headSha}:<path>\`. If any of these commands fails or is denied, so that you cannot read the range, do not review from memory: report 'not run: cannot read the range' with the error and end with NO-SHIP, never SHIP. EXCLUDE noise files from the entire review: lockfiles (package-lock.json, yarn.lock, Cargo.lock, go.sum, ...), generated/minified output (dist/, build/, *.min.js, *.map, *.snap), and vendored code (node_modules/, vendor/). If nothing else changed, report that and stop with SHIP.`
+      ? `1. Run \`git -C ${scope.root} diff --name-only ${range}\` and \`git -C ${scope.root} diff ${range}\` to see exactly what the range changed, and review that range only: never the working tree or its uncommitted changes. ${scope.checkout ? `Read a changed file as of the head at ${scope.checkout}/<path>: that folder is a clean, detached checkout of ${scope.headSha} made for this review.` : `Read a changed file as of the head with \`git -C ${scope.root} show ${scope.headSha}:<path>\`.`} If any of these commands fails or is denied, so that you cannot read the range, do not review from memory: report 'not run: cannot read the range' with the error and end with NO-SHIP, never SHIP. EXCLUDE noise files from the entire review: lockfiles (package-lock.json, yarn.lock, Cargo.lock, go.sum, ...), generated/minified output (dist/, build/, *.min.js, *.map, *.snap), and vendored code (node_modules/, vendor/). If nothing else changed, report that and stop with SHIP.`
       : "1. Run `git diff` (and include untracked files) to see exactly what changed. EXCLUDE noise files from the entire review: lockfiles (package-lock.json, yarn.lock, Cargo.lock, go.sum, ...), generated/minified output (dist/, build/, *.min.js, *.map, *.snap), and vendored code (node_modules/, vendor/). If nothing else changed, report that and stop with SHIP.",
     "2. MECHANICAL GATES - run these BEFORE consulting any critic:",
-    ...(scope
+    ...(scope?.checkout
       ? [
-          `   Run them in ${scope.root} only when \`git -C ${scope.root} rev-parse HEAD\` prints ${scope.headSha} and \`git -C ${scope.root} status --porcelain\` prints nothing; otherwise record every gate as 'not run (the working tree is not the reviewed head)' and go straight to the critics.`,
+          `   Run them in the review checkout ${scope.checkout}, with that folder as every command's working directory, never in ${scope.root}. A fresh checkout has no installed dependencies or build outputs of its own: a gate that fails only for that (a missing node_modules, an unbuilt dependency) is recorded as 'not run (dependencies not installed in the review checkout)', never as a failure, and nothing is installed to make it run.`,
         ]
-      : []),
+      : scope
+        ? [
+            `   Run them in ${scope.root} only when \`git -C ${scope.root} rev-parse HEAD\` prints ${scope.headSha} and \`git -C ${scope.root} status --porcelain\` prints nothing; otherwise record every gate as 'not run (the working tree is not the reviewed head)' and go straight to the critics.`,
+          ]
+        : []),
     "   - Detect the project's own typecheck/lint commands (package.json scripts, tsconfig.json, Makefile, pyproject.toml, go.mod, Cargo.toml) and run the cheapest applicable check (e.g. `tsc --noEmit`, `ruff check`, `go vet`, `cargo check`), scoped to changed files where the tool allows. Only run a check the project itself configures: if the changed files have no project-configured typecheck or lint (for example a standalone script or plugin file with no package.json or tsconfig next to it), record 'no project typecheck configured' and move on immediately.",
     "   - Scan the changed files for leftover debug output (console.log, print-debugging, debugger statements) and commented-out code blocks.",
     "   - Check whether the diff touches linter/formatter/typechecker config (.eslintrc*, biome.json*, tsconfig*, .prettierrc*, ruff.toml, clippy.toml) in a way that WEAKENS rules.",
     "   Every mechanical failure is an automatic P1 finding. Record them; never fix anything.",
     "3. Delegate the critique to FOUR subagents IN PARALLEL (fire all four task calls in the same message, then wait for all). The critic tasks must run in the FOREGROUND: NEVER launch them as background tasks, and NEVER end your turn while any critique is still pending or the final verdict line is missing. Give each: the mechanical-gate results as context, the project review rules above (if any), and these standing orders: it is strictly read-only, it must not report anything the mechanical gates already cover, and it must omit findings it is less than 70% confident are real and material:",
+    ...(scope?.checkout
+      ? [
+          `   Tell every critic that the head is checked out at ${scope.checkout}: it reads the changed files and the code around them there, never under ${scope.root}, whose working tree may not be the reviewed head.`,
+        ]
+      : []),
     `   a. \`${RISK_AGENT}\` - adversarial risk critique. Its job is to BREAK confidence, not validate:`,
     "      - Attack the most expensive/risky surfaces first (auth, data loss, concurrency, external I/O, error paths).",
     "      - Report ONLY material findings, each with concrete evidence (file:line) and a severity P0-P3.",
@@ -507,9 +537,9 @@ function buildReviewPrompt(languageHints, projectRules, timeoutMs, scope = null)
         ]
       : ["4. Language-specific attention: none for this diff."]),
     "5. After ALL subagents return:",
-    "   a. ADVERSARIAL VERIFICATION - for EVERY P0/P1 finding, actively try to REFUTE it before accepting it: read the FULL current file (not just the diff) and check imports, declarations, type definitions, callers, and existing validation that may already handle the case. Drop any finding you can refute or cannot back with concrete evidence; when uncertain whether a finding is real, default to NOT REAL and drop it. Downgrade severity where the claimed failure scenario is not actually reachable. A false positive costs more than a missed nit.",
+    `   a. ADVERSARIAL VERIFICATION - for EVERY P0/P1 finding, actively try to REFUTE it before accepting it: read the FULL ${scope?.checkout ? `file as checked out in ${scope.checkout}` : "current file"} (not just the diff) and check imports, declarations, type definitions, callers, and existing validation that may already handle the case. Drop any finding you can refute or cannot back with concrete evidence; when uncertain whether a finding is real, default to NOT REAL and drop it. Downgrade severity where the claimed failure scenario is not actually reachable. A false positive costs more than a missed nit.`,
     "   b. DEDUPLICATE - merge findings from different critics that point at the same file:line or the same root cause into ONE finding at the highest justified severity.",
-    "   c. Merge the surviving critic findings with the mechanical-gate findings into one severity-ranked list, then run diagnostics on every changed file and record any that are not clean as findings.",
+    `   c. Merge the surviving critic findings with the mechanical-gate findings into one severity-ranked list, then run diagnostics on every changed file${scope?.checkout ? ` as checked out in ${scope.checkout}` : ""} and record any that are not clean as findings.`,
     "6. Output the FULL findings report: every finding, severity-ranked (P0 first), each with:",
     "   - Severity (P0-P3).",
     "   - Exact location (file:line).",
@@ -749,6 +779,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       : DEFAULT_BRANCH_MAX_DIFF_LINES;
   const branchTimeoutMs =
     Number.isFinite(options.branchTimeoutMs) && options.branchTimeoutMs > 0 ? options.branchTimeoutMs : reviewTimeoutMs * 2;
+  const branchWorktreeDir = options.branchWorktreeDir ?? defaultWorktreeParent();
 
   // sessionID -> parentID (or null for a root session). Asked of the server
   // once per session; the parent link never changes.
@@ -1402,8 +1433,24 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
   // ------------------------------------------------------------ branch review
 
   function describeBranchRange(state) {
-    return `${state.root} ${state.baseRef}...${state.headRef} (${shortRange(state)})`;
+    return `${state.root} ${state.baseRef}...${state.headRef} (${shortRange(state)})${state.worktree ? " [worktree]" : ""}`;
   }
+
+  // Ends what a worktree review holds: the critics' read grant and the
+  // checkout. Each is taken off the entry before the first await, so a
+  // second call (the deadline racing an idle, a reload) finds nothing left.
+  async function releaseBranchWorktree(state) {
+    const { grant, checkout } = state;
+    state.grant = null;
+    state.checkout = null;
+    try {
+      await grant?.dispose?.();
+    } catch {
+      // Withdrawing the grant is best-effort; it ends with the plugin anyway.
+    }
+    if (checkout) await removeReviewWorktree($, state.root, checkout, state.parentDir).catch(() => false);
+  }
+
 
   // A running entry whose end can no longer be recorded: older than its own
   // deadline, or its deadline timer died with the instance that set it (a
@@ -1450,7 +1497,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
     sessionBaselines.delete(reviewSessionID);
     sessionWroteCode.delete(reviewSessionID);
     const state = key ? branchReviews.get(key) : undefined;
-    if (!state || state.reviewSessionID !== reviewSessionID) return;
+    if (!state || state.reviewSessionID !== reviewSessionID) return null;
     if (state.timer) {
       clearTimeout(state.timer);
       ownedTimers.delete(state.timer);
@@ -1465,13 +1512,15 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       finishedAt: Date.now(),
       timer: null,
     });
+    return state;
   }
 
   async function handleBranchIdle(reviewSessionID) {
     const report = await lastAssistantText(reviewSessionID);
     const verdict = extractVerdict(report);
     if (!verdict && (await nudgeForVerdict(reviewSessionID, report))) return;
-    finishBranchReview(reviewSessionID, verdict, report);
+    const state = finishBranchReview(reviewSessionID, verdict, report);
+    if (state) await releaseBranchWorktree(state);
   }
 
   async function startBranchReview(args, sessionID) {
@@ -1493,12 +1542,24 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       return `Branch review not started: ${shortRange(range)} changes ${range.lines} lines, over branchMaxDiffLines (${branchMaxDiffLines}).`;
     }
 
-    const key = branchKey(range);
-    const existing = branchReviews.get(key);
-    if (existing && (args?.rerun !== true || (existing.status === "running" && !isStaleBranchReview(existing)))) {
-      return describeBranchReview(existing);
+    const useWorktree = args?.worktree === true;
+    const key = useWorktree ? `${branchKey(range)}\u0000worktree` : branchKey(range);
+    const known = () => {
+      const entry = branchReviews.get(key);
+      return entry && (args?.rerun !== true || (entry.status === "running" && !isStaleBranchReview(entry))) ? entry : null;
+    };
+    if (known()) return describeBranchReview(known());
+    let parentDir = null;
+    if (useWorktree) {
+      const prepared = await prepareWorktreeParent($, range.root, branchWorktreeDir);
+      if (prepared.error) return `Branch review not started: ${prepared.error}`;
+      parentDir = prepared.dir;
+      // A parallel call may have claimed the range during that await.
+      if (known()) return describeBranchReview(known());
     }
-    const orphanSessionID = existing?.status === "running" ? existing.reviewSessionID : null;
+    const existing = branchReviews.get(key);
+    const orphan = existing?.status === "running" ? existing : null;
+    const orphanSessionID = orphan ? orphan.reviewSessionID : null;
 
     // Claimed before the first await, so a parallel call for the same range
     // reads this entry instead of starting a second review.
@@ -1513,6 +1574,11 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       report: null,
       timer: null,
       timerOwner: null,
+      owner: ownedTimers,
+      worktree: useWorktree,
+      parentDir,
+      checkout: null,
+      grant: null,
     };
     branchReviews.set(key, state);
     evictFinishedBranchReviews(branchReviews);
@@ -1526,12 +1592,22 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
         // Abort is best-effort.
       }
     }
+    if (orphan) await releaseBranchWorktree(orphan);
 
     try {
+      let checkout = null;
+      if (useWorktree) {
+        const made = await addReviewWorktree($, range, parentDir);
+        if (made.error) throw new Error(made.error);
+        checkout = state.checkout = made.dir;
+        state.grant = await client.agent?.allowExternal?.({ agents: CRITIC_AGENTS, directories: [checkout] });
+        if (!state.grant) throw new Error("this host cannot let the critics read a review checkout.");
+        if (state.status !== "running") throw new Error("the plugin was reloaded during the start.");
+      }
       const rules = await projectRules(range.root);
-      const reviewPrompt = buildReviewPrompt(languageHintsFor(range.files), rules, branchTimeoutMs, range);
+      const reviewPrompt = buildReviewPrompt(languageHintsFor(range.files), rules, branchTimeoutMs, checkout ? { ...range, checkout } : range);
       const created = await client.session.create({
-        body: { title: `${BRANCH_TITLE} ${range.baseRef}...${range.headRef}` },
+        body: { title: `${BRANCH_TITLE} ${range.baseRef}...${range.headRef}`, ...(checkout ? { externalAllow: [checkout] } : {}) },
       });
       const reviewSessionID = created?.data?.id ?? created?.id;
       if (!reviewSessionID) throw new Error("session.create returned no id");
@@ -1547,6 +1623,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
           } catch {
             // Abort is best-effort.
           }
+          await releaseBranchWorktree(state);
         }, branchTimeoutMs),
       );
       await sendPrompt(reviewSessionID, reviewPrompt, {
@@ -1554,7 +1631,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
         ...(reviewAgent ? { agent: reviewAgent } : {}),
         ...(reviewModel ? { model: reviewModel } : {}),
       });
-      return `Branch review started for ${describeBranchRange(state)}: ${range.files.length} file${range.files.length === 1 ? "" : "s"}, ${range.lines} changed lines. Advisory: nothing is blocked or sent back. Read it with review_branch and the same arguments, or review_status.`;
+      return `Branch review started for ${describeBranchRange(state)}: ${range.files.length} file${range.files.length === 1 ? "" : "s"}, ${range.lines} changed lines${checkout ? `, in a checkout of the head at ${checkout} that is removed after the verdict` : ""}. Advisory: nothing is blocked or sent back. Read it with review_branch and the same arguments, or review_status.`;
     } catch (err) {
       if (state.timer) {
         clearTimeout(state.timer);
@@ -1568,6 +1645,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
           // Abort is best-effort.
         }
       }
+      await releaseBranchWorktree(state);
       if (branchReviews.get(key) === state) branchReviews.delete(key);
       return `Branch review not started: ${String(err?.message ?? err)}`;
     }
@@ -1677,6 +1755,11 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
                   base: { type: "string", description: "Base branch, tag or commit (for a lane: main)." },
                   head: { type: "string", description: "Head branch, tag or commit (default: HEAD of repo)." },
                   rerun: { type: "boolean", description: "Start a fresh review even when a finished one exists for the same commits." },
+                  worktree: {
+                    type: "boolean",
+                    description:
+                      "Review inside a temporary detached checkout of head (made under branchWorktreeDir, by default the system's temporary folder, and removed after the verdict), so the critics read head's files and the gates run there. Default false: the review reads the range through git.",
+                  },
                 },
                 required: ["base"],
                 additionalProperties: false,
@@ -1805,6 +1888,29 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
     dispose: () => {
       for (const timer of ownedTimers) clearTimeout(timer);
       ownedTimers.clear();
+      // A review checkout must not outlive the instance that would remove
+      // it: this instance's running worktree reviews end here.
+      const releases = [];
+      for (const state of branchReviews.values()) {
+        if (!state.worktree || state.status !== "running" || state.owner !== ownedTimers) continue;
+        const sessionID = state.reviewSessionID;
+        if (!sessionID || !finishBranchReview(sessionID, null, BRANCH_RELOAD_REPORT)) {
+          Object.assign(state, { status: "done", verdict: null, report: BRANCH_RELOAD_REPORT, finishedAt: Date.now(), timer: null });
+        }
+        releases.push(
+          (async () => {
+            if (sessionID) {
+              try {
+                await client.session.abort({ path: { id: sessionID } });
+              } catch {
+                // Abort is best-effort.
+              }
+            }
+            await releaseBranchWorktree(state);
+          })(),
+        );
+      }
+      return releases.length ? Promise.allSettled(releases) : undefined;
     },
   };
 };

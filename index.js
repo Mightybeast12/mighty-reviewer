@@ -501,7 +501,7 @@ function buildReviewPrompt(languageHints, projectRules, timeoutMs, scope = null)
     "2. MECHANICAL GATES - run these BEFORE consulting any critic:",
     ...(scope?.checkout
       ? [
-          `   Run them in the review checkout ${scope.checkout}, with that folder as every command's working directory, never in ${scope.root}. A fresh checkout has no installed dependencies or build outputs of its own, and nothing is installed to make a gate run. A gate is recorded as 'not run (dependencies not installed in the review checkout: <its first error line, quoted>)' only when it fails because a package the head's manifest or lockfile declares is absent from disk. A missing relative path, a package the head does not declare, and any error that is not a bare missing-install error are failures.`,
+          `   Run them in the review checkout ${scope.checkout}, with that folder as every command's working directory, never in ${scope.root}. Run each check tool directly (for example \`tsc --noEmit\`, \`cargo check\`), never a package script (\`npm run\`, \`make\` and the like). A fresh checkout has no installed dependencies or build outputs of its own, and nothing is installed to make a gate run. A gate is recorded as 'not run (dependencies not installed in the review checkout: <its first error line, quoted>)' only when it fails because a package the head's manifest or lockfile declares is absent from disk. A missing relative path, a package the head does not declare, and any error that is not a bare missing-install error are failures.`,
         ]
       : scope
         ? [
@@ -1753,7 +1753,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
                   worktree: {
                     type: "boolean",
                     description:
-                      "Review inside a temporary detached checkout of head (made under branchWorktreeDir, by default the system's temporary folder, and removed after the verdict), so the critics read head's files and the gates run there. Default false: the review reads the range through git.",
+                      "Review inside a temporary detached checkout of head (made under branchWorktreeDir, by default the system's temporary folder, and removed after the verdict), so the critics read head's files and the gates run there. It runs the head's own lint and build commands with your rights: use it only for branches you would run yourself. Default false: the review reads the range through git.",
                   },
                 },
                 required: ["base"],

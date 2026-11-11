@@ -1817,6 +1817,9 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     };
     const hooks = await make();
     assert.equal(hooks.tool.review_branch.inputSchema.properties.worktree?.type, "boolean", "review_branch takes worktree: true");
+    const warning = "It runs the head's own lint and build commands with your rights: use it only for branches you would run yourself.";
+    assert.ok(hooks.tool.review_branch.inputSchema.properties.worktree.description.includes(warning), "the option says it runs the head's own commands");
+    assert.ok(readFileSync(new URL("./README.md", import.meta.url), "utf8").includes(warning), "and so does the README");
     const call = (args, h = hooks) => h.tool.review_branch.execute(args, { sessionID: "orch-wt" });
     const idle = (id, h = hooks) => h.event({ event: { type: "session.idle", properties: { sessionID: id } } });
 
@@ -1837,6 +1840,7 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     assert.deepEqual(created.at(-1).externalAllow, [dir], "the review session may read the checkout, and no other folder is opened");
     const prompt = prompts.at(-1).text;
     assert.ok(prompt.includes(`Run them in the review checkout ${dir}`), "the gates run in the checkout");
+    assert.ok(prompt.includes("Run each check tool directly (for example `tsc --noEmit`, `cargo check`), never a package script (`npm run`, `make` and the like)."), "the gates call the check tools, not the head's scripts");
     assert.ok(!prompt.includes("not run (the working tree is not the reviewed head)"), "instead of being skipped for the working tree");
     assert.ok(
       prompt.includes("'not run (dependencies not installed in the review checkout: <its first error line, quoted>)' only when it fails because a package the head's manifest or lockfile declares is absent from disk"),

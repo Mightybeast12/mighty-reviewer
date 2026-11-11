@@ -180,7 +180,7 @@ All options go in the plugin entry in `opencode.json` (OpenCode 2 object form sh
 | `autoUpdate` | `true` | Install the newer version into opencode's plugin cache automatically (unpinned npm installs only); with `false` you get a notification toast instead |
 | `branchMaxDiffLines` | `6000` | OpenCode 2 only. Largest committed range (changed lines, lockfiles/generated excluded) `review_branch` reviews |
 | `branchTimeoutMs` | twice `timeoutMs` | OpenCode 2 only. Time budget of a branch review; at the deadline it is aborted and reads as timed out |
-| `branchWorktreeDir` | `<system temp>/mighty-reviewer-worktrees` | OpenCode 2 only. Where `review_branch({ worktree: true })` makes its checkouts: an absolute path outside every work tree of the reviewed repository, private to you (a folder open to other users is refused) |
+| `branchWorktreeDir` | `<system temp>/mighty-reviewer-worktrees` | OpenCode 2 only. Where `review_branch({ worktree: true })` makes its checkouts: an absolute path outside every work tree of the reviewed repository, private to you, with no glob character (`* ? [ ] { }`) in its real path (any other folder is refused) |
 
 ### Project review rules (`.mighty-reviewer.md`)
 

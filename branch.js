@@ -258,6 +258,8 @@ export async function sweepOrphanWorktrees($, root, parentDir) {
   }
 }
 
+const GLOB_CHARACTER = /[*?[\]{}]/;
+
 // The real path `dir` has or would have once made: the real path of its
 // nearest existing ancestor joined with the rest.
 function realPathAhead(dir) {
@@ -284,6 +286,11 @@ export async function prepareWorktreeParent($, root, parent = defaultWorktreePar
     return { error: `branchWorktreeDir must be an absolute path (got ${JSON.stringify(parent)}).` };
   }
   const ahead = realPathAhead(parent);
+  // The review's allow is the glob `<checkout>/*`: a glob character in the
+  // folder's path would make it match more than the checkout.
+  if (GLOB_CHARACTER.test(parent) || GLOB_CHARACTER.test(ahead)) {
+    return { error: `the worktree folder ${parent} (real path ${ahead}) holds a glob character (* ? [ ] { }), which would widen the review's read allow; pick another folder.` };
+  }
   const trees = (await worktreePaths($, root)).map((tree) => realOrNull(tree) ?? tree);
   const inside = trees.find((tree) => isWithin(ahead, tree));
   if (inside) return { error: `the worktree folder ${parent} is inside a work tree of the reviewed repository (${inside}).` };

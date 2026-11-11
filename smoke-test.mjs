@@ -2007,6 +2007,21 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     const openHooks = await make({ branchWorktreeDir: openDir });
     const open = await call({ repo, base: "base-x", head: "lane/x", worktree: true, rerun: true }, openHooks);
     assert.ok(open.includes("Branch review not started") && open.includes("open to other users"), open);
+    // The allow is a glob over the checkout's path, so a folder whose real
+    // path holds a glob character would open more than the checkout.
+    for (const name of ["glob[x]", "glob*", "glob{a,b}", "glob?"]) {
+      const globDir = path.join(box, name);
+      const globHooks = await make({ branchWorktreeDir: globDir });
+      const refused = await call({ repo, base: "base-x", head: "lane/x", worktree: true, rerun: true }, globHooks);
+      assert.ok(refused.includes("Branch review not started") && refused.includes("glob character"), `a folder named ${name} is refused: ${refused}`);
+      assert.equal(fs.existsSync(globDir), false, `and not made: ${name}`);
+    }
+    const linkedGlob = path.join(box, "glob[real]");
+    fs.mkdirSync(linkedGlob, { mode: 0o700 });
+    fs.symlinkSync(linkedGlob, path.join(box, "plain-link"));
+    const linkedHooks = await make({ branchWorktreeDir: path.join(box, "plain-link", "reviews") });
+    const linkedRefused = await call({ repo, base: "base-x", head: "lane/x", worktree: true, rerun: true }, linkedHooks);
+    assert.ok(linkedRefused.includes("glob character"), `so is one whose real path holds one: ${linkedRefused}`);
     assert.equal(created.length, createdBefore, "neither created a session");
     assert.equal(listed(), before, "nor a checkout");
     assert.ok((await call({ repo, base: "base-x", head: "lane/x", worktree: true })).includes("verdict: NO-SHIP"), "and a refused rerun leaves the last verdict readable");

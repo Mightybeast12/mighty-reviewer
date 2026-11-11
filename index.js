@@ -493,6 +493,11 @@ function buildReviewPrompt(languageHints, projectRules, timeoutMs, scope = null)
     scope
       ? `1. Run \`git -C ${scope.root} diff --name-only ${range}\` and \`git -C ${scope.root} diff ${range}\` to see exactly what the range changed, and review that range only: never the working tree or its uncommitted changes. ${scope.checkout ? `Read a changed file as of the head at ${scope.checkout}/<path>: that folder is a clean, detached checkout of ${scope.headSha} made for this review.` : `Read a changed file as of the head with \`git -C ${scope.root} show ${scope.headSha}:<path>\`.`} If any of these commands fails or is denied, so that you cannot read the range, do not review from memory: report 'not run: cannot read the range' with the error and end with NO-SHIP, never SHIP. EXCLUDE noise files from the entire review: lockfiles (package-lock.json, yarn.lock, Cargo.lock, go.sum, ...), generated/minified output (dist/, build/, *.min.js, *.map, *.snap), and vendored code (node_modules/, vendor/). If nothing else changed, report that and stop with SHIP.`
       : "1. Run `git diff` (and include untracked files) to see exactly what changed. EXCLUDE noise files from the entire review: lockfiles (package-lock.json, yarn.lock, Cargo.lock, go.sum, ...), generated/minified output (dist/, build/, *.min.js, *.map, *.snap), and vendored code (node_modules/, vendor/). If nothing else changed, report that and stop with SHIP.",
+    ...(scope?.unlinked?.length
+      ? [
+          `   These symlinks of the head point outside the review checkout and were removed from it before the review, so nothing is read through them: ${scope.unlinked.slice(0, 50).map((rel) => JSON.stringify(rel)).join(", ")}${scope.unlinked.length > 50 ? ` and ${scope.unlinked.length - 50} more` : ""}. Review each as a link (its target is in the diff); never follow one.`,
+        ]
+      : []),
     "2. MECHANICAL GATES - run these BEFORE consulting any critic:",
     ...(scope?.checkout
       ? [
@@ -1586,14 +1591,16 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
 
     try {
       let checkout = null;
+      let unlinked = [];
       if (useWorktree) {
         const made = await addReviewWorktree($, range, parentDir);
         if (made.error) throw new Error(made.error);
         checkout = state.checkout = made.dir;
+        unlinked = made.unlinked;
         if (state.status !== "running") throw new Error("the plugin was reloaded during the start.");
       }
       const rules = await projectRules(range.root);
-      const reviewPrompt = buildReviewPrompt(languageHintsFor(range.files), rules, branchTimeoutMs, checkout ? { ...range, checkout } : range);
+      const reviewPrompt = buildReviewPrompt(languageHintsFor(range.files), rules, branchTimeoutMs, checkout ? { ...range, checkout, unlinked } : range);
       const created = await client.session.create({
         body: { title: `${BRANCH_TITLE} ${range.baseRef}...${range.headRef}`, ...(checkout ? { externalAllow: [checkout] } : {}) },
       });

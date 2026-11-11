@@ -291,10 +291,52 @@ export async function prepareWorktreeParent($, root, parent = defaultWorktreePar
 }
 
 /**
+ * Removes from the fresh checkout `dir` every symlink of `headSha` whose
+ * target, followed to its end, lies outside the checkout (dangling ones
+ * judged by where they point). The review may read `<dir>/*`, and the host
+ * matches a path as written, so a read through such a link would leave the
+ * checkout. Every link is judged before any is removed, so a link to a link
+ * that leaves goes too. Only the links go, never their targets. Returns
+ * `{ removed }` (paths relative to the checkout, sorted) or `{ error }`:
+ * a head whose links cannot be listed is never handed to a review.
+ */
+async function unlinkEscapingLinks($, dir, headSha) {
+  let listing;
+  try {
+    listing = String(await $`git -C ${dir} ls-tree -r -z --full-tree ${headSha}`.quiet().text());
+  } catch (err) {
+    return { error: `cannot list the head's symlinks: ${firstLine(err)}` };
+  }
+  const escaping = [];
+  for (const entry of listing.split("\0")) {
+    const tab = entry.indexOf("\t");
+    if (tab === -1 || !entry.startsWith("120000 ")) continue;
+    const rel = entry.slice(tab + 1);
+    const at = path.join(dir, rel);
+    let target = realOrNull(at);
+    if (target === null) {
+      try {
+        target = realPathAhead(path.resolve(path.dirname(at), fs.readlinkSync(at)));
+      } catch {
+        target = null;
+      }
+    }
+    if (target === null || !isWithin(target, dir)) escaping.push(rel);
+  }
+  try {
+    for (const rel of escaping) fs.unlinkSync(path.join(dir, rel));
+  } catch (err) {
+    return { error: `cannot remove a symlink that leaves the checkout: ${firstLine(err)}` };
+  }
+  return { removed: escaping.sort() };
+}
+
+/**
  * Makes a detached checkout of `headSha` for one review in `parentDir` (a
  * real path from prepareWorktreeParent), without running the repository's
- * hooks, after removing the orphans there. Returns `{ dir }` (a real path,
- * held until removeReviewWorktree) or `{ error }`.
+ * hooks and without the head's symlinks that leave it, after removing the
+ * orphans there. Returns `{ dir, unlinked }` (a real path, held until
+ * removeReviewWorktree, and the symlinks removed) or `{ error }`.
  */
 export async function addReviewWorktree($, { root, headSha }, parentDir) {
   await sweepOrphanWorktrees($, root, parentDir);
@@ -312,7 +354,12 @@ export async function addReviewWorktree($, { root, headSha }, parentDir) {
     await removeReviewWorktree($, root, dir, parentDir);
     return { error: `the checkout at ${dir} is not at ${headSha}.` };
   }
-  return { dir };
+  const links = await unlinkEscapingLinks($, dir, headSha);
+  if (links.error) {
+    await removeReviewWorktree($, root, dir, parentDir);
+    return { error: links.error };
+  }
+  return { dir, unlinked: links.removed };
 }
 
 export const MAX_BRANCH_REVIEWS = 50;

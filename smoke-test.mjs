@@ -1937,6 +1937,53 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     git("worktree", "remove", foreign);
     assert.equal(listed(), before, "after the review only the test's own entries were left");
 
+    // A symlink of the head whose target, followed to its end, is outside
+    // the checkout is removed from the checkout before the review: the
+    // allow is `<checkout>/*` and the host matches paths as written, so a
+    // read through such a link would leave the checkout. Links that stay
+    // inside are kept, the targets are never touched, and the review is
+    // told which paths went.
+    const secretDir = path.join(box, "secret-dir");
+    fs.mkdirSync(secretDir);
+    fs.writeFileSync(path.join(secretDir, "key.txt"), "not for the critics\n");
+    const secretFile = path.join(box, "secret.txt");
+    fs.writeFileSync(secretFile, "not for the critics\n");
+    git("checkout", "-q", "-b", "lane/links", "base-x");
+    fs.mkdirSync(path.join(repo, "sub"));
+    const links = {
+      "out-file": secretFile,
+      "out-dir": secretDir,
+      "sub/up": "../../../secret-dir",
+      dangling: "/nonexistent-mighty-reviewer-target/x",
+      "z-chain": "in-out",
+      "in-out": secretFile,
+      "in-file": "a.js",
+      "sub/in-up": "../a.js",
+    };
+    for (const [name, target] of Object.entries(links)) fs.symlinkSync(target, path.join(repo, name));
+    git("add", "-A", ".");
+    git("commit", "-q", "-m", "links");
+    git("checkout", "-q", "lane/x");
+    const escaping = ["dangling", "in-out", "out-dir", "out-file", "sub/up", "z-chain"];
+    assert.ok((await call({ repo, base: "base-x", head: "lane/links", worktree: true })).includes("Branch review started"));
+    const linkDir = allowOf();
+    const lexists = (p) => {
+      try {
+        fs.lstatSync(p);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    for (const name of escaping) assert.equal(lexists(path.join(linkDir, name)), false, `a link leaving the checkout is removed: ${name}`);
+    for (const name of ["in-file", "sub/in-up"]) assert.ok(fs.lstatSync(path.join(linkDir, name)).isSymbolicLink(), `a link inside the checkout stays: ${name}`);
+    assert.ok(fs.existsSync(secretFile) && fs.existsSync(path.join(secretDir, "key.txt")), "and the targets are untouched");
+    const linkPrompt = prompts.at(-1).text;
+    assert.ok(linkPrompt.includes(`point outside the review checkout and were removed from it before the review, so nothing is read through them: ${escaping.map((e) => JSON.stringify(e)).join(", ")}.`), `the review is told which: ${linkPrompt.slice(0, 200)}`);
+    assert.ok(!prompt.includes("point outside the review checkout"), "a head without such links gets no such line");
+    await idle(`wt-review-${n}`);
+    assert.equal(listed(), before, "and the checkout goes after the verdict");
+
     // Never inside a work tree of the repository, and never a folder open
     // to other users.
     const createdBefore = created.length;

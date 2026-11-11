@@ -253,8 +253,31 @@ function isOrphan(dir) {
   return pid === process.pid ? !LIVE_CHECKOUTS.has(dir) : !processAlive(pid);
 }
 
+// Whether the repository whose common git folder is `common` lists `dir`
+// as one of its worktrees (an entry whose gitdir file names `<dir>/.git`).
+function listsCheckout(common, dir) {
+  const admin = path.join(common, "worktrees");
+  let names = [];
+  try {
+    names = fs.readdirSync(admin);
+  } catch {
+    return false;
+  }
+  return names.some((name) => {
+    try {
+      // worktree.useRelativePaths writes it relative to the entry.
+      return path.resolve(admin, name, fs.readFileSync(path.join(admin, name, "gitdir"), "utf8").trim()) === path.join(dir, ".git");
+    } catch {
+      return false;
+    }
+  });
+}
+
 // The common git folder of the repository a checkout belongs to, read from
-// the checkout's own `.git` file; null when it has none.
+// the checkout's own `.git` file; null when it has none, or when the
+// repository it names does not list the checkout: the file is the
+// checkout's own and a review's shell could rewrite it, so no git command
+// is run in a repository on its word alone.
 function commonDirOf(dir) {
   try {
     const line = fs.readFileSync(path.join(dir, ".git"), "utf8").trim();
@@ -266,7 +289,7 @@ function commonDirOf(dir) {
     } catch {
       // No commondir file: the layout <common>/worktrees/<name> stands.
     }
-    return fs.existsSync(common) ? common : null;
+    return listsCheckout(common, dir) ? common : null;
   } catch {
     return null;
   }

@@ -1810,8 +1810,15 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
         messages: async () => [{ info: { role: "assistant" }, parts: [{ type: "text", text: report }] }],
       },
     };
+    // Every git command the plugin runs, as one line each.
+    const commands = [];
+    const shell = makeShell();
+    const recording = (strings, ...values) => {
+      commands.push(String.raw({ raw: strings }, ...values));
+      return shell(strings, ...values);
+    };
     const make = async (extra = {}) => {
-      const h = await plugin({ client, directory: repo, worktree: repo, $: makeShell() }, { idleDebounceMs: 0, updateCheck: false, branchWorktreeDir: parent, ...extra });
+      const h = await plugin({ client, directory: repo, worktree: repo, $: recording }, { idleDebounceMs: 0, updateCheck: false, branchWorktreeDir: parent, ...extra });
       instances.push(h);
       return h;
     };
@@ -2042,6 +2049,32 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     assert.ok(!prompt.includes("point outside the review checkout"), "a head without such links gets no such line");
     await idle(`wt-review-${n}`);
     assert.equal(listed(), before, "and the checkout goes after the verdict");
+
+    // A checkout's `.git` file is its own, and a review's shell could
+    // rewrite it: the sweep runs git in the repository that file names only
+    // when that repository lists the folder as its worktree, and otherwise
+    // removes the folder as it is, leaving the named repository untouched.
+    const victim = path.join(box, "victim");
+    fs.mkdirSync(victim);
+    const gitVictim = (...args) => execFileSync("git", ["-C", victim, ...args], { encoding: "utf8" }).trim();
+    gitVictim("init", "-q");
+    gitVictim("-c", "user.email=smoke@example.invalid", "-c", "user.name=smoke", "commit", "-q", "--allow-empty", "-m", "victim");
+    const victimSha = gitVictim("rev-parse", "HEAD");
+    const victimTree = path.join(box, "victim-wt");
+    gitVictim("worktree", "add", "-q", "--detach", victimTree, victimSha);
+    const victimBefore = gitVictim("worktree", "list", "--porcelain");
+    const [victimEntry] = fs.readdirSync(path.join(victim, ".git", "worktrees"));
+    const planted = path.join(realParent, `${deadPid}-${victimSha.slice(0, 12)}-p1`);
+    fs.mkdirSync(planted);
+    fs.writeFileSync(path.join(planted, ".git"), `gitdir: ${path.join(victim, ".git", "worktrees", victimEntry)}\n`);
+    commands.length = 0;
+    assert.ok((await call({ repo, base: "base-x", head: "lane/x", worktree: true, rerun: true })).includes("Branch review started"));
+    assert.equal(fs.existsSync(planted), false, "a folder whose .git names a repository that does not list it is removed as it is");
+    assert.deepEqual(commands.filter((c) => c.includes(victim)), [], "and no git command runs in the repository it names");
+    assert.equal(gitVictim("worktree", "list", "--porcelain"), victimBefore, "which keeps its worktrees");
+    assert.ok(fs.existsSync(path.join(victimTree, ".git")), "and their folders");
+    await idle(`wt-review-${n}`);
+    assert.equal(listed(), before, "and the review's own checkout still goes");
 
     // Never inside a work tree of the repository, and never a folder open
     // to other users.

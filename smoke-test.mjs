@@ -1716,7 +1716,7 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
   const { execFileSync, spawnSync } = await import("node:child_process");
   const { captureBranchStart } = await import("./test/branch-capture.mjs");
   const { createV2Setup } = await import("./v2.js");
-  const { defaultWorktreeParent } = await import("./branch.js");
+  const { defaultWorktreeParent, removeReviewWorktree } = await import("./branch.js");
   const scratch = path.join(os.tmpdir(), "opencode", "reviewer-test");
   fs.mkdirSync(scratch, { recursive: true });
 
@@ -1928,6 +1928,25 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     for (const d of [orphan, gone, alive, held, unheld, foreign]) git("worktree", "add", "-q", "--detach", d, headSha);
     fs.rmSync(gone, { recursive: true, force: true });
     fs.rmSync(foreign, { recursive: true, force: true });
+    // The same rule over the whole folder, whatever repository a checkout
+    // belongs to: another repository's checkouts of a dead process and this
+    // process's unheld one go, a live process's stays, and an own-named
+    // folder that is no checkout at all goes too.
+    const other = path.join(box, "other");
+    fs.mkdirSync(other);
+    const gitOther = (...args) => execFileSync("git", ["-C", other, ...args], { encoding: "utf8" }).trim();
+    gitOther("init", "-q");
+    gitOther("-c", "user.email=smoke@example.invalid", "-c", "user.name=smoke", "commit", "-q", "--allow-empty", "-m", "other");
+    const otherSha = gitOther("rev-parse", "HEAD");
+    const other12 = otherSha.slice(0, 12);
+    const otherBefore = gitOther("worktree", "list", "--porcelain");
+    const otherDead = path.join(realParent, `${deadPid}-${other12}-o1`);
+    const otherAlive = path.join(realParent, `${process.ppid}-${other12}-o2`);
+    const otherUnheld = path.join(realParent, `${process.pid}-${other12}-o3`);
+    for (const d of [otherDead, otherAlive, otherUnheld]) gitOther("worktree", "add", "-q", "--detach", d, otherSha);
+    const stray = path.join(realParent, `${deadPid}-${other12}-o4`);
+    fs.mkdirSync(stray);
+    fs.writeFileSync(path.join(stray, "left"), "x\n");
     assert.ok((await call({ repo, base: "base-x", head: "lane/y", worktree: true, rerun: true })).includes("Branch review started"));
     const runningY = allowOf();
     const runningYID = `wt-review-${n}`;
@@ -1940,6 +1959,13 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     assert.ok(sweptList.includes(held), "so does one this process holds");
     assert.ok(!sweptList.includes(unheld) && !fs.existsSync(unheld), "this process's checkout no review holds is removed");
     assert.ok(sweptList.includes(`worktree ${foreign}`) && sweptList.includes("prunable"), "and a stale entry outside the folder is not pruned");
+    const otherList = gitOther("worktree", "list", "--porcelain");
+    assert.ok(!otherList.includes(otherDead) && !fs.existsSync(otherDead), "another repository's checkout of a dead process is removed");
+    assert.ok(!otherList.includes(otherUnheld) && !fs.existsSync(otherUnheld), "so is this process's unheld one");
+    assert.ok(otherList.includes(otherAlive) && fs.existsSync(otherAlive), "a live process's stays");
+    assert.equal(fs.existsSync(stray), false, "and an own-named folder that is no checkout goes");
+    gitOther("worktree", "remove", otherAlive);
+    assert.equal(gitOther("worktree", "list", "--porcelain"), otherBefore, "the other repository is left as it was");
     await idle(runningYID);
     await idle(`wt-review-${n}`);
     registry.delete(held);
@@ -1947,6 +1973,28 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     git("worktree", "remove", held);
     git("worktree", "remove", foreign);
     assert.equal(listed(), before, "after the review only the test's own entries were left");
+
+    // A removal that throws still lets go of the checkout, so a later
+    // sweep can take it.
+    const stuck = path.join(realParent, `${process.pid}-${head12}-a6`);
+    git("worktree", "add", "-q", "--detach", stuck, headSha);
+    registry.add(stuck);
+    const locked = path.join(stuck, "locked");
+    fs.mkdirSync(locked);
+    fs.writeFileSync(path.join(locked, "f"), "x\n");
+    fs.chmodSync(locked, 0o500);
+    let threw = false;
+    try {
+      await removeReviewWorktree(makeShell(), repo, stuck, realParent);
+    } catch {
+      threw = true;
+    } finally {
+      fs.chmodSync(locked, 0o700);
+    }
+    assert.ok(threw, "a removal that cannot delete the folder throws");
+    assert.equal(registry.has(stuck), false, "and still lets go of the checkout");
+    assert.equal(await removeReviewWorktree(makeShell(), repo, stuck, realParent), true, "which a later call then removes");
+    assert.equal(listed(), before, "leaving nothing");
 
     // A symlink of the head whose target, followed to its end, is outside
     // the checkout is removed from the checkout before the review: the

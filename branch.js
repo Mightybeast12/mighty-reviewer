@@ -221,40 +221,82 @@ function processAlive(pid) {
 export async function removeReviewWorktree($, root, dir, parentDir) {
   if (!isOwnCheckout(dir, parentDir)) return false;
   try {
-    await $`git -C ${root} worktree remove --force ${dir}`.quiet();
-  } catch {
-    // Older git refuses an entry whose folder is gone: handled below.
-  }
-  if ((await worktreePaths($, root)).includes(dir)) {
-    const common = await gitText($`git -C ${root} rev-parse --path-format=absolute --git-common-dir`);
-    const admin = common ? path.join(common, "worktrees") : null;
-    for (const name of admin && fs.existsSync(admin) ? fs.readdirSync(admin) : []) {
-      let gitdir = "";
-      try {
-        gitdir = fs.readFileSync(path.join(admin, name, "gitdir"), "utf8").trim();
-      } catch {
-        continue;
-      }
-      if (gitdir === path.join(dir, ".git")) fs.rmSync(path.join(admin, name), { recursive: true, force: true });
+    try {
+      await $`git -C ${root} worktree remove --force ${dir}`.quiet();
+    } catch {
+      // Older git refuses an entry whose folder is gone: handled below.
     }
+    if ((await worktreePaths($, root)).includes(dir)) {
+      const common = await gitText($`git -C ${root} rev-parse --path-format=absolute --git-common-dir`);
+      const admin = common ? path.join(common, "worktrees") : null;
+      for (const name of admin && fs.existsSync(admin) ? fs.readdirSync(admin) : []) {
+        let gitdir = "";
+        try {
+          gitdir = fs.readFileSync(path.join(admin, name, "gitdir"), "utf8").trim();
+        } catch {
+          continue;
+        }
+        // worktree.useRelativePaths writes it relative to the entry.
+        if (path.resolve(admin, name, gitdir) === path.join(dir, ".git")) fs.rmSync(path.join(admin, name), { recursive: true, force: true });
+      }
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+    return !fs.existsSync(dir) && !(await worktreePaths($, root)).includes(dir);
+  } finally {
+    // Let go even when the removal throws, so a later sweep can take it.
+    LIVE_CHECKOUTS.delete(dir);
   }
-  fs.rmSync(dir, { recursive: true, force: true });
-  LIVE_CHECKOUTS.delete(dir);
-  return !fs.existsSync(dir) && !(await worktreePaths($, root)).includes(dir);
+}
+
+function isOrphan(dir) {
+  const pid = Number(WORKTREE_NAME.exec(path.basename(dir))[1]);
+  return pid === process.pid ? !LIVE_CHECKOUTS.has(dir) : !processAlive(pid);
+}
+
+// The common git folder of the repository a checkout belongs to, read from
+// the checkout's own `.git` file; null when it has none.
+function commonDirOf(dir) {
+  try {
+    const line = fs.readFileSync(path.join(dir, ".git"), "utf8").trim();
+    if (!line.startsWith("gitdir: ")) return null;
+    const gitdir = path.resolve(dir, line.slice("gitdir: ".length));
+    let common = path.resolve(gitdir, "..", "..");
+    try {
+      common = path.resolve(gitdir, fs.readFileSync(path.join(gitdir, "commondir"), "utf8").trim());
+    } catch {
+      // No commondir file: the layout <common>/worktrees/<name> stands.
+    }
+    return fs.existsSync(common) ? common : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
- * Removes the orphaned review checkouts of `root` in `parentDir`: those
- * whose process is gone, and this process's that no review holds. Another
- * live process's checkouts and every entry outside the folder are left
- * alone.
+ * Removes the orphaned review checkouts in `parentDir`: those whose process
+ * is gone, and this process's that no review holds. First `root`'s entries
+ * (also one whose folder a temp cleaner deleted), then every own-named
+ * folder left in `parentDir`, whatever repository it belongs to (found
+ * through its `.git` file; a folder without one is removed as it is).
+ * Another live process's checkouts and every entry outside the folder are
+ * left alone, and `git worktree prune` is never run.
  */
 export async function sweepOrphanWorktrees($, root, parentDir) {
   for (const dir of await worktreePaths($, root)) {
-    if (!isOwnCheckout(dir, parentDir)) continue;
-    const pid = Number(WORKTREE_NAME.exec(path.basename(dir))[1]);
-    const orphan = pid === process.pid ? !LIVE_CHECKOUTS.has(dir) : !processAlive(pid);
-    if (orphan) await removeReviewWorktree($, root, dir, parentDir);
+    if (isOwnCheckout(dir, parentDir) && isOrphan(dir)) await removeReviewWorktree($, root, dir, parentDir);
+  }
+  let names = [];
+  try {
+    names = fs.readdirSync(parentDir);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    const dir = path.join(parentDir, name);
+    if (!isOwnCheckout(dir, parentDir) || !isOrphan(dir)) continue;
+    const common = commonDirOf(dir);
+    if (common) await removeReviewWorktree($, common, dir, parentDir).catch(() => false);
+    else fs.rmSync(dir, { recursive: true, force: true });
   }
 }
 

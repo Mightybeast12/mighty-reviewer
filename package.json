@@ -13,6 +13,7 @@
     "index.js",
     "v2.js",
     "branch.js",
+    "branch-store.js",
     "tui.js",
     "sidebar.js",
     "internals.js",

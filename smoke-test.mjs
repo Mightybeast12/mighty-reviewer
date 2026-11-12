@@ -31,6 +31,17 @@ assert.equal(tuiPlugin.id, "mighty-reviewer", "tui companion shares the plugin i
 assert.equal(typeof tuiPlugin.setup, "function", "tui companion exports setup");
 const plugin = MightyReviewer;
 
+// Branch reviews persist to the plugin's store under XDG_DATA_HOME (section
+// 35): every review this file starts writes to a scratch store, never the
+// real one.
+{
+  const { mkdtempSync, mkdirSync } = await import("node:fs");
+  const pathMod = await import("node:path");
+  const base = pathMod.join(os.tmpdir(), "opencode", "reviewer-test");
+  mkdirSync(base, { recursive: true });
+  process.env.XDG_DATA_HOME = mkdtempSync(pathMod.join(base, "xdg-"));
+}
+
 // opencode v1 calls EVERY function export of the plugin entry point as a
 // plugin factory, so any extra export (helpers returning null) bricks
 // opencode at bootstrap.
@@ -2106,6 +2117,171 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     assert.equal(created.length, createdBefore, "neither created a session");
     assert.equal(listed(), before, "nor a checkout");
     assert.ok((await call({ repo, base: "base-x", head: "lane/x", worktree: true })).includes("verdict: NO-SHIP"), "and a refused rerun leaves the last verdict readable");
+  } finally {
+    for (const h of instances) await h.dispose();
+    fs.rmSync(box, { recursive: true, force: true });
+  }
+}
+
+// 35. Branch reviews survive a reload (backlog B15): review_branch keeps
+//     each review in the plugin's own store (branchStoreDir, default
+//     $XDG_DATA_HOME/mighty-reviewer/branch-reviews), so a hot reload, which
+//     imports the module afresh, loses no finished result and adopts a
+//     running review of the same process (its idle is still recorded). A
+//     running entry of a process that is gone reads as lost, one of a live
+//     process as running until that process records its end. Files are
+//     private, a broken file is skipped, and at most 50 finished entries
+//     are kept.
+{
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const { execFileSync, spawnSync } = await import("node:child_process");
+  const { branchStoreFile } = await import("./branch-store.js");
+  const scratch = path.join(os.tmpdir(), "opencode", "reviewer-test");
+  fs.mkdirSync(scratch, { recursive: true });
+  const box = fs.realpathSync(fs.mkdtempSync(path.join(scratch, "store-")));
+  const repo = path.join(box, "repo");
+  const storeDir = path.join(box, "store");
+  const instances = [];
+  try {
+    fs.mkdirSync(repo);
+    const git = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
+    git("init", "-q");
+    git("config", "user.email", "smoke@example.invalid");
+    git("config", "user.name", "smoke");
+    fs.writeFileSync(path.join(repo, "a.js"), "export const a = 1;\n");
+    git("add", "a.js");
+    git("commit", "-q", "-m", "base");
+    git("branch", "base-x");
+    for (const lane of ["x", "y", "z", "w"]) {
+      git("checkout", "-q", "-b", `lane/${lane}`, "base-x");
+      fs.writeFileSync(path.join(repo, `${lane}.js`), `export const ${lane} = 2;\n`);
+      git("add", `${lane}.js`);
+      git("commit", "-q", "-m", lane);
+    }
+
+    const reports = new Map();
+    const created = [];
+    let n = 0;
+    let failPrompt = false;
+    const client = {
+      v2: true,
+      tui: { showToast: async () => {} },
+      app: { log: async () => {} },
+      session: {
+        get: async ({ path: p }) => ({ data: { id: p.id } }),
+        create: async ({ body }) => {
+          created.push(body);
+          return { data: { id: `store-review-${++n}` } };
+        },
+        update: async () => {},
+        abort: async () => {},
+        promptAsync: async () => {
+          if (failPrompt) throw new Error("prompt refused by the host");
+        },
+        messages: async ({ path: p }) => [{ info: { role: "assistant" }, parts: [{ type: "text", text: reports.get(p.id) ?? "" }] }],
+      },
+    };
+    const make = async (factory, extra = {}) => {
+      const h = await factory({ client, directory: repo, worktree: repo, $: makeShell() }, { idleDebounceMs: 0, updateCheck: false, branchStoreDir: storeDir, ...extra });
+      instances.push(h);
+      return h;
+    };
+    const call = (h, args, sessionID = "orch-store") => h.tool.review_branch.execute(args, { sessionID });
+    const idle = (h, id) => h.event({ event: { type: "session.idle", properties: { sessionID: id } } });
+
+    // Every local module a published file imports is published too (a
+    // missing one breaks the installed plugin at its first import).
+    const pkg = JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url), "utf8"));
+    for (const file of pkg.files.filter((f) => f.endsWith(".js"))) {
+      const text = fs.readFileSync(new URL(`./${file}`, import.meta.url), "utf8");
+      for (const [, dep] of text.matchAll(/from\s+"\.\/([\w.-]+\.js)"/g)) {
+        assert.ok(pkg.files.includes(dep), `${file} imports ./${dep}, which package.json's files list must name`);
+      }
+    }
+
+    // Before the reload: one review finished NO-SHIP, one still running.
+    const a = await make(plugin);
+    assert.ok((await call(a, { repo, base: "base-x", head: "lane/x" })).includes("Branch review started"));
+    reports.set("store-review-1", "- P1 x.js:1 constant\n\nNO-SHIP");
+    await idle(a, "store-review-1");
+    assert.ok((await call(a, { repo, base: "base-x", head: "lane/y" })).includes("Branch review started"));
+    assert.equal(fs.statSync(storeDir).mode & 0o777, 0o700, "the store folder is private");
+    const files = fs.readdirSync(storeDir).filter((f) => f.endsWith(".json"));
+    assert.equal(files.length, 2, `one file per review: ${files.join(",")}`);
+    for (const f of files) assert.equal(fs.statSync(path.join(storeDir, f)).mode & 0o777, 0o600, `and each file too: ${f}`);
+    fs.writeFileSync(path.join(storeDir, "broken.json"), "{ not json");
+    await a.dispose();
+
+    // The reload: a fresh copy of the module, as OpenCode 2 imports it.
+    const fresh = (await import(`./index.js?reload=${Date.now()}`)).MightyReviewer;
+    const b = await make(fresh);
+    const before = created.length;
+    const listedAfter = await b.tool.review_status.execute({}, { sessionID: "orch-store" });
+    assert.ok(listedAfter.includes("lane/x") && listedAfter.includes("done: NO-SHIP") && listedAfter.includes("lane/y") && listedAfter.includes("running"), `review_status lists both after the reload: ${listedAfter}`);
+    // The running review's idle arrives before anything reads it.
+    reports.set("store-review-2", "- P3 y.js:1 naming\n\nSHIP");
+    await idle(b, "store-review-2");
+    const x = await call(b, { repo, base: "base-x", head: "lane/x" });
+    assert.ok(x.includes("verdict: NO-SHIP") && x.includes("x.js:1 constant"), `a finished review is read back after the reload: ${x}`);
+    const y = await call(b, { repo, base: "base-x", head: "lane/y" });
+    assert.ok(y.includes("verdict: SHIP") && y.includes("y.js:1 naming"), `a running review of this process is adopted, and its idle recorded: ${y}`);
+    assert.equal(created.length, before, "and neither starts a new review");
+
+    // A failed start leaves nothing in the store.
+    failPrompt = true;
+    assert.ok((await call(b, { repo, base: "base-x", head: "lane/w" })).includes("Branch review not started"));
+    failPrompt = false;
+    const wKey = `${repo}\u0000${git("rev-parse", "base-x")}\u0000${git("rev-parse", "lane/w")}`;
+    assert.equal(fs.existsSync(branchStoreFile(storeDir, wKey)), false, "a failed start leaves no entry in the store");
+
+    // A running entry whose process is gone reads as lost; rerun restarts.
+    const deadPid = spawnSync(process.execPath, ["-e", ""]).pid;
+    const yFile = files.map((f) => path.join(storeDir, f)).find((f) => JSON.parse(fs.readFileSync(f, "utf8")).headRef === "lane/y");
+    const zEntry = { ...JSON.parse(fs.readFileSync(yFile, "utf8")) };
+    const zSha = git("rev-parse", "lane/z");
+    const baseSha = git("rev-parse", "base-x");
+    Object.assign(zEntry, { headRef: "lane/z", headSha: zSha, key: `${zEntry.root}\u0000${baseSha}\u0000${zSha}`, status: "running", verdict: null, report: null, finishedAt: null, pid: deadPid, reviewSessionID: "store-review-gone" });
+    fs.writeFileSync(branchStoreFile(storeDir, zEntry.key), JSON.stringify(zEntry), { mode: 0o600 });
+    const fresh2 = (await import(`./index.js?reload=${Date.now()}-2`)).MightyReviewer;
+    const c = await make(fresh2);
+    const z = await call(c, { repo, base: "base-x", head: "lane/z" });
+    assert.ok(z.includes("lost") && z.includes("rerun: true"), `a dead process's running review reads as lost: ${z}`);
+    assert.ok((await call(c, { repo, base: "base-x", head: "lane/z", rerun: true })).includes("Branch review started"), "and rerun: true restarts it");
+
+    // A live process's running entry stays running until that process
+    // records its end in the store.
+    const other = { ...zEntry, headRef: "lane/x", headSha: git("rev-parse", "lane/x"), pid: process.ppid, reviewSessionID: "store-review-other" };
+    other.key = `${other.root}\u0000${baseSha}\u0000${other.headSha}`;
+    // Another process of the same user took lane/x over in the store.
+    fs.writeFileSync(branchStoreFile(storeDir, other.key), JSON.stringify(other), { mode: 0o600 });
+    const fresh3 = (await import(`./index.js?reload=${Date.now()}-3`)).MightyReviewer;
+    const d = await make(fresh3);
+    assert.ok((await call(d, { repo, base: "base-x", head: "lane/x" })).includes("still running"), "a live process's running review reads as running");
+    fs.writeFileSync(branchStoreFile(storeDir, other.key), JSON.stringify({ ...other, status: "done", verdict: "SHIP", report: "- P3 x.js:1 nit\n\nSHIP", finishedAt: Date.now() }), { mode: 0o600 });
+    assert.ok((await call(d, { repo, base: "base-x", head: "lane/x" })).includes("verdict: SHIP"), "and its end is read from the store once that process writes it");
+
+    // At most 50 finished entries stay in the store, the newest.
+    const many = (await import(`./index.js?reload=${Date.now()}-4`)).MightyReviewer;
+    const e = await make(many);
+    for (let i = 0; i < 55; i++) {
+      fs.writeFileSync(path.join(storeDir, `old-${i}.json`), JSON.stringify({ ...other, key: `k-${i}`, status: "done", verdict: "SHIP", report: "r", startedAt: i, finishedAt: i }), { mode: 0o600 });
+    }
+    // lane/z's rerun (started by the previous copy) is running; its end is a
+    // save, which prunes.
+    reports.set(`store-review-${n}`, "SHIP");
+    await idle(e, `store-review-${n}`);
+    const kept = fs.readdirSync(storeDir).filter((f) => f.endsWith(".json"));
+    const finished = kept.filter((f) => {
+      try {
+        return JSON.parse(fs.readFileSync(path.join(storeDir, f), "utf8")).status === "done";
+      } catch {
+        return false;
+      }
+    });
+    assert.ok(finished.length <= 50, `at most 50 finished entries are kept: ${finished.length}`);
+    assert.ok(!kept.includes("old-0.json") && kept.includes("old-54.json"), "the oldest go first");
+    assert.ok(kept.includes("broken.json"), "and a file the store cannot read is left alone");
   } finally {
     for (const h of instances) await h.dispose();
     fs.rmSync(box, { recursive: true, force: true });

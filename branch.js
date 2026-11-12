@@ -203,7 +203,7 @@ function isOwnCheckout(dir, parentDir) {
   return path.dirname(dir) === parentDir && WORKTREE_NAME.test(path.basename(dir));
 }
 
-function processAlive(pid) {
+export function processAlive(pid) {
   try {
     process.kill(pid, 0);
     return true;

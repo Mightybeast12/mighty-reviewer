@@ -129,7 +129,8 @@
  *             a failed start, the deadline or a reload, so the critics read
  *             head's files and the gates run there. Options:
  *             branchMaxDiffLines (default 6000), branchTimeoutMs (default
- *             twice timeoutMs), branchWorktreeDir.
+ *             twice timeoutMs), branchWorktreeDir, branchStoreDir (each
+ *             review is also kept there, so a reload loses no result).
  * Scope:      Only ROOT sessions are reviewed. Child sessions (subagents
  *             spawned via the task tool, other plugins' background sessions)
  *             are never reviewed on their own; edits they make are credited
@@ -138,7 +139,7 @@
  * Options:    { disabled, model, criticModel, agent, maxDiffLines, ignore,
  *             idleDebounceMs, timeoutMs, enforceNoShip, progressToasts, quiet,
  *             updateCheck, autoUpdate, branchMaxDiffLines, branchTimeoutMs,
- *             branchWorktreeDir }
+ *             branchWorktreeDir, branchStoreDir }
  *             via the plugin tuple form.
  * Opt-out:    set MIGHTY_REVIEWER_DISABLE=1, or pass { disabled: true }
  *             via the plugin tuple form in opencode.json.
@@ -166,11 +167,13 @@ import {
   defaultWorktreeParent,
   evictFinishedBranchReviews,
   prepareWorktreeParent,
+  processAlive,
   readableRepoPath,
   removeReviewWorktree,
   resolveBranchRange,
   shortRange,
 } from "./branch.js";
+import { defaultBranchStoreDir, forgetBranchReview, loadBranchReview, loadBranchReviews, saveBranchReview } from "./branch-store.js";
 
 const REVIEW_MARKER = "<!--adversarial-review-auto-->";
 const FEEDBACK_MARKER = "<!--adversarial-review-feedback-->";
@@ -234,6 +237,9 @@ const RISK_AGENT = "adversarial-risk-critic";
 const DESIGN_AGENT = "design-principles-critic";
 const SECURITY_AGENT = "security-checklist-critic";
 const SLOP_AGENT = "ai-slop-critic";
+const BRANCH_LOST_REPORT =
+  "Branch review lost: the process that ran it ended before its verdict was recorded. Call review_branch with rerun: true to start it again.";
+
 const BRANCH_RELOAD_REPORT =
   "Branch review ended by a plugin reload before its verdict; its checkout was removed. Call review_branch with rerun: true to start it again.";
 
@@ -783,6 +789,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
   const branchTimeoutMs =
     Number.isFinite(options.branchTimeoutMs) && options.branchTimeoutMs > 0 ? options.branchTimeoutMs : reviewTimeoutMs * 2;
   const branchWorktreeDir = options.branchWorktreeDir ?? defaultWorktreeParent();
+  const branchStoreDir = options.branchStoreDir ?? defaultBranchStoreDir();
 
   // sessionID -> parentID (or null for a root session). Asked of the server
   // once per session; the parent link never changes.
@@ -1508,6 +1515,59 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       finishedAt: Date.now(),
       timer: null,
     });
+    saveBranchReview(branchStoreDir, key, state);
+    return state;
+  }
+
+  // Ends a branch review at its deadline: recorded as timed out, its
+  // session aborted, its checkout removed.
+  function armBranchDeadline(state, reviewSessionID, ms) {
+    state.timerOwner = ownedTimers;
+    state.timer = ownTimer(
+      setTimeout(async () => {
+        if (!branchReviewSessions.has(reviewSessionID)) return;
+        finishBranchReview(reviewSessionID, null, `Branch review timed out after ${Math.round(branchTimeoutMs / 60000)} minutes and was aborted.`);
+        try {
+          await client.session.abort({ path: { id: reviewSessionID } });
+        } catch {
+          // Abort is best-effort.
+        }
+        await releaseBranchWorktree(state);
+      }, Math.max(0, ms)),
+    );
+  }
+
+  // A stored entry made usable here. A running review of this process (a
+  // copy of the module before a hot reload) is adopted: its idle is
+  // recorded here and its deadline rearmed. One of another live process
+  // stays running until that process stores its end. Anything else that
+  // was running can no longer finish and reads as lost.
+  function settleStoredBranchReview(entry) {
+    const state = { ...entry, timer: null, timerOwner: null, owner: null, parentDir: null, checkout: null };
+    if (state.status !== "running") return state;
+    const deadline = Number.isFinite(state.deadline) ? state.deadline : (state.startedAt ?? 0) + branchTimeoutMs;
+    if (state.pid === process.pid && !state.worktree && state.reviewSessionID && Date.now() < deadline) {
+      state.owner = ownedTimers;
+      branchReviewSessions.set(state.reviewSessionID, state.key);
+      armBranchDeadline(state, state.reviewSessionID, deadline - Date.now());
+      return state;
+    }
+    if (state.pid !== process.pid && Number.isInteger(state.pid) && processAlive(state.pid) && Date.now() < deadline) return state;
+    Object.assign(state, { status: "done", verdict: null, report: BRANCH_LOST_REPORT, finishedAt: Date.now() });
+    saveBranchReview(branchStoreDir, state.key, state);
+    return state;
+  }
+
+  // The entry for `key`, read again from the store when this copy has none
+  // or holds another process's running one, so a reload or a second
+  // process loses nothing.
+  function branchReviewFor(key) {
+    const entry = branchReviews.get(key);
+    if (entry && !(entry.status === "running" && entry.pid !== process.pid)) return entry;
+    const stored = loadBranchReview(branchStoreDir, key);
+    if (!stored) return entry;
+    const state = settleStoredBranchReview(stored);
+    branchReviews.set(key, state);
     return state;
   }
 
@@ -1541,7 +1601,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
     const useWorktree = args?.worktree === true;
     const key = useWorktree ? `${branchKey(range)}\u0000worktree` : branchKey(range);
     const known = () => {
-      const entry = branchReviews.get(key);
+      const entry = branchReviewFor(key);
       return entry && (args?.rerun !== true || (entry.status === "running" && !isStaleBranchReview(entry))) ? entry : null;
     };
     if (known()) return describeBranchReview(known());
@@ -1561,11 +1621,14 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
     // reads this entry instead of starting a second review.
     const state = {
       ...range,
+      key,
       status: "running",
       requestedBy: sessionID,
       reviewSessionID: null,
       startedAt: Date.now(),
       finishedAt: null,
+      deadline: Date.now() + branchTimeoutMs,
+      pid: process.pid,
       verdict: null,
       report: null,
       timer: null,
@@ -1608,19 +1671,8 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       if (!reviewSessionID) throw new Error("session.create returned no id");
       state.reviewSessionID = reviewSessionID;
       branchReviewSessions.set(reviewSessionID, key);
-      state.timerOwner = ownedTimers;
-      state.timer = ownTimer(
-        setTimeout(async () => {
-          if (!branchReviewSessions.has(reviewSessionID)) return;
-          finishBranchReview(reviewSessionID, null, `Branch review timed out after ${Math.round(branchTimeoutMs / 60000)} minutes and was aborted.`);
-          try {
-            await client.session.abort({ path: { id: reviewSessionID } });
-          } catch {
-            // Abort is best-effort.
-          }
-          await releaseBranchWorktree(state);
-        }, branchTimeoutMs),
-      );
+      armBranchDeadline(state, reviewSessionID, branchTimeoutMs);
+      saveBranchReview(branchStoreDir, key, state);
       await sendPrompt(reviewSessionID, reviewPrompt, {
         tools: { ...ORCHESTRATOR_TOOLS },
         ...(reviewAgent ? { agent: reviewAgent } : {}),
@@ -1641,7 +1693,10 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
         }
       }
       await releaseBranchWorktree(state);
-      if (branchReviews.get(key) === state) branchReviews.delete(key);
+      if (branchReviews.get(key) === state) {
+        branchReviews.delete(key);
+        forgetBranchReview(branchStoreDir, key);
+      }
       return `Branch review not started: ${String(err?.message ?? err)}`;
     }
   }
@@ -1693,6 +1748,14 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       // Update checking is best-effort and must never break the plugin.
     }
   }
+
+  // What a previous copy of the module stored (a hot reload imports it
+  // afresh): finished results come back, and a running review of this
+  // process is adopted before its idle can arrive.
+  for (const entry of loadBranchReviews(branchStoreDir)) {
+    if (!branchReviews.has(entry.key)) branchReviews.set(entry.key, settleStoredBranchReview(entry));
+  }
+  evictFinishedBranchReviews(branchReviews);
 
   if (updateCheck && !updateCheckScheduled) {
     updateCheckScheduled = true;
@@ -1891,6 +1954,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
         const sessionID = state.reviewSessionID;
         if (!sessionID || !finishBranchReview(sessionID, null, BRANCH_RELOAD_REPORT)) {
           Object.assign(state, { status: "done", verdict: null, report: BRANCH_RELOAD_REPORT, finishedAt: Date.now(), timer: null });
+          saveBranchReview(branchStoreDir, state.key, state);
         }
         releases.push(
           (async () => {

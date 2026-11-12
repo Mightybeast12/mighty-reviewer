@@ -1,8 +1,10 @@
 // Captures what one review_branch start sends and runs, with every path
 // and commit replaced by a placeholder, so a branch start can be compared
 // byte for byte with a recorded one (smoke-test.mjs section 34 compares the
-// start without `worktree` with test/branch-0.12.0.json, which this
-// function recorded on 0.12.0). It takes the plugin factory and the shell
+// start without `worktree` with test/branch-plain.json, which this
+// function recorded: on 0.12.0 first, and again when backlog B16 changed
+// three lines of the branch prompt, the diff checked to be exactly those).
+// It takes the plugin factory and the shell
 // maker as arguments, so the same capture runs on any version's files.
 
 import { execFileSync } from "node:child_process";

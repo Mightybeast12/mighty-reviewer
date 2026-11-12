@@ -1718,9 +1718,11 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
 //     inside a work tree of the repository, and removes it after SHIP,
 //     NO-SHIP, a failed start, the deadline and a reload. The review
 //     session may read that checkout (its critics' sessions inherit its
-//     rules), and the gates and 5c's diagnostics run there. Without the option a branch start is
-//     byte for byte 0.12.0's (test/branch-0.12.0.json, recorded on 0.12.0
-//     by test/branch-capture.mjs).
+//     rules), and the gates and 5c's diagnostics run there. Without the
+//     option a branch start is byte for byte the recorded plain one
+//     (test/branch-plain.json, made by test/branch-capture.mjs: on 0.12.0
+//     first, recorded again when B16 changed three lines of the branch
+//     prompt).
 {
   const fs = await import("node:fs");
   const path = await import("node:path");
@@ -1731,9 +1733,9 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
   const scratch = path.join(os.tmpdir(), "opencode", "reviewer-test");
   fs.mkdirSync(scratch, { recursive: true });
 
-  const recorded = JSON.parse(readFileSync(new URL("./test/branch-0.12.0.json", import.meta.url), "utf8"));
+  const recorded = JSON.parse(readFileSync(new URL("./test/branch-plain.json", import.meta.url), "utf8"));
   const offPath = await captureBranchStart({ plugin, makeShell, scratch });
-  assert.deepEqual(offPath, recorded, "without worktree a branch start sends, creates and runs exactly what 0.12.0's did");
+  assert.deepEqual(offPath, recorded, "without worktree a branch start sends, creates and runs exactly the recorded plain start");
   const offFalse = await captureBranchStart({ plugin, makeShell, scratch, args: { worktree: false } });
   assert.deepEqual(offFalse, recorded, "and so does worktree: false");
   assert.equal(defaultWorktreeParent(), path.join(os.tmpdir(), "mighty-reviewer-worktrees"), "the default checkout folder is in the system's temporary folder");
@@ -2285,6 +2287,89 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
   } finally {
     for (const h of instances) await h.dispose();
     fs.rmSync(box, { recursive: true, force: true });
+  }
+}
+
+// 36. Branch review severity (backlog B16, E1 round 1's false NO-SHIP on
+//     c659b): in a branch review a finding about comments, documentation
+//     or other prose alone is at most P2 and never makes the verdict
+//     NO-SHIP, the verdict word stands only on the verdict line, and a
+//     report whose text also states the other verdict is flagged when it
+//     is read back. The automatic review's prompt keeps its rules.
+{
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const { execFileSync } = await import("node:child_process");
+  const scratch = path.join(os.tmpdir(), "opencode", "reviewer-test");
+  fs.mkdirSync(scratch, { recursive: true });
+  const repo = fs.realpathSync(fs.mkdtempSync(path.join(scratch, "severity-")));
+  let hooks;
+  try {
+    const git = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
+    git("init", "-q");
+    git("config", "user.email", "smoke@example.invalid");
+    git("config", "user.name", "smoke");
+    fs.writeFileSync(path.join(repo, "a.js"), "export const a = 1;\n");
+    git("add", "a.js");
+    git("commit", "-q", "-m", "base");
+    git("branch", "base-x");
+    for (const lane of ["x", "y"]) {
+      git("checkout", "-q", "-b", `lane/${lane}`, "base-x");
+      fs.writeFileSync(path.join(repo, `${lane}.js`), `export const ${lane} = 2;\n`);
+      git("add", `${lane}.js`);
+      git("commit", "-q", "-m", lane);
+    }
+    const prompts = new Map();
+    const reports = new Map();
+    let n = 0;
+    const client = {
+      v2: true,
+      tui: { showToast: async () => {} },
+      app: { log: async () => {} },
+      session: {
+        get: async ({ path: p }) => ({ data: { id: p.id } }),
+        create: async () => ({ data: { id: `sev-review-${++n}` } }),
+        update: async () => {},
+        abort: async () => {},
+        promptAsync: async ({ path: p, body }) => prompts.set(p.id, body.parts[0].text),
+        messages: async ({ path: p }) => [{ info: { role: "assistant" }, parts: [{ type: "text", text: reports.get(p.id) ?? "" }] }],
+      },
+    };
+    hooks = await plugin({ client, directory: repo, worktree: repo, $: makeShell() }, { idleDebounceMs: 0, updateCheck: false });
+    const call = (args) => hooks.tool.review_branch.execute(args, { sessionID: "orch-sev" });
+    const idle = (id) => hooks.event({ event: { type: "session.idle", properties: { sessionID: id } } });
+
+    assert.ok((await call({ repo, base: "base-x", head: "lane/x" })).includes("Branch review started"));
+    const branchPrompt = prompts.get("sev-review-1");
+    const proseRule = "A finding about comments, documentation or other prose alone, with no change in behaviour, is at most P2 in this review and never makes the verdict NO-SHIP.";
+    assert.ok(branchPrompt.includes(proseRule), "a branch review caps a prose-only finding at P2 in its verdict rule");
+    assert.ok(branchPrompt.includes("P2 at most in a branch review, where a finding about prose alone never blocks the range"), "and in the slop critic's standing order");
+    assert.ok(!branchPrompt.includes("P1 only for chatbot residue"), "which no longer makes false documentation P1 there");
+    assert.ok(branchPrompt.includes("Write SHIP or NO-SHIP only as the verdict line itself: never start any other line of the report with either word."), "the verdict word stands on the verdict line only");
+
+    // The automatic review of a coding turn keeps its rules.
+    const ordinary = await makeHarness("SHIP", { options: { updateCheck: false } });
+    await ordinary.turn("parent-sev", "edit");
+    const ordinaryPrompt = ordinary.promptCalls[0]?.text ?? "";
+    assert.ok(ordinaryPrompt.includes("<!--adversarial-review-auto-->"), "the automatic review ran");
+    assert.ok(ordinaryPrompt.includes("P1 only for chatbot residue or placeholder text in shipped text and for documentation that is false about the code"), "the automatic review's slop order is unchanged");
+    assert.ok(!ordinaryPrompt.includes(proseRule) && !ordinaryPrompt.includes("verdict line itself"), "and it gets neither branch rule");
+    ordinary.hooks.dispose();
+
+    // A report whose text states the other verdict is flagged on reading.
+    reports.set("sev-review-1", "## Findings\n- P2 x.js:1 naming\n\nNO-SHIP, adversarial verification found no verified P0 or P1. The verdict below follows the rule.\n\nSHIP");
+    await idle("sev-review-1");
+    const flagged = await call({ repo, base: "base-x", head: "lane/x" });
+    assert.ok(flagged.includes("verdict: SHIP"), `the verdict is still the last line's: ${flagged}`);
+    assert.ok(flagged.includes("note: the report's text also states NO-SHIP (\"NO-SHIP, adversarial verification found no verified P0 or P1."), `and the contradicting line is named: ${flagged}`);
+    assert.ok((await call({ repo, base: "base-x", head: "lane/y" })).includes("Branch review started"));
+    reports.set("sev-review-2", "## Findings\n- P3 y.js:1 a rule that would make this NO-SHIP if it were behaviour\n\nVerdict:\nSHIP");
+    await idle("sev-review-2");
+    const clean = await call({ repo, base: "base-x", head: "lane/y" });
+    assert.ok(clean.includes("verdict: SHIP") && !clean.includes("note: the report's text"), `a verdict word inside a sentence is not flagged: ${clean}`);
+  } finally {
+    hooks?.dispose();
+    fs.rmSync(repo, { recursive: true, force: true });
   }
 }
 

@@ -91,6 +91,29 @@ export function extractVerdict(text) {
   return null;
 }
 
+/**
+ * A line of `text`, other than its verdict line, that starts with the
+ * opposite verdict word (after list and emphasis marks), cut to 120
+ * characters; or null. extractVerdict reads the last standalone verdict
+ * line, so a report can say one verdict in its text and end with the
+ * other; this names such a line for whoever reads the report.
+ */
+export function verdictConflict(text, verdict) {
+  if (typeof text !== "string" || (verdict !== "SHIP" && verdict !== "NO-SHIP")) return null;
+  const other = verdict === "SHIP" ? /^NO-SHIP(?=$|[\s,.:;!])/ : /^SHIP(?=$|[\s,.:;!])/;
+  const lines = text.split("\n");
+  let verdictLine = -1;
+  for (let i = lines.length - 1; i >= 0 && verdictLine === -1; i--) {
+    if (extractVerdict(lines[i]) === verdict) verdictLine = i;
+  }
+  for (let i = 0; i < lines.length; i++) {
+    if (i === verdictLine) continue;
+    const line = lines[i].replace(/[*_`]/g, "").replace(/^\s*(?:#{1,6}|[->]|\d+\.)?\s*(?:verdict\s*:)?\s*/i, "");
+    if (other.test(line)) return line.trim().slice(0, 120);
+  }
+  return null;
+}
+
 export function compareSemver(a, b) {
   const parse = (v) => {
     const [core, ...pre] = String(v).split("-");

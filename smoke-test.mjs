@@ -35,11 +35,14 @@ const plugin = MightyReviewer;
 // 35): every review this file starts writes to a scratch store, never the
 // real one.
 {
-  const { mkdtempSync, mkdirSync } = await import("node:fs");
+  const { mkdtempSync, mkdirSync, rmSync } = await import("node:fs");
   const pathMod = await import("node:path");
   const base = pathMod.join(os.tmpdir(), "opencode", "reviewer-test");
   mkdirSync(base, { recursive: true });
-  process.env.XDG_DATA_HOME = mkdtempSync(pathMod.join(base, "xdg-"));
+  const xdg = mkdtempSync(pathMod.join(base, "xdg-"));
+  process.env.XDG_DATA_HOME = xdg;
+  // Gone when the run ends, passed or failed.
+  process.on("exit", () => rmSync(xdg, { recursive: true, force: true }));
 }
 
 // opencode v1 calls EVERY function export of the plugin entry point as a

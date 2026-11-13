@@ -1724,8 +1724,8 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
 //     rules), and the gates and 5c's diagnostics run there. Without the
 //     option a branch start is byte for byte the recorded plain one
 //     (test/branch-plain.json, made by test/branch-capture.mjs: on 0.12.0
-//     first, recorded again when B16 changed three lines of the branch
-//     prompt).
+//     first, recorded again for B16's three prompt lines and for the
+//     critic's tightened wording, each diff checked to be those lines).
 {
   const fs = await import("node:fs");
   const path = await import("node:path");
@@ -2293,12 +2293,13 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
   }
 }
 
-// 36. Branch review severity (backlog B16, E1 round 1's false NO-SHIP on
-//     c659b): in a branch review a finding about comments, documentation
-//     or other prose alone is at most P2 and never makes the verdict
-//     NO-SHIP, the verdict word stands only on the verdict line, and a
-//     report whose text also states the other verdict is flagged when it
-//     is read back. The automatic review's prompt keeps its rules.
+// 36. Review severity (backlog B16, E1 round 1's false NO-SHIP on c659b;
+//     B16a, the owner's yes of 2026-11-13): in every review a finding
+//     about comments, documentation or other prose alone is at most P2 and
+//     never makes the verdict NO-SHIP, unless the prose is right and the
+//     code contradicts it or the text states a guarantee the code lacks.
+//     A branch review also keeps the verdict word to the verdict line, and
+//     a report whose text states the other verdict is flagged when read.
 {
   const fs = await import("node:fs");
   const path = await import("node:path");
@@ -2344,19 +2345,23 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
 
     assert.ok((await call({ repo, base: "base-x", head: "lane/x" })).includes("Branch review started"));
     const branchPrompt = prompts.get("sev-review-1");
-    const proseRule = "A finding about comments, documentation or other prose alone, with no change in behaviour, is at most P2 in this review and never makes the verdict NO-SHIP.";
-    assert.ok(branchPrompt.includes(proseRule), "a branch review caps a prose-only finding at P2 in its verdict rule");
-    assert.ok(branchPrompt.includes("P2 at most in a branch review, where a finding about prose alone never blocks the range"), "and in the slop critic's standing order");
-    assert.ok(!branchPrompt.includes("P1 only for chatbot residue"), "which no longer makes false documentation P1 there");
+    const exception = "If the comment or the documentation is right and the code contradicts it, or the text states a guarantee the code lacks (security, data safety, limits), it is a behaviour finding at its own severity.";
+    const proseRule = `A finding about comments, documentation or other prose alone, with no change in behaviour, is at most P2 in this review and never makes the verdict NO-SHIP. ${exception}`;
+    const slopCap = `(P2 at most: a finding about prose alone never blocks the change). ${exception}`;
+    assert.ok(branchPrompt.includes(`   - ${proseRule}`), "a branch review caps a prose-only finding at P2 in its verdict rule, with the exception for a behaviour defect");
+    assert.ok(branchPrompt.includes(slopCap), "and so does the slop critic's standing order");
+    assert.ok(!branchPrompt.includes("P1 only for chatbot residue"), "which no longer makes false documentation P1 by itself");
     assert.ok(branchPrompt.includes("Write SHIP or NO-SHIP only as the verdict line itself: never start any other line of the report with either word."), "the verdict word stands on the verdict line only");
 
-    // The automatic review of a coding turn keeps its rules.
+    // The automatic review of a coding turn gets the same cap (B16a), and
+    // not the branch review's verdict-line rule.
     const ordinary = await makeHarness("SHIP", { options: { updateCheck: false } });
     await ordinary.turn("parent-sev", "edit");
     const ordinaryPrompt = ordinary.promptCalls[0]?.text ?? "";
     assert.ok(ordinaryPrompt.includes("<!--adversarial-review-auto-->"), "the automatic review ran");
-    assert.ok(ordinaryPrompt.includes("P1 only for chatbot residue or placeholder text in shipped text and for documentation that is false about the code"), "the automatic review's slop order is unchanged");
-    assert.ok(!ordinaryPrompt.includes(proseRule) && !ordinaryPrompt.includes("verdict line itself"), "and it gets neither branch rule");
+    assert.ok(ordinaryPrompt.includes(`   - ${proseRule}`) && ordinaryPrompt.includes(slopCap), "the automatic review caps a prose-only finding the same way");
+    assert.ok(!ordinaryPrompt.includes("P1 only for chatbot residue"), "and no longer makes false documentation P1 by itself");
+    assert.ok(!ordinaryPrompt.includes("verdict line itself"), "but keeps its verdict rules otherwise");
     ordinary.hooks.dispose();
 
     // A report whose text states the other verdict is flagged on reading.

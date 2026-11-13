@@ -238,10 +238,13 @@ const RISK_AGENT = "adversarial-risk-critic";
 const DESIGN_AGENT = "design-principles-critic";
 const SECURITY_AGENT = "security-checklist-critic";
 const SLOP_AGENT = "ai-slop-critic";
-// Backlog B16 (E1 round 1, c659b): a branch review answered NO-SHIP on a
-// "P1" that was about comments only.
-const BRANCH_PROSE_RULE =
-  "A finding about comments, documentation or other prose alone, with no change in behaviour, is at most P2 in this review and never makes the verdict NO-SHIP.";
+// Backlog B16 (E1 round 1, c659b: a branch review answered NO-SHIP on a
+// "P1" that was about comments only) and B16a (the owner's yes of
+// 2026-11-13: the same for the automatic review). The exception keeps a
+// behaviour defect that shows up as a comment at its own severity.
+const PROSE_EXCEPTION =
+  "If the comment or the documentation is right and the code contradicts it, or the text states a guarantee the code lacks (security, data safety, limits), it is a behaviour finding at its own severity.";
+const PROSE_RULE = `A finding about comments, documentation or other prose alone, with no change in behaviour, is at most P2 in this review and never makes the verdict NO-SHIP. ${PROSE_EXCEPTION}`;
 
 const BRANCH_LOST_REPORT =
   "Branch review lost: the process that ran it ended before its verdict was recorded. Call review_branch with rerun: true to start it again.";
@@ -543,9 +546,7 @@ function buildReviewPrompt(languageHints, projectRules, timeoutMs, scope = null)
     "      - Report ONLY material findings, each with concrete evidence (file:line) and a severity P0-P3.",
     `   d. \`${SLOP_AGENT}\` - AI-slop critique of code and prose:`,
     "      - Hunt AI-authoring residue in the changed code (narrating comments, needless defensive checks, `any` casts, style drift, emoji) and in every changed line of prose (AI vocabulary, puffery, negative parallelisms, bold inline-header lists, em dashes, chatbot leftovers, placeholder text, leaked citation markup, documentation claims the code does not back).",
-    scope
-      ? "      - Report ONLY material findings, each with concrete evidence (file:line, quoted text) and a severity P2-P3: slop is P3 by default, P2 when a pattern repeats across the diff, for chatbot residue or placeholder text in shipped text, and for documentation that is false about the code. P2 at most in a branch review, where a finding about prose alone never blocks the range."
-      : "      - Report ONLY material findings, each with concrete evidence (file:line, quoted text) and a severity P1-P3: slop is P3 by default, P2 when a pattern repeats across the diff, P1 only for chatbot residue or placeholder text in shipped text and for documentation that is false about the code.",
+    `      - Report ONLY material findings, each with concrete evidence (file:line, quoted text) and a severity P1-P3: slop is P3 by default, P2 when a pattern repeats across the diff, for chatbot residue or placeholder text in shipped text, and for documentation that is false about the code (P2 at most: a finding about prose alone never blocks the change). ${PROSE_EXCEPTION}`,
     "   Use the task tool (named `subagent` on OpenCode 2, where the agent name goes in its `agent` parameter) with subagent_type set to those exact agent names. NEVER substitute a different agent (explore, librarian, general, ...) for a critic: they run with other rubrics. If you have no way to delegate to the critics at all, perform all four critiques yourself in this session, one after another, applying each rubric above.",
     ...(languageHints.length
       ? [
@@ -566,12 +567,8 @@ function buildReviewPrompt(languageHints, projectRules, timeoutMs, scope = null)
     "   If there are no findings, say so in one line.",
     "7. End with ONE terse verdict covering ALL reviews, stated as exactly the single word SHIP or the single word NO-SHIP on its own line:",
     "   - If any mechanical gate failed, or any VERIFIED P0/P1 finding survived, the verdict is NO-SHIP. Do NOT fix anything yourself; the findings list above is the fix list.",
-    ...(scope
-      ? [
-          `   - ${BRANCH_PROSE_RULE}`,
-          "   - Write SHIP or NO-SHIP only as the verdict line itself: never start any other line of the report with either word.",
-        ]
-      : []),
+    `   - ${PROSE_RULE}`,
+    ...(scope ? ["   - Write SHIP or NO-SHIP only as the verdict line itself: never start any other line of the report with either word."] : []),
     "   - If SHIP: say so and stop. Do NOT start unrelated new work.",
     "",
     "Keep it tight. This is a review pass that reports problems; it never rewrites code.",

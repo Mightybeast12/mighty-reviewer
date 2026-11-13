@@ -2,8 +2,9 @@
 // and commit replaced by a placeholder, so a branch start can be compared
 // byte for byte with a recorded one (smoke-test.mjs section 34 compares the
 // start without `worktree` with test/branch-plain.json, which this
-// function recorded: on 0.12.0 first, and again when backlog B16 changed
-// three lines of the branch prompt, the diff checked to be exactly those).
+// function recorded: on 0.12.0 first, and again for backlog B16's three
+// prompt lines and for the critic's tightened wording of 2026-11-13, each
+// diff checked to be exactly those lines).
 // It takes the plugin factory and the shell
 // maker as arguments, so the same capture runs on any version's files.
 

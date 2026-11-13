@@ -111,13 +111,26 @@ export function forgetBranchReview(dir, key) {
   }
 }
 
+// A write in flight lives at most seconds as a .tmp file; one older than
+// this was left by a write that crashed before its rename.
+const STALE_TMP_MS = 3600 * 1000;
+
 function pruneBranchStore(dir, max) {
-  let names = [];
+  let all = [];
   try {
-    names = fs.readdirSync(dir).filter((name) => name.endsWith(".json"));
+    all = fs.readdirSync(dir);
   } catch {
     return;
   }
+  for (const name of all.filter((n) => n.endsWith(".tmp"))) {
+    try {
+      const file = path.join(dir, name);
+      if (Date.now() - fs.statSync(file).mtimeMs > STALE_TMP_MS) fs.rmSync(file, { force: true });
+    } catch {
+      // Gone already, or not ours to read: best-effort.
+    }
+  }
+  const names = all.filter((name) => name.endsWith(".json"));
   const finished = names
     .map((name) => ({ name, entry: readEntry(path.join(dir, name)) }))
     .filter(({ entry }) => entry && entry.status !== "running")

@@ -2196,13 +2196,28 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     const idle = (h, id) => h.event({ event: { type: "session.idle", properties: { sessionID: id } } });
 
     // Every local module a published file imports is published too (a
-    // missing one breaks the installed plugin at its first import).
-    const pkg = JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url), "utf8"));
-    for (const file of pkg.files.filter((f) => f.endsWith(".js"))) {
-      const text = fs.readFileSync(new URL(`./${file}`, import.meta.url), "utf8");
-      for (const [, dep] of text.matchAll(/from\s+"\.\/([\w.-]+\.js)"/g)) {
-        assert.ok(pkg.files.includes(dep), `${file} imports ./${dep}, which package.json's files list must name`);
+    // missing one breaks the installed plugin at its first import): every
+    // relative `from`, `import(` and bare `import`, followed from the
+    // published files, either quote, `../` resolved (mighty-instincts'
+    // smoke/published-files.mjs is the same guard).
+    {
+      const root = new URL("./", import.meta.url);
+      const pkg = JSON.parse(fs.readFileSync(new URL("package.json", root), "utf8"));
+      const covered = (rel) => pkg.files.some((entry) => (entry.endsWith("/") ? rel.startsWith(entry) : rel === entry));
+      const queue = pkg.files.filter((entry) => /\.m?js$/.test(entry));
+      const seen = new Set();
+      while (queue.length) {
+        const file = queue.shift();
+        if (seen.has(file)) continue;
+        seen.add(file);
+        const text = fs.readFileSync(new URL(file, root), "utf8");
+        for (const [, spec] of text.matchAll(/(?:from\s+|import\s*\(\s*|import\s+)["'](\.{1,2}\/[^"']+)["']/g)) {
+          const rel = path.posix.normalize(path.posix.join(path.posix.dirname(file), spec));
+          assert.ok(covered(rel), `${file} imports ${spec} (${rel}), which package.json's files list must cover`);
+          if (/\.m?js$/.test(rel) && fs.existsSync(new URL(rel, root))) queue.push(rel);
+        }
       }
+      assert.ok(seen.has("branch-store.js") && seen.size >= 6, `the guard followed the published modules: ${[...seen].join(",")}`);
     }
 
     // Before the reload: one review finished NO-SHIP, one still running.
@@ -2252,7 +2267,19 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     const c = await make(fresh2);
     const z = await call(c, { repo, base: "base-x", head: "lane/z" });
     assert.ok(z.includes("lost") && z.includes("rerun: true"), `a dead process's running review reads as lost: ${z}`);
+    assert.ok(z.includes("verdict: unknown"), `with no verdict: ${z}`);
+    const zStored = JSON.parse(fs.readFileSync(branchStoreFile(storeDir, zEntry.key), "utf8"));
+    assert.equal(zStored.status, "done", "and the store holds it as done");
+    assert.equal(zStored.verdict ?? null, null, "with no verdict, never SHIP or NO-SHIP");
     assert.ok((await call(c, { repo, base: "base-x", head: "lane/z", rerun: true })).includes("Branch review started"), "and rerun: true restarts it");
+
+    // A live process's running entry past its deadline reads as lost too:
+    // the pid may be reused, and the review is past its time either way.
+    const pastSha = git("rev-parse", "lane/w");
+    const past = { ...zEntry, headRef: "lane/w", headSha: pastSha, key: `${zEntry.root}\u0000${baseSha}\u0000${pastSha}`, pid: process.ppid, deadline: Date.now() - 1000, reviewSessionID: "store-review-past" };
+    fs.writeFileSync(branchStoreFile(storeDir, past.key), JSON.stringify(past), { mode: 0o600 });
+    const pastRead = await call(c, { repo, base: "base-x", head: "lane/w" });
+    assert.ok(pastRead.includes("lost") && pastRead.includes("verdict: unknown"), `a live pid past its deadline reads as lost: ${pastRead}`);
 
     // A live process's running entry stays running until that process
     // records its end in the store.
@@ -2272,10 +2299,20 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     for (let i = 0; i < 55; i++) {
       fs.writeFileSync(path.join(storeDir, `old-${i}.json`), JSON.stringify({ ...other, key: `k-${i}`, status: "done", verdict: "SHIP", report: "r", startedAt: i, finishedAt: i }), { mode: 0o600 });
     }
+    // A temporary file a crashed write left behind is pruned after an hour;
+    // a fresh one (a write in flight) stays.
+    const oldTmp = path.join(storeDir, "crashed.json.1.tmp");
+    const freshTmp = path.join(storeDir, "inflight.json.2.tmp");
+    fs.writeFileSync(oldTmp, "{");
+    fs.writeFileSync(freshTmp, "{");
+    const twoHoursAgo = (Date.now() - 2 * 3600 * 1000) / 1000;
+    fs.utimesSync(oldTmp, twoHoursAgo, twoHoursAgo);
     // lane/z's rerun (started by the previous copy) is running; its end is a
     // save, which prunes.
     reports.set(`store-review-${n}`, "SHIP");
     await idle(e, `store-review-${n}`);
+    assert.equal(fs.existsSync(oldTmp), false, "a temporary file older than an hour is pruned");
+    assert.equal(fs.existsSync(freshTmp), true, "a fresh one is left");
     const kept = fs.readdirSync(storeDir).filter((f) => f.endsWith(".json"));
     const finished = kept.filter((f) => {
       try {
@@ -2287,6 +2324,13 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     assert.ok(finished.length <= 50, `at most 50 finished entries are kept: ${finished.length}`);
     assert.ok(!kept.includes("old-0.json") && kept.includes("old-54.json"), "the oldest go first");
     assert.ok(kept.includes("broken.json"), "and a file the store cannot read is left alone");
+
+    // Nothing was written outside the store: the test's folder holds only
+    // the repository and the store, and the default store was never made.
+    assert.deepEqual(fs.readdirSync(box).sort(), ["repo", "store"], "no file outside the store");
+    const defaultStore = path.join(process.env.XDG_DATA_HOME, "mighty-reviewer", "branch-reviews");
+    const leaked = (fs.existsSync(defaultStore) ? fs.readdirSync(defaultStore) : []).filter((f) => fs.readFileSync(path.join(defaultStore, f), "utf8").includes(box));
+    assert.deepEqual(leaked, [], "and none of this section's reviews in the default store");
   } finally {
     for (const h of instances) await h.dispose();
     fs.rmSync(box, { recursive: true, force: true });

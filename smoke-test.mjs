@@ -2397,6 +2397,16 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     assert.ok(!branchPrompt.includes("P1 only for chatbot residue"), "which no longer makes false documentation P1 by itself");
     assert.ok(branchPrompt.includes("Write SHIP or NO-SHIP only as the verdict line itself: never start any other line of the report with either word."), "the verdict word stands on the verdict line only");
 
+    // The slop critic's own agent prompt rates prose the same way: P2 at
+    // most, P1 only for the behaviour case (the critic's round 2 P3 on
+    // b6e926b..ab4e4e8).
+    const cfg36 = {};
+    hooks.config(cfg36);
+    const slopPrompt = cfg36.agent["ai-slop-critic"].prompt;
+    assert.ok(slopPrompt.includes(`  - P1 only when the prose reveals a behaviour defect: ${exception}`), "the slop critic's P1 is the behaviour case only");
+    assert.ok(slopPrompt.includes("  - P2 (at most) for any finding about prose alone:"), "and its prose findings are P2 at most");
+    assert.ok(!slopPrompt.includes("  - P1: chatbot residue"), "with no P1 for prose alone left");
+
     // The automatic review of a coding turn gets the same cap (B16a), and
     // not the branch review's verdict-line rule.
     const ordinary = await makeHarness("SHIP", { options: { updateCheck: false } });

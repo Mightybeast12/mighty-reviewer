@@ -155,6 +155,7 @@ import {
   compareSemver,
   describeInstall,
   extractVerdict,
+  endsWithCriticNotice,
   pendingBackgroundCritics,
   verdictConflict,
   formatFindingsDigest,
@@ -549,7 +550,7 @@ function buildReviewPrompt(languageHints, projectRules, timeoutMs, scope = null)
     "   Every mechanical failure is an automatic P1 finding. Record them; never fix anything.",
     ...(scope ? ["   Only a gate that ran makes a mechanical failure: findings the critics report from reading keep their own severity."] : []),
     scope
-      ? "3. Delegate the critique to FOUR subagents IN PARALLEL (fire all four task calls in the same message, then wait for all). The critic tasks must run in the FOREGROUND: NEVER launch them as background tasks, and NEVER end your turn while any critique is still pending or the final verdict line is missing. Give each: the mechanical-gate results as context, the project review rules above (if any), and these standing orders: it is strictly read-only, it must not report what a gate that ran already covers; when the gates were recorded as not run, it MUST report the type errors, lint violations and leftover debug output it finds by reading the head (its standing rule about deterministic tooling does not apply then), and it must omit findings it is less than 70% confident are real and material:"
+      ? "3. Delegate the critique to FOUR subagents IN PARALLEL (fire all four task calls in the same message, then wait for all). Run the critic tasks in the foreground where the task tool allows it, and never end your turn without the final verdict line once every critique has reported. Never write the verdict line while any critique is still pending. Give each: the mechanical-gate results as context, the project review rules above (if any), and these standing orders: it is strictly read-only, it must not report what a gate that ran already covers; when the gates were recorded as not run, it MUST report the type errors, lint violations and leftover debug output it finds by reading the head (its standing rule about deterministic tooling does not apply then), and it must omit findings it is less than 70% confident are real and material:"
       : "3. Delegate the critique to FOUR subagents IN PARALLEL (fire all four task calls in the same message, then wait for all). The critic tasks must run in the FOREGROUND: NEVER launch them as background tasks, and NEVER end your turn while any critique is still pending or the final verdict line is missing. Give each: the mechanical-gate results as context, the project review rules above (if any), and these standing orders: it is strictly read-only, it must not report anything the mechanical gates already cover, and it must omit findings it is less than 70% confident are real and material:",
     ...(scope?.checkout
       ? [
@@ -1017,9 +1018,29 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
   async function criticsStillRunning(reviewSessionID) {
     try {
       const res = await client.session.messages({ path: { id: reviewSessionID } });
-      return pendingBackgroundCritics(res?.data ?? res ?? []).length > 0;
+      const messages = res?.data ?? res ?? [];
+      return pendingBackgroundCritics(messages).length > 0 || endsWithCriticNotice(messages);
     } catch {
       return false;
+    }
+  }
+
+  // At a review's deadline, the critics it launched in the background and
+  // that never reported are aborted with it (the critic's round, P3 c).
+  async function abortPendingCritics(reviewSessionID) {
+    let pending = [];
+    try {
+      const res = await client.session.messages({ path: { id: reviewSessionID } });
+      pending = pendingBackgroundCritics(res?.data ?? res ?? []);
+    } catch {
+      return;
+    }
+    for (const id of pending) {
+      try {
+        await client.session.abort({ path: { id } });
+      } catch {
+        // Abort is best-effort.
+      }
     }
   }
 
@@ -1194,6 +1215,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
     const abortReview = async () => {
       reviewWatchdogs.delete(reviewSessionID);
       if (!spawnedReviewSessions.has(reviewSessionID)) return;
+      await abortPendingCritics(reviewSessionID);
       spawnedReviewSessions.delete(reviewSessionID);
       reviewParents.delete(reviewSessionID);
       reviewNudges.delete(reviewSessionID);
@@ -1602,6 +1624,8 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
     state.timerOwner = ownedTimers;
     state.timer = ownTimer(
       setTimeout(async () => {
+        if (!branchReviewSessions.has(reviewSessionID)) return;
+        await abortPendingCritics(reviewSessionID);
         if (!branchReviewSessions.has(reviewSessionID)) return;
         finishBranchReview(reviewSessionID, null, `Branch review timed out after ${Math.round(branchTimeoutMs / 60000)} minutes and was aborted.`);
         try {

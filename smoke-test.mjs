@@ -1735,8 +1735,8 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
 //     (test/branch-plain.json, made by test/branch-capture.mjs: on 0.12.0
 //     first, recorded again for B16's three prompt lines, the critic's
 //     tightened wording, B21's unrun-gate rule and B17's two lines, the
-//     critic's round 2 wording and run 10's two lines, each diff checked to
-//     be those lines).
+//     critic's round 2 wording, run 10's two lines and its step 3 order,
+//     each diff checked to be those lines).
 {
   const fs = await import("node:fs");
   const path = await import("node:path");
@@ -2494,6 +2494,11 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     const waitLine = "   If the task tool returns at once with a session id (the critics run in the background), end your turn once all four are dispatched, without a verdict: each critic's result arrives as a <subagent> message and resumes you. Write the report and the verdict line only after all four have reported.";
     assert.ok(branchPrompt.includes(handOff) && branchPrompt.includes("diff -U0 ") && branchPrompt.includes("and the whole diff when it is under 400 lines."), "a branch review hands each critic the changed line ranges");
     assert.ok(branchPrompt.includes(waitLine), "and waits for background critics before its verdict");
+    // The critic's round (P3 d): the branch order no longer says never to
+    // end the turn while a critique is pending, which a background critic
+    // makes impossible.
+    assert.ok(!delegateLine(branchPrompt).includes("NEVER end your turn while any critique is still pending"), "the branch order does not contradict the background wait");
+    assert.ok(delegateLine(branchPrompt).includes("Never write the verdict line while any critique is still pending"), "it forbids an early verdict instead");
     assert.ok(!ordinaryPrompt.includes("The critics have no shell") && !ordinaryPrompt.includes("If the task tool returns at once"), "the automatic review's prompt is unchanged");
 
     // B21 in a worktree review: a gate with no direct tool reads as not run.
@@ -2562,6 +2567,13 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     h.setMessages([prompt0, launch(crits), deliver("crit-1"), deliver("crit-2"), deliver("crit-3"), say("partial report\n\nSHIP"), deliver("crit-4", "running")]);
     await h.childIdle("child-1");
     assert.ok((await status.execute({}, { sessionID: "bg-parent" })).includes("still in progress"), "a critic that reports it is still running has not reported");
+    // The critic's round on 0218a3d..5605339 (P2): the last critic's notice
+    // lands just after the idle of the previous turn, before the review
+    // answers it; that idle must not record the partial SHIP above.
+    h.setMessages([prompt0, launch(crits), deliver("crit-1"), deliver("crit-2"), deliver("crit-3"), say("partial report\n\nSHIP"), deliver("crit-4")]);
+    await h.childIdle("child-1");
+    assert.ok((await status.execute({}, { sessionID: "bg-parent" })).includes("still in progress"), "an idle that comes before the review has answered the last critic's notice records nothing");
+    assert.equal(h.promptCalls.length, 1, "and sends no nudge into the turn that is starting");
     h.setMessages([prompt0, launch(crits), deliver("crit-1"), deliver("crit-2"), deliver("crit-3"), say("partial report\n\nSHIP"), deliver("crit-4"), say("full report with the risk findings\n- P1 a.js:1 broken\n\nNO-SHIP")]);
     await h.childIdle("child-1");
     const done = await status.execute({}, { sessionID: "bg-parent" });
@@ -2591,6 +2603,30 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     h.setMessages([prompt0, v1Task, say("report\n\nSHIP")]);
     await h.childIdle("child-1");
     assert.ok((await h.hooks.tool.review_status.execute({}, { sessionID: "v1-parent" })).includes("verdict: SHIP"), "a task result without a background launch needs no wait");
+    h.hooks.dispose();
+  }
+
+  // The critic's round (P3 a): the notice's attributes in another order.
+  {
+    const { pendingBackgroundCritics } = await import("./internals.js");
+    const reordered = { info: { role: "user" }, parts: [{ type: "text", text: '<subagent description="critique" state="completed" sessionID="crit-1">\nfindings\n</subagent>' }] };
+    assert.deepEqual(pendingBackgroundCritics([launch(["crit-1", "crit-2"]), reordered]), ["crit-2"], "a notice is read whatever the order of its attributes");
+  }
+
+  // The critic's round (P2): a critic that never reports ends at the
+  // automatic review's own deadline, as before, and its session is aborted
+  // (P3 c).
+  {
+    const h = await makeHarness("unused", { options: { timeoutMs: 300 } });
+    await h.hooks["command.execute.before"]({ command: "mighty-review", sessionID: "dl-parent" }, { parts: [] });
+    await h.tick();
+    h.setMessages([prompt0, launch(["crit-5", "crit-6"]), deliver("crit-6")]);
+    await h.childIdle("child-1");
+    assert.ok((await h.hooks.tool.review_status.execute({}, { sessionID: "dl-parent" })).includes("still in progress"), "waiting on crit-5");
+    await new Promise((r) => setTimeout(r, 700));
+    const timedOut = await h.hooks.tool.review_status.execute({}, { sessionID: "dl-parent" });
+    assert.ok(timedOut.includes("timed out"), `the wait ends at the review's deadline: ${timedOut}`);
+    assert.ok(h.aborted.includes("crit-5") && !h.aborted.includes("crit-6"), `and the critic still out is aborted, the one that reported is not: ${JSON.stringify(h.aborted)}`);
     h.hooks.dispose();
   }
 
@@ -2644,6 +2680,27 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     const read = await call();
     assert.ok(read.includes("verdict: NO-SHIP") && read.includes("all four in"), `the report is the one written after the last critic: ${read}`);
     assert.deepEqual(fs.readdirSync(wtParent), [], "and the checkout goes after it");
+
+    // The critic's round (P2, P3 c): a worktree review whose critic never
+    // reports ends at its deadline, its checkout removed and the critic
+    // aborted.
+    const aborted = [];
+    const dlClient = { ...client, session: { ...client.session, create: async () => ({ data: { id: "bg-review-2" } }), abort: async ({ path: p }) => aborted.push(p.id) } };
+    const dlHooks = await plugin({ client: dlClient, directory: repo, worktree: repo, $: makeShell() }, { idleDebounceMs: 0, updateCheck: false, branchWorktreeDir: wtParent, branchTimeoutMs: 400, branchStoreDir: path.join(wtParent, "..", path.basename(wtParent) + "-store") });
+    try {
+      assert.ok((await dlHooks.tool.review_branch.execute({ repo, base: "base-x", head: "lane/x", worktree: true, rerun: true }, { sessionID: "orch-dl" })).includes("Branch review started"));
+      transcript = [prompt0, launch(["crit-7"], "Dispatched; waiting.")];
+      await dlHooks.event({ event: { type: "session.idle", properties: { sessionID: "bg-review-2" } } });
+      assert.equal(fs.readdirSync(wtParent).length, 1, "the checkout is there while the critic is out");
+      await new Promise((r) => setTimeout(r, 900));
+      const read = await dlHooks.tool.review_branch.execute({ repo, base: "base-x", head: "lane/x", worktree: true }, { sessionID: "orch-dl" });
+      assert.ok(read.includes("timed out"), `the review ends at its deadline: ${read}`);
+      assert.deepEqual(fs.readdirSync(wtParent), [], "its checkout is removed");
+      assert.ok(aborted.includes("crit-7") && aborted.includes("bg-review-2"), `and the review and its critic still out are aborted: ${JSON.stringify(aborted)}`);
+    } finally {
+      await dlHooks.dispose();
+      fs.rmSync(path.join(wtParent, "..", path.basename(wtParent) + "-store"), { recursive: true, force: true });
+    }
   } finally {
     await hooks?.dispose();
     fs.rmSync(repo, { recursive: true, force: true });

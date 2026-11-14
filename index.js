@@ -1026,16 +1026,20 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
   }
 
   // At a review's deadline, the critics it launched in the background and
-  // that never reported are aborted with it (the critic's round, P3 c).
-  async function abortPendingCritics(reviewSessionID) {
-    let pending = [];
+  // that never reported are aborted with it (the critic's round, P3 c),
+  // after the review itself (round 2): read the list first, abort the
+  // review, then the critics, so no cancelled critic's notice resumes it.
+  async function pendingCriticsOf(reviewSessionID) {
     try {
       const res = await client.session.messages({ path: { id: reviewSessionID } });
-      pending = pendingBackgroundCritics(res?.data ?? res ?? []);
+      return pendingBackgroundCritics(res?.data ?? res ?? []);
     } catch {
-      return;
+      return [];
     }
-    for (const id of pending) {
+  }
+
+  async function abortSessions(ids) {
+    for (const id of ids) {
       try {
         await client.session.abort({ path: { id } });
       } catch {
@@ -1215,7 +1219,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
     const abortReview = async () => {
       reviewWatchdogs.delete(reviewSessionID);
       if (!spawnedReviewSessions.has(reviewSessionID)) return;
-      await abortPendingCritics(reviewSessionID);
+      const pendingCritics = await pendingCriticsOf(reviewSessionID);
       spawnedReviewSessions.delete(reviewSessionID);
       reviewParents.delete(reviewSessionID);
       reviewNudges.delete(reviewSessionID);
@@ -1230,6 +1234,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       } catch {
         // Abort is best-effort.
       }
+      await abortSessions(pendingCritics);
       void setReviewTitle(reviewSessionID, "timed out", parentSessionID);
       await showToast("Background review timed out and was aborted.", "warning", parentSessionID, {
         category: "timed-out",
@@ -1625,7 +1630,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
     state.timer = ownTimer(
       setTimeout(async () => {
         if (!branchReviewSessions.has(reviewSessionID)) return;
-        await abortPendingCritics(reviewSessionID);
+        const pendingCritics = await pendingCriticsOf(reviewSessionID);
         if (!branchReviewSessions.has(reviewSessionID)) return;
         finishBranchReview(reviewSessionID, null, `Branch review timed out after ${Math.round(branchTimeoutMs / 60000)} minutes and was aborted.`);
         try {
@@ -1633,6 +1638,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
         } catch {
           // Abort is best-effort.
         }
+        await abortSessions(pendingCritics);
         await releaseBranchWorktree(state);
       }, Math.max(0, ms)),
     );

@@ -2611,6 +2611,13 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     const { pendingBackgroundCritics } = await import("./internals.js");
     const reordered = { info: { role: "user" }, parts: [{ type: "text", text: '<subagent description="critique" state="completed" sessionID="crit-1">\nfindings\n</subagent>' }] };
     assert.deepEqual(pendingBackgroundCritics([launch(["crit-1", "crit-2"]), reordered]), ["crit-2"], "a notice is read whatever the order of its attributes");
+    // Round 2's P3: a ">" inside a model-written description before the
+    // state must not hide the state and count an interim notice.
+    const angled = (state) => ({ info: { role: "user" }, parts: [{ type: "text", text: `<subagent sessionID="crit-2" description="risk > 2 paths" state="${state}">\nhalf way\n</subagent>` }] });
+    assert.deepEqual(pendingBackgroundCritics([launch(["crit-2"]), angled("running")]), ["crit-2"], "an interim notice with a > in its description is still interim");
+    assert.deepEqual(pendingBackgroundCritics([launch(["crit-2"]), angled("completed")]), [], "and the final one with a > in it is read");
+    const stateless = { info: { role: "user" }, parts: [{ type: "text", text: '<subagent sessionID="crit-2">\nno state\n</subagent>' }] };
+    assert.deepEqual(pendingBackgroundCritics([launch(["crit-2"]), stateless]), ["crit-2"], "a notice without a readable state is no report");
   }
 
   // The critic's round (P2): a critic that never reports ends at the
@@ -2627,6 +2634,9 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     const timedOut = await h.hooks.tool.review_status.execute({}, { sessionID: "dl-parent" });
     assert.ok(timedOut.includes("timed out"), `the wait ends at the review's deadline: ${timedOut}`);
     assert.ok(h.aborted.includes("crit-5") && !h.aborted.includes("crit-6"), `and the critic still out is aborted, the one that reported is not: ${JSON.stringify(h.aborted)}`);
+    // Round 2's P3: the review first, so an aborted critic's notice cannot
+    // resume it for one more turn.
+    assert.ok(h.aborted.indexOf("child-1") >= 0 && h.aborted.indexOf("child-1") < h.aborted.indexOf("crit-5"), `the review is aborted before its critics: ${JSON.stringify(h.aborted)}`);
     h.hooks.dispose();
   }
 
@@ -2697,6 +2707,7 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
       assert.ok(read.includes("timed out"), `the review ends at its deadline: ${read}`);
       assert.deepEqual(fs.readdirSync(wtParent), [], "its checkout is removed");
       assert.ok(aborted.includes("crit-7") && aborted.includes("bg-review-2"), `and the review and its critic still out are aborted: ${JSON.stringify(aborted)}`);
+      assert.ok(aborted.indexOf("bg-review-2") < aborted.indexOf("crit-7"), `the review before its critic: ${JSON.stringify(aborted)}`);
     } finally {
       await dlHooks.dispose();
       fs.rmSync(path.join(wtParent, "..", path.basename(wtParent) + "-store"), { recursive: true, force: true });

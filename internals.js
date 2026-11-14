@@ -118,11 +118,13 @@ export function verdictConflict(text, verdict) {
 // On OpenCode 2.3 the subagent tool returns at once ("working in the
 // background (sessionID: X)") and each result arrives later as a message
 // carrying `<subagent sessionID="X" state="...">` (attributes in any order);
-// a report whose state is "running" is an interim one. A critic whose result
+// a report whose state is "running", or has no readable state, is no
+// result. The tag is read attribute by attribute, so a ">" inside a quoted
+// value (a model-written description) does not end it. A critic whose result
 // came back in its own tool call (a host that runs subagents in the
 // foreground) is never pending, so on such a host nothing changes.
 const BACKGROUND_LAUNCH = /working in the background \(sessionID: ([^)\s]+)\)/;
-const CRITIC_NOTICE = /<subagent\b([^>]*)>/g;
+const CRITIC_NOTICE = /<subagent((?:\s+[A-Za-z_][\w-]*="[^"]*")*)\s*>/g;
 const attributeOf = (attributes, name) => attributes.match(new RegExp(`\\b${name}="([^"]*)"`))?.[1] ?? null;
 
 function noticesIn(text) {
@@ -142,7 +144,7 @@ export function pendingBackgroundCritics(messages) {
   const launched = new Set();
   const reported = new Set();
   const noteReports = (text) => {
-    for (const notice of noticesIn(text)) if (notice.state !== "running") reported.add(notice.sessionID);
+    for (const notice of noticesIn(text)) if (notice.state && notice.state !== "running") reported.add(notice.sessionID);
   };
   for (const message of Array.isArray(messages) ? messages : []) {
     const fromAssistant = message?.info?.role === "assistant";

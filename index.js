@@ -542,6 +542,13 @@ function buildReviewPrompt(languageHints, projectRules, timeoutMs, scope = null)
     "      - Attack the most expensive/risky surfaces first (auth, data loss, concurrency, external I/O, error paths).",
     "      - Report ONLY material findings, each with concrete evidence (file:line) and a severity P0-P3.",
     "      - Check the change against what it was clearly trying to do: nothing gamed, no deleted tests, no `as any`/`@ts-ignore`, no weakened lint/typecheck config.",
+    // Backlog B17 (E1 round 1's three code-visible misses and E1 on 0.14.0's
+    // c701 and c703: each crossed a boundary the diff does not show).
+    ...(scope
+      ? [
+          "      - Trace each changed behaviour past the diff: for a changed shared component, function, parameter, default or rule, read its callers outside the diff and check that each still gets what it got before; for a changed path, find the other paths that do the same job (another entry point, a retry, a second client) and check that they changed with it.",
+        ]
+      : []),
     `   b. \`${DESIGN_AGENT}\` - design and best-practice enforcement:`,
     "      - Enforce DRY, SOLID, separation of concerns, abstraction boundaries, and sound systems-design choices in the changed code.",
     "      - Report ONLY material findings, each with concrete evidence (file:line) and a severity P0-P3.",
@@ -563,6 +570,9 @@ function buildReviewPrompt(languageHints, projectRules, timeoutMs, scope = null)
     `   a. ADVERSARIAL VERIFICATION - for EVERY P0/P1 finding, actively try to REFUTE it before accepting it: read the FULL ${scope?.checkout ? `file as checked out in ${scope.checkout}` : "current file"} (not just the diff) and check imports, declarations, type definitions, callers, and existing validation that may already handle the case. Drop any finding you can refute or cannot back with concrete evidence; when uncertain whether a finding is real, default to NOT REAL and drop it. Downgrade severity where the claimed failure scenario is not actually reachable. A false positive costs more than a missed nit.`,
     "   b. DEDUPLICATE - merge findings from different critics that point at the same file:line or the same root cause into ONE finding at the highest justified severity.",
     `   c. Merge the surviving critic findings with the mechanical-gate findings into one severity-ranked list, then run diagnostics on every changed file${scope?.checkout ? ` as checked out in ${scope.checkout}` : ""} and record any that are not clean as findings.`,
+    ...(scope
+      ? ["   A residual a critic names (a risk it saw but did not rate as a finding) is listed as an unverified P3 finding with its file:line, never left as a prose line."]
+      : []),
     "6. Output the FULL findings report: every finding, severity-ranked (P0 first), each with:",
     "   - Severity (P0-P3).",
     "   - Exact location (file:line).",

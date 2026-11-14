@@ -1725,8 +1725,8 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
 //     option a branch start is byte for byte the recorded plain one
 //     (test/branch-plain.json, made by test/branch-capture.mjs: on 0.12.0
 //     first, recorded again for B16's three prompt lines, the critic's
-//     tightened wording and B21's unrun-gate rule, each diff checked to be
-//     those lines).
+//     tightened wording, B21's unrun-gate rule and B17's two lines, each
+//     diff checked to be those lines).
 {
   const fs = await import("node:fs");
   const path = await import("node:path");
@@ -2440,6 +2440,16 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     await idle("sev-review-2");
     const clean = await call({ repo, base: "base-x", head: "lane/y" });
     assert.ok(clean.includes("verdict: SHIP") && !clean.includes("note: the report's text"), `a verdict word inside a sentence is not flagged: ${clean}`);
+    // B17 (E1 on 0.14.0: c701's kit default meeting every caller, c703's
+    // normal path never reaching the new code): in a branch review the risk
+    // critic traces a change past the diff, and a residual a critic names
+    // is listed as an unverified P3 finding, never left in prose.
+    const traceOrder = "      - Trace each changed behaviour past the diff: for a changed shared component, function, parameter, default or rule, read its callers outside the diff and check that each still gets what it got before; for a changed path, find the other paths that do the same job (another entry point, a retry, a second client) and check that they changed with it.";
+    const residualRule = "   A residual a critic names (a risk it saw but did not rate as a finding) is listed as an unverified P3 finding with its file:line, never left as a prose line.";
+    assert.ok(branchPrompt.includes(traceOrder), "the branch review's risk critic traces a change across its callers and the paths that do the same job");
+    assert.ok(branchPrompt.includes(residualRule), "and a named residual becomes a P3 finding");
+    assert.ok(!ordinaryPrompt.includes("Trace each changed behaviour past the diff") && !ordinaryPrompt.includes("A residual a critic names"), "the automatic review gets neither");
+
     // B21 in a worktree review: a gate with no direct tool reads as not run.
     const wtCall = await hooks.tool.review_branch.execute({ repo, base: "base-x", head: "lane/y", worktree: true }, { sessionID: "orch-sev" });
     assert.ok(wtCall.includes("Branch review started"), wtCall);

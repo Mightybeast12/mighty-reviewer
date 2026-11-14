@@ -17,6 +17,9 @@ import path from "node:path";
 
 export async function captureBranchStart({ plugin, makeShell, scratch, args = {} }) {
   const repo = fs.realpathSync(fs.mkdtempSync(path.join(scratch, "capture-")));
+  // A store of its own: a caller outside the smoke test (recording the pin)
+  // runs with the owner's XDG_DATA_HOME, whose default store is his.
+  const store = fs.mkdtempSync(path.join(scratch, "capture-store-"));
   let hooks;
   try {
     const git = (...a) => execFileSync("git", ["-C", repo, ...a], { encoding: "utf8" }).trim();
@@ -60,7 +63,7 @@ export async function captureBranchStart({ plugin, makeShell, scratch, args = {}
       commands.push(String.raw({ raw: strings }, ...values).replace(/\s+/g, " ").trim());
       return shell(strings, ...values);
     };
-    hooks = await plugin({ client, directory: repo, worktree: repo, $: recording }, { idleDebounceMs: 0, updateCheck: false });
+    hooks = await plugin({ client, directory: repo, worktree: repo, $: recording }, { idleDebounceMs: 0, updateCheck: false, branchStoreDir: store });
     const reply = await hooks.tool.review_branch.execute({ repo, base: "base-x", head: "lane/x", ...args }, { sessionID: "capture-orch" });
     const normalize = (value) =>
       JSON.parse(
@@ -85,5 +88,6 @@ export async function captureBranchStart({ plugin, makeShell, scratch, args = {}
   } finally {
     await hooks?.dispose?.();
     fs.rmSync(repo, { recursive: true, force: true });
+    fs.rmSync(store, { recursive: true, force: true });
   }
 }

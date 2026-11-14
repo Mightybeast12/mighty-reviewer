@@ -1742,6 +1742,14 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
   assert.deepEqual(offPath, recorded, "without worktree a branch start sends, creates and runs exactly the recorded plain start");
   const offFalse = await captureBranchStart({ plugin, makeShell, scratch, args: { worktree: false } });
   assert.deepEqual(offFalse, recorded, "and so does worktree: false");
+  // The capture is also run from outside this file, to record the pin,
+  // where XDG_DATA_HOME is the owner's own: it keeps its reviews in a store
+  // of its own and leaves the default store alone (tooling reviewer run 9:
+  // a recording left four "lost" entries in the real store).
+  const captureStore = path.join(process.env.XDG_DATA_HOME, "mighty-reviewer", "branch-reviews");
+  const captured = (fs.existsSync(captureStore) ? fs.readdirSync(captureStore) : []).filter((f) => fs.readFileSync(path.join(captureStore, f), "utf8").includes('"requestedBy":"capture-orch"'));
+  assert.deepEqual(captured, [], "a capture writes nothing into the default branch store");
+  assert.deepEqual(fs.readdirSync(scratch).filter((f) => f.startsWith("capture-")), [], "and leaves no folder of its own behind");
   assert.equal(defaultWorktreeParent(), path.join(os.tmpdir(), "mighty-reviewer-worktrees"), "the default checkout folder is in the system's temporary folder");
 
   // The v2 adapter: the review session's own allow comes after the

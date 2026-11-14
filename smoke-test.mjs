@@ -113,6 +113,11 @@ for (const name of CRITICS) {
   for (const denied of ["edit", "write", "patch", "bash", "task"]) {
     assert.equal(tools[denied], false, `${name} denies ${denied}`);
   }
+  // On OpenCode 2.3 a critic reached review_branch through code mode and
+  // started a second review of the range (tooling reviewer run 10).
+  for (const denied of ["review_branch", "review_status", "execute"]) {
+    assert.equal(tools[denied], false, `${name} denies ${denied}`);
+  }
 }
 assert.notEqual(
   cfg2.agent["adversarial-risk-critic"].tools,
@@ -136,6 +141,7 @@ assert.equal(extractVerdict(undefined), null);
 // Fake-client harness driving the hook choreography of one parent session.
 const makeHarness = async (report, { promptAsyncResult, options, clientV2 } = {}) => {
   let currentReport = report;
+  let currentMessages = null;
   const promptCalls = [];
   const toasts = [];
   const logs = [];
@@ -161,7 +167,7 @@ const makeHarness = async (report, { promptAsyncResult, options, clientV2 } = {}
         }
         return undefined;
       },
-      messages: async () => [{ info: { role: "assistant" }, parts: [{ type: "text", text: currentReport }] }],
+      messages: async () => currentMessages ?? [{ info: { role: "assistant" }, parts: [{ type: "text", text: currentReport }] }],
     },
     app: { log: async ({ body }) => logs.push(body) },
   };
@@ -189,6 +195,9 @@ const makeHarness = async (report, { promptAsyncResult, options, clientV2 } = {}
     },
     setReport: (value) => {
       currentReport = value;
+    },
+    setMessages: (value) => {
+      currentMessages = value;
     },
     lastChild: () => `child-${childN}`,
     turn: async (parent, msgText) => {
@@ -703,7 +712,7 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
   assert.equal(critic.request.body.temperature, 0.1, "temperature lands in request.body");
   assert.ok(critic.system.includes("Weakened guardrails"), "prompt becomes system");
   const denied = critic.permissions.filter((rule) => rule.effect === "deny").map((rule) => rule.action).sort();
-  assert.deepEqual(denied, ["edit", "external_directory", "shell", "subagent"], "critic tools map to v2 permission actions, plus out-of-project access denied");
+  assert.deepEqual(denied, ["edit", "execute", "external_directory", "review_branch", "review_status", "shell", "subagent"], "critic tools map to v2 permission actions, plus out-of-project access denied");
   assert.equal(agents.get("build").system, undefined, "existing agents untouched");
 
   assert.equal(commands.length, 1, "mighty-review command registered");
@@ -1725,8 +1734,9 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
 //     option a branch start is byte for byte the recorded plain one
 //     (test/branch-plain.json, made by test/branch-capture.mjs: on 0.12.0
 //     first, recorded again for B16's three prompt lines, the critic's
-//     tightened wording, B21's unrun-gate rule and B17's two lines, and the
-//     critic's round 2 wording, each diff checked to be those lines).
+//     tightened wording, B21's unrun-gate rule and B17's two lines, the
+//     critic's round 2 wording and run 10's two lines, each diff checked to
+//     be those lines).
 {
   const fs = await import("node:fs");
   const path = await import("node:path");
@@ -2477,6 +2487,14 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     assert.ok(branchPrompt.includes(traceOrder), "the branch review's risk critic traces a change across its callers and the paths that do the same job");
     assert.ok(branchPrompt.includes(residualRule), "and a named residual becomes a P3 finding");
     assert.ok(!ordinaryPrompt.includes("Trace each changed behaviour past the diff") && !ordinaryPrompt.includes("A residual a critic names"), "the automatic review gets neither");
+    // Tooling reviewer run 10: a critic has no shell, so it cannot run git
+    // (c715's slop critic "could not run git diff"), and on OpenCode 2.3 the
+    // critics always run in the background.
+    const handOff = "   The critics have no shell and cannot run git: put into each critic's task the changed files with their changed line ranges (the `@@` lines of `git -C ";
+    const waitLine = "   If the task tool returns at once with a session id (the critics run in the background), end your turn once all four are dispatched, without a verdict: each critic's result arrives as a <subagent> message and resumes you. Write the report and the verdict line only after all four have reported.";
+    assert.ok(branchPrompt.includes(handOff) && branchPrompt.includes("diff -U0 ") && branchPrompt.includes("and the whole diff when it is under 400 lines."), "a branch review hands each critic the changed line ranges");
+    assert.ok(branchPrompt.includes(waitLine), "and waits for background critics before its verdict");
+    assert.ok(!ordinaryPrompt.includes("The critics have no shell") && !ordinaryPrompt.includes("If the task tool returns at once"), "the automatic review's prompt is unchanged");
 
     // B21 in a worktree review: a gate with no direct tool reads as not run.
     const wtCall = await hooks.tool.review_branch.execute({ repo, base: "base-x", head: "lane/y", worktree: true }, { sessionID: "orch-sev" });
@@ -2491,6 +2509,145 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     await hooks?.dispose();
     fs.rmSync(repo, { recursive: true, force: true });
     for (const d of wtParents) fs.rmSync(d, { recursive: true, force: true });
+  }
+}
+
+// 37. Critics that run in the background (OpenCode 2.3: the subagent tool
+//     returns at once and each result arrives later as a <subagent>
+//     message). A review session that idles while a critic it launched has
+//     not reported is waiting, not done: no nudge, no verdict recorded, and
+//     a worktree review keeps its checkout (tooling reviewer run 10: four
+//     worktree reviews of 2026-11-14 recorded SHIP with the risk critic
+//     still running, after a nudge told the review to finish at once).
+{
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const { execFileSync } = await import("node:child_process");
+  const launch = (ids, text = "") => ({
+    info: { role: "assistant" },
+    parts: [
+      ...ids.map((id) => ({
+        type: "tool",
+        name: "subagent",
+        state: {
+          status: "completed",
+          input: { agent: "adversarial-risk-critic" },
+          metadata: { sessionID: id, status: "running" },
+          content: [{ type: "text", text: `The subagent is working in the background (sessionID: ${id}). You will receive a <subagent> message when it goes idle, and again after each later round of work.` }],
+        },
+      })),
+      ...(text ? [{ type: "text", text }] : []),
+    ],
+  });
+  const deliver = (id, state = "completed") => ({ info: { role: "user" }, parts: [{ type: "text", text: `<subagent sessionID="${id}" state="${state}" description="critique">\nfindings of ${id}\n</subagent>` }] });
+  const say = (text) => ({ info: { role: "assistant" }, parts: [{ type: "text", text }] });
+  const prompt0 = { info: { role: "user" }, parts: [{ type: "text", text: "<!--adversarial-review-auto-->\nreview" }] };
+  const crits = ["crit-1", "crit-2", "crit-3", "crit-4"];
+
+  // The automatic review of a coding turn.
+  {
+    const h = await makeHarness("unused");
+    const status = h.hooks.tool.review_status;
+    await h.hooks["command.execute.before"]({ command: "mighty-review", sessionID: "bg-parent" }, { parts: [] });
+    await h.tick();
+    assert.equal(h.promptCalls.length, 1, "review spawned");
+    h.setMessages([prompt0, launch(crits, "Four critics are running. I'll wait for their reports.")]);
+    await h.childIdle("child-1");
+    assert.equal(h.promptCalls.length, 1, "an idle while all four critics run sends no nudge");
+    assert.ok((await status.execute({}, { sessionID: "bg-parent" })).includes("still in progress"), "and the review keeps running");
+    h.setMessages([prompt0, launch(crits), deliver("crit-1"), deliver("crit-2"), deliver("crit-3"), say("partial report\n\nSHIP")]);
+    await h.childIdle("child-1");
+    assert.ok((await status.execute({}, { sessionID: "bg-parent" })).includes("still in progress"), "a verdict written with a critic still out is not recorded");
+    assert.equal(h.promptCalls.length, 1, "and draws no nudge");
+    h.setMessages([prompt0, launch(crits), deliver("crit-1"), deliver("crit-2"), deliver("crit-3"), say("partial report\n\nSHIP"), deliver("crit-4", "running")]);
+    await h.childIdle("child-1");
+    assert.ok((await status.execute({}, { sessionID: "bg-parent" })).includes("still in progress"), "a critic that reports it is still running has not reported");
+    h.setMessages([prompt0, launch(crits), deliver("crit-1"), deliver("crit-2"), deliver("crit-3"), say("partial report\n\nSHIP"), deliver("crit-4"), say("full report with the risk findings\n- P1 a.js:1 broken\n\nNO-SHIP")]);
+    await h.childIdle("child-1");
+    const done = await status.execute({}, { sessionID: "bg-parent" });
+    assert.ok(done.includes("verdict: NO-SHIP"), `once every critic has reported, the last verdict is the review's: ${done}`);
+    h.hooks.dispose();
+  }
+
+  // A critic whose result came back in its own tool call (a host that runs
+  // subagents in the foreground) is never waited for.
+  {
+    const h = await makeHarness("unused");
+    await h.hooks["command.execute.before"]({ command: "mighty-review", sessionID: "fg-parent" }, { parts: [] });
+    await h.tick();
+    const foreground = { info: { role: "assistant" }, parts: [{ type: "tool", name: "subagent", state: { status: "completed", metadata: { sessionID: "crit-9" }, content: [{ type: "text", text: '<subagent sessionID="crit-9" state="completed">\nNo material findings.\n</subagent>' }] } }] };
+    h.setMessages([prompt0, foreground, say("report\n\nSHIP")]);
+    await h.childIdle("child-1");
+    assert.ok((await h.hooks.tool.review_status.execute({}, { sessionID: "fg-parent" })).includes("verdict: SHIP"), "a foreground critic's result needs no wait");
+    h.hooks.dispose();
+  }
+  // Nor is one whose foreground result carries no <subagent> tag at all
+  // (OpenCode 1's task tool).
+  {
+    const h = await makeHarness("unused");
+    await h.hooks["command.execute.before"]({ command: "mighty-review", sessionID: "v1-parent" }, { parts: [] });
+    await h.tick();
+    const v1Task = { info: { role: "assistant" }, parts: [{ type: "tool", tool: "task", state: { status: "completed", metadata: { sessionID: "crit-8" }, output: "No material findings.\n\n<task_metadata>\nsession_id: crit-8\n</task_metadata>" } }] };
+    h.setMessages([prompt0, v1Task, say("report\n\nSHIP")]);
+    await h.childIdle("child-1");
+    assert.ok((await h.hooks.tool.review_status.execute({}, { sessionID: "v1-parent" })).includes("verdict: SHIP"), "a task result without a background launch needs no wait");
+    h.hooks.dispose();
+  }
+
+  // A worktree branch review keeps its checkout until the last critic.
+  const scratch = path.join(os.tmpdir(), "opencode", "reviewer-test");
+  fs.mkdirSync(scratch, { recursive: true });
+  const repo = fs.realpathSync(fs.mkdtempSync(path.join(scratch, "bgcritics-")));
+  const wtParent = fs.mkdtempSync(path.join(scratch, "bgcritics-wt-"));
+  let hooks;
+  try {
+    const git = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
+    git("init", "-q");
+    git("config", "user.email", "smoke@example.invalid");
+    git("config", "user.name", "smoke");
+    fs.writeFileSync(path.join(repo, "a.js"), "export const a = 1;\n");
+    git("add", "a.js");
+    git("commit", "-q", "-m", "base");
+    git("branch", "base-x");
+    git("checkout", "-q", "-b", "lane/x");
+    fs.writeFileSync(path.join(repo, "x.js"), "export const x = 2;\n");
+    git("add", "x.js");
+    git("commit", "-q", "-m", "x");
+    const prompts = [];
+    let transcript = [];
+    const client = {
+      v2: true,
+      tui: { showToast: async () => {} },
+      app: { log: async () => {} },
+      session: {
+        get: async ({ path: p }) => ({ data: { id: p.id } }),
+        create: async () => ({ data: { id: "bg-review-1" } }),
+        update: async () => {},
+        abort: async () => {},
+        promptAsync: async ({ path: p, body }) => prompts.push({ id: p.id, text: body.parts[0].text }),
+        messages: async () => transcript,
+      },
+    };
+    hooks = await plugin({ client, directory: repo, worktree: repo, $: makeShell() }, { idleDebounceMs: 0, updateCheck: false, branchWorktreeDir: wtParent });
+    const call = () => hooks.tool.review_branch.execute({ repo, base: "base-x", head: "lane/x", worktree: true }, { sessionID: "orch-bg" });
+    const idle = () => hooks.event({ event: { type: "session.idle", properties: { sessionID: "bg-review-1" } } });
+    assert.ok((await call()).includes("Branch review started"));
+    transcript = [prompt0, launch(crits, "Dispatched; waiting.")];
+    await idle();
+    assert.equal(prompts.length, 1, "a branch review waiting on its critics is not nudged");
+    transcript = [prompt0, launch(crits), deliver("crit-2"), deliver("crit-3"), deliver("crit-4"), say("three of four in\n\nSHIP")];
+    await idle();
+    assert.ok((await call()).includes("still running"), "nor recorded while the risk critic is out");
+    assert.equal(fs.readdirSync(wtParent).length, 1, "and its checkout stays for the critic still reading it");
+    transcript = [...transcript, deliver("crit-1"), say("all four in: the risk critic's P1\n- P1 x.js:1 wrong\n\nNO-SHIP")];
+    await idle();
+    const read = await call();
+    assert.ok(read.includes("verdict: NO-SHIP") && read.includes("all four in"), `the report is the one written after the last critic: ${read}`);
+    assert.deepEqual(fs.readdirSync(wtParent), [], "and the checkout goes after it");
+  } finally {
+    await hooks?.dispose();
+    fs.rmSync(repo, { recursive: true, force: true });
+    fs.rmSync(wtParent, { recursive: true, force: true });
   }
 }
 

@@ -155,6 +155,7 @@ import {
   compareSemver,
   describeInstall,
   extractVerdict,
+  pendingBackgroundCritics,
   verdictConflict,
   formatFindingsDigest,
   formatNoShipSummary,
@@ -260,7 +261,19 @@ const BRANCH_RELOAD_REPORT =
 
 // Critic agents are review-only and never need a shell: deny the mutating
 // tools AND bash/task, so the read-only contract is enforced by mechanism.
-const CRITIC_TOOLS = { edit: false, write: false, patch: false, bash: false, task: false };
+// The review tools and code mode go too: on OpenCode 2.3 a critic called
+// review_branch through code mode's `execute` and started a second review
+// of the range it was critiquing (tooling reviewer run 10).
+const CRITIC_TOOLS = {
+  edit: false,
+  write: false,
+  patch: false,
+  bash: false,
+  task: false,
+  review_branch: false,
+  review_status: false,
+  execute: false,
+};
 
 // The orchestrating review session must keep bash (git diff, tsc --noEmit,
 // mechanical gates), so only the direct file-mutating tools are denied; its
@@ -543,6 +556,13 @@ function buildReviewPrompt(languageHints, projectRules, timeoutMs, scope = null)
           `   Tell every critic that the head is checked out at ${scope.checkout}: it reads the changed files and the code around them there, never under ${scope.root}, whose working tree may not be the reviewed head.`,
         ]
       : []),
+    // Tooling reviewer run 10: critics have no shell (CRITIC_TOOLS), so a
+    // critic cannot read the range itself (c715's slop critic).
+    ...(scope
+      ? [
+          `   The critics have no shell and cannot run git: put into each critic's task the changed files with their changed line ranges (the \`@@\` lines of \`git -C ${scope.root} diff -U0 ${range}\`), and the whole diff when it is under 400 lines.`,
+        ]
+      : []),
     `   a. \`${RISK_AGENT}\` - adversarial risk critique. Its job is to BREAK confidence, not validate:`,
     "      - Attack the most expensive/risky surfaces first (auth, data loss, concurrency, external I/O, error paths).",
     "      - Report ONLY material findings, each with concrete evidence (file:line) and a severity P0-P3.",
@@ -565,6 +585,14 @@ function buildReviewPrompt(languageHints, projectRules, timeoutMs, scope = null)
     "      - Hunt AI-authoring residue in the changed code (narrating comments, needless defensive checks, `any` casts, style drift, emoji) and in every changed line of prose (AI vocabulary, puffery, negative parallelisms, bold inline-header lists, em dashes, chatbot leftovers, placeholder text, leaked citation markup, documentation claims the code does not back).",
     `      - Report ONLY material findings, each with concrete evidence (file:line, quoted text) and a severity P1-P3: slop is P3 by default, P2 when a pattern repeats across the diff, for chatbot residue or placeholder text in shipped text, and for documentation that is false about the code (P2 at most: a finding about prose alone never blocks the change). ${PROSE_EXCEPTION}`,
     "   Use the task tool (named `subagent` on OpenCode 2, where the agent name goes in its `agent` parameter) with subagent_type set to those exact agent names. NEVER substitute a different agent (explore, librarian, general, ...) for a critic: they run with other rubrics. If you have no way to delegate to the critics at all, perform all four critiques yourself in this session, one after another, applying each rubric above.",
+    // OpenCode 2.3 runs every subagent in the background (tooling reviewer
+    // run 10); the plugin waits for each critic's report before it reads a
+    // verdict (pendingBackgroundCritics).
+    ...(scope
+      ? [
+          "   If the task tool returns at once with a session id (the critics run in the background), end your turn once all four are dispatched, without a verdict: each critic's result arrives as a <subagent> message and resumes you. Write the report and the verdict line only after all four have reported.",
+        ]
+      : []),
     ...(languageHints.length
       ? [
           "4. Language-specific attention for this diff (pass these to the relevant critics):",
@@ -979,6 +1007,20 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       // Best-effort only.
     }
     return null;
+  }
+
+  // True while a critic the review launched in the background has not
+  // reported: the review's idle then means it is waiting (the host resumes
+  // it with each result), so it is neither nudged nor finished. The
+  // review's own deadline still bounds the wait. Unreadable messages read
+  // as nothing pending, so the review ends as it did before.
+  async function criticsStillRunning(reviewSessionID) {
+    try {
+      const res = await client.session.messages({ path: { id: reviewSessionID } });
+      return pendingBackgroundCritics(res?.data ?? res ?? []).length > 0;
+    } catch {
+      return false;
+    }
   }
 
   async function sendPrompt(sessionIDToPrompt, text, extra = {}) {
@@ -1607,6 +1649,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
   }
 
   async function handleBranchIdle(reviewSessionID) {
+    if (await criticsStillRunning(reviewSessionID)) return;
     const report = await lastAssistantText(reviewSessionID);
     const verdict = extractVerdict(report);
     if (!verdict && (await nudgeForVerdict(reviewSessionID, report))) return;
@@ -1949,6 +1992,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       // This is one of our own background review sessions finishing, not a
       // user turn -> report the verdict via toast and stop, do not recurse.
       if (spawnedReviewSessions.has(sessionID)) {
+        if (await criticsStillRunning(sessionID)) return;
         const report = await lastAssistantText(sessionID);
         const verdict = extractVerdict(report);
         // No verdict means the orchestrator ended its turn early (typically

@@ -114,6 +114,43 @@ export function verdictConflict(text, verdict) {
   return null;
 }
 
+// Critics a review launched in the background that have not reported yet.
+// On OpenCode 2.3 the subagent tool returns at once ("working in the
+// background (sessionID: X)") and each result arrives later as a message
+// carrying `<subagent sessionID="X" state="...">`; a report whose state is
+// "running" is an interim one. A critic whose result came back in its own
+// tool call (a host that runs subagents in the foreground) is never
+// pending, so on such a host nothing changes.
+const BACKGROUND_LAUNCH = /working in the background \(sessionID: ([^)\s]+)\)/;
+const CRITIC_REPORT = /<subagent\s+sessionID="([^"]+)"\s+state="([^"]+)"/g;
+
+export function pendingBackgroundCritics(messages) {
+  const launched = new Set();
+  const reported = new Set();
+  const textOf = (part) => (typeof part?.text === "string" ? part.text : "");
+  const outputOf = (state) =>
+    typeof state?.output === "string" ? state.output : Array.isArray(state?.content) ? state.content.map(textOf).join("\n") : "";
+  const noteReports = (text) => {
+    for (const match of text.matchAll(CRITIC_REPORT)) if (match[2] !== "running") reported.add(match[1]);
+  };
+  for (const message of Array.isArray(messages) ? messages : []) {
+    const fromAssistant = message?.info?.role === "assistant";
+    for (const part of message?.parts ?? []) {
+      const tool = part?.type === "tool" ? (part.name ?? part.tool) : null;
+      if (tool === "subagent" || tool === "task") {
+        const output = outputOf(part.state);
+        noteReports(output);
+        const launch = output.match(BACKGROUND_LAUNCH);
+        const id = typeof part.state?.metadata?.sessionID === "string" ? part.state.metadata.sessionID : launch?.[1];
+        if (launch && id) launched.add(id);
+      } else if (!fromAssistant && part?.type === "text") {
+        noteReports(textOf(part));
+      }
+    }
+  }
+  return [...launched].filter((id) => !reported.has(id));
+}
+
 export function compareSemver(a, b) {
   const parse = (v) => {
     const [core, ...pre] = String(v).split("-");

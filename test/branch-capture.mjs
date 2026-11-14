@@ -7,6 +7,7 @@
 // B21's unrun-gate rule, B17's trace and residual lines, and the critic's
 // round on them (the branch critics' standing order, the closed list),
 // and its round 2 (the stopped-check clause, read findings' severity),
+// and run 10's two lines (the critics' line ranges, the background wait),
 // each diff checked to be exactly those lines).
 // It takes the plugin factory and the shell
 // maker as arguments, so the same capture runs on any version's files.

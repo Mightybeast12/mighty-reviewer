@@ -3,8 +3,8 @@
 // byte for byte with a recorded one (smoke-test.mjs section 34 compares the
 // start without `worktree` with test/branch-plain.json, which this
 // function recorded: on 0.12.0 first, and again for backlog B16's three
-// prompt lines and for the critic's tightened wording of 2026-11-13, each
-// diff checked to be exactly those lines).
+// prompt lines, for the critic's tightened wording of 2026-11-13 and for
+// B21's unrun-gate rule, each diff checked to be exactly those lines).
 // It takes the plugin factory and the shell
 // maker as arguments, so the same capture runs on any version's files.
 

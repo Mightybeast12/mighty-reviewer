@@ -244,6 +244,10 @@ const SLOP_AGENT = "ai-slop-critic";
 // behaviour defect that shows up as a comment at its own severity.
 const PROSE_EXCEPTION =
   "If the comment or the documentation is right and the code contradicts it, or the text states a guarantee the code lacks (security, data safety, limits), it is a behaviour finding at its own severity.";
+// Backlog B21 (the benchmark of 2026-11-13: all four false alarms, on both
+// versions, were a gate the review could not run, read as a failed one).
+const UNRUN_GATE_RULE =
+  "A gate recorded as not run, for any reason (the time budget, no direct tool for it, dependencies not installed, the working tree not at the head), is not a failed gate and never makes the verdict NO-SHIP by itself: only a gate that ran and failed does. Name the gates that did not run in the report.";
 const PROSE_RULE = `A finding about comments, documentation or other prose alone, with no change in behaviour, is at most P2 in this review and never makes the verdict NO-SHIP. ${PROSE_EXCEPTION}`;
 
 const BRANCH_LOST_REPORT =
@@ -517,7 +521,7 @@ function buildReviewPrompt(languageHints, projectRules, timeoutMs, scope = null)
     "2. MECHANICAL GATES - run these BEFORE consulting any critic:",
     ...(scope?.checkout
       ? [
-          `   Run them in the review checkout ${scope.checkout}, with that folder as every command's working directory, never in ${scope.root}. Run each check tool directly (for example \`tsc --noEmit\`, \`cargo check\`), never a package script (\`npm run\`, \`make\` and the like). A fresh checkout has no installed dependencies or build outputs of its own, and nothing is installed to make a gate run. A gate is recorded as 'not run (dependencies not installed in the review checkout: <its first error line, quoted>)' only when it fails because a package the head's manifest or lockfile declares is absent from disk. A missing relative path, a package the head does not declare, and any error that is not a bare missing-install error are failures.`,
+          `   Run them in the review checkout ${scope.checkout}, with that folder as every command's working directory, never in ${scope.root}. Run each check tool directly (for example \`tsc --noEmit\`, \`cargo check\`), never a package script (\`npm run\`, \`make\` and the like). A gate the review checkout cannot run at all (no direct tool for it, as for checks that run only through a build wrapper such as Gradle) is recorded as 'not run (no direct tool)', never as a failure. A fresh checkout has no installed dependencies or build outputs of its own, and nothing is installed to make a gate run. A gate is recorded as 'not run (dependencies not installed in the review checkout: <its first error line, quoted>)' only when it fails because a package the head's manifest or lockfile declares is absent from disk. A missing relative path, a package the head does not declare, and any error that is not a bare missing-install error are failures.`,
         ]
       : scope
         ? [
@@ -569,7 +573,9 @@ function buildReviewPrompt(languageHints, projectRules, timeoutMs, scope = null)
     "7. End with ONE terse verdict covering ALL reviews, stated as exactly the single word SHIP or the single word NO-SHIP on its own line:",
     "   - If any mechanical gate failed, or any VERIFIED P0/P1 finding survived, the verdict is NO-SHIP. Do NOT fix anything yourself; the findings list above is the fix list.",
     `   - ${PROSE_RULE}`,
-    ...(scope ? ["   - Write SHIP or NO-SHIP only as the verdict line itself: never start any other line of the report with either word."] : []),
+    ...(scope
+      ? [`   - ${UNRUN_GATE_RULE}`, "   - Write SHIP or NO-SHIP only as the verdict line itself: never start any other line of the report with either word."]
+      : []),
     "   - If SHIP: say so and stop. Do NOT start unrelated new work.",
     "",
     "Keep it tight. This is a review pass that reports problems; it never rewrites code.",

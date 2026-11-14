@@ -1724,8 +1724,9 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
 //     rules), and the gates and 5c's diagnostics run there. Without the
 //     option a branch start is byte for byte the recorded plain one
 //     (test/branch-plain.json, made by test/branch-capture.mjs: on 0.12.0
-//     first, recorded again for B16's three prompt lines and for the
-//     critic's tightened wording, each diff checked to be those lines).
+//     first, recorded again for B16's three prompt lines, the critic's
+//     tightened wording and B21's unrun-gate rule, each diff checked to be
+//     those lines).
 {
   const fs = await import("node:fs");
   const path = await import("node:path");
@@ -2351,6 +2352,7 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
   const scratch = path.join(os.tmpdir(), "opencode", "reviewer-test");
   fs.mkdirSync(scratch, { recursive: true });
   const repo = fs.realpathSync(fs.mkdtempSync(path.join(scratch, "severity-")));
+  const wtParents = [];
   let hooks;
   try {
     const git = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
@@ -2383,7 +2385,9 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
         messages: async ({ path: p }) => [{ info: { role: "assistant" }, parts: [{ type: "text", text: reports.get(p.id) ?? "" }] }],
       },
     };
-    hooks = await plugin({ client, directory: repo, worktree: repo, $: makeShell() }, { idleDebounceMs: 0, updateCheck: false });
+    const wtParent = fs.mkdtempSync(path.join(scratch, "severity-wt-"));
+    wtParents.push(wtParent);
+    hooks = await plugin({ client, directory: repo, worktree: repo, $: makeShell() }, { idleDebounceMs: 0, updateCheck: false, branchWorktreeDir: wtParent });
     const call = (args) => hooks.tool.review_branch.execute(args, { sessionID: "orch-sev" });
     const idle = (id) => hooks.event({ event: { type: "session.idle", properties: { sessionID: id } } });
 
@@ -2396,6 +2400,12 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     assert.ok(branchPrompt.includes(slopCap), "and so does the slop critic's standing order");
     assert.ok(!branchPrompt.includes("P1 only for chatbot residue"), "which no longer makes false documentation P1 by itself");
     assert.ok(branchPrompt.includes("Write SHIP or NO-SHIP only as the verdict line itself: never start any other line of the report with either word."), "the verdict word stands on the verdict line only");
+
+    // B21 (the benchmark of 2026-11-13: all four false alarms were an unrun
+    // Gradle gate read as a failed one): in a branch review an unrun gate
+    // never makes NO-SHIP by itself.
+    const unrunRule = "A gate recorded as not run, for any reason (the time budget, no direct tool for it, dependencies not installed, the working tree not at the head), is not a failed gate and never makes the verdict NO-SHIP by itself: only a gate that ran and failed does. Name the gates that did not run in the report.";
+    assert.ok(branchPrompt.includes(`   - ${unrunRule}`), "a branch review's verdict rule says an unrun gate is never a failure by itself");
 
     // The slop critic's own agent prompt rates prose the same way: P2 at
     // most, P1 only for the behaviour case (the critic's round 2 P3 on
@@ -2416,6 +2426,7 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     assert.ok(ordinaryPrompt.includes(`   - ${proseRule}`) && ordinaryPrompt.includes(slopCap), "the automatic review caps a prose-only finding the same way");
     assert.ok(!ordinaryPrompt.includes("P1 only for chatbot residue"), "and no longer makes false documentation P1 by itself");
     assert.ok(!ordinaryPrompt.includes("verdict line itself"), "but keeps its verdict rules otherwise");
+    assert.ok(!ordinaryPrompt.includes("A gate recorded as not run, for any reason"), "and gets no branch rule about unrun gates");
     ordinary.hooks.dispose();
 
     // A report whose text states the other verdict is flagged on reading.
@@ -2429,9 +2440,19 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     await idle("sev-review-2");
     const clean = await call({ repo, base: "base-x", head: "lane/y" });
     assert.ok(clean.includes("verdict: SHIP") && !clean.includes("note: the report's text"), `a verdict word inside a sentence is not flagged: ${clean}`);
+    // B21 in a worktree review: a gate with no direct tool reads as not run.
+    const wtCall = await hooks.tool.review_branch.execute({ repo, base: "base-x", head: "lane/y", worktree: true }, { sessionID: "orch-sev" });
+    assert.ok(wtCall.includes("Branch review started"), wtCall);
+    const wtPrompt = prompts.get(`sev-review-${n}`);
+    assert.ok(wtPrompt.includes("A gate the review checkout cannot run at all (no direct tool for it, as for checks that run only through a build wrapper such as Gradle) is recorded as 'not run (no direct tool)', never as a failure."), "a worktree review records a gate with no direct tool as not run");
+    assert.ok(wtPrompt.includes(`   - ${unrunRule}`), "and its verdict rule says so too");
+    reports.set(`sev-review-${n}`, "SHIP");
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: `sev-review-${n}` } } });
+    assert.deepEqual(fs.readdirSync(wtParent), [], "and its checkout is gone after the verdict");
   } finally {
-    hooks?.dispose();
+    await hooks?.dispose();
     fs.rmSync(repo, { recursive: true, force: true });
+    for (const d of wtParents) fs.rmSync(d, { recursive: true, force: true });
   }
 }
 

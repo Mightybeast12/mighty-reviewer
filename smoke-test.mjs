@@ -1725,8 +1725,8 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
 //     option a branch start is byte for byte the recorded plain one
 //     (test/branch-plain.json, made by test/branch-capture.mjs: on 0.12.0
 //     first, recorded again for B16's three prompt lines, the critic's
-//     tightened wording, B21's unrun-gate rule and B17's two lines, each
-//     diff checked to be those lines).
+//     tightened wording, B21's unrun-gate rule and B17's two lines, and the
+//     critic's round 2 wording, each diff checked to be those lines).
 {
   const fs = await import("node:fs");
   const path = await import("node:path");
@@ -2404,8 +2404,16 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     // B21 (the benchmark of 2026-11-13: all four false alarms were an unrun
     // Gradle gate read as a failed one): in a branch review an unrun gate
     // never makes NO-SHIP by itself.
-    const unrunRule = "A gate recorded as not run because of the time budget, because it has no direct tool, because dependencies are not installed, or because the working tree is not at the head is not a failed gate and never makes the verdict NO-SHIP by itself: only a gate that ran and failed does, and a check that started and then crashed, timed out after starting its work, or printed errors ran and failed. Name the gates that did not run in the report.";
+    const unrunRule = "A gate recorded as not run because of the time budget, because it has no direct tool, because dependencies are not installed, or because the working tree is not at the head is not a failed gate and never makes the verdict NO-SHIP by itself: only a gate that ran and failed does. A check that started and then failed on its own (crashed, or exited with errors) ran and failed; a check stopped by this review's time budget or tool timeout is not run. Name the gates that did not run in the report.";
     assert.ok(branchPrompt.includes(`   - ${unrunRule}`), "a branch review's verdict rule says an unrun gate is never a failure by itself");
+    // The critic's round 2 on 3c83193..b164de6: a check the review's own
+    // time budget stopped is not run (P3, "timed out after starting its
+    // work" read it as failed), and a finding the critics report from
+    // reading keeps its own severity (its note: the automatic P1 is a gate's).
+    assert.ok(!branchPrompt.includes("timed out after starting its work"), "a check stopped by the review's own time budget is never read as failed");
+    const mechanicalP1 = "   Every mechanical failure is an automatic P1 finding. Record them; never fix anything.\n";
+    const readSeverity = "   Only a gate that ran makes a mechanical failure: findings the critics report from reading keep their own severity.\n";
+    assert.ok(branchPrompt.includes(mechanicalP1 + readSeverity), "in a branch review a finding the critics report from reading keeps its own severity");
 
     // With unrun gates no longer blocking, a branch review's critics report
     // what an unrun gate would have caught (the critic's P2 on
@@ -2437,6 +2445,7 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     assert.ok(!ordinaryPrompt.includes("P1 only for chatbot residue"), "and no longer makes false documentation P1 by itself");
     assert.ok(!ordinaryPrompt.includes("verdict line itself"), "but keeps its verdict rules otherwise");
     assert.ok(!ordinaryPrompt.includes("A gate recorded as not run because"), "and gets no branch rule about unrun gates");
+    assert.ok(ordinaryPrompt.includes(mechanicalP1) && !ordinaryPrompt.includes("keep their own severity"), "and its automatic-P1 line is what it was");
     assert.equal(delegateLine(ordinaryPrompt), ordinaryDelegate, "and its critics' standing order is byte for byte what it was");
     ordinary.hooks.dispose();
 

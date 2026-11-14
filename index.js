@@ -245,9 +245,11 @@ const SLOP_AGENT = "ai-slop-critic";
 const PROSE_EXCEPTION =
   "If the comment or the documentation is right and the code contradicts it, or the text states a guarantee the code lacks (security, data safety, limits), it is a behaviour finding at its own severity.";
 // Backlog B21 (the benchmark of 2026-11-13: all four false alarms, on both
-// versions, were a gate the review could not run, read as a failed one).
+// versions, were a gate the review could not run, read as a failed one). A
+// check this review's own time budget stopped is not run (the critic's
+// round 2 on 3c83193..b164de6).
 const UNRUN_GATE_RULE =
-  "A gate recorded as not run because of the time budget, because it has no direct tool, because dependencies are not installed, or because the working tree is not at the head is not a failed gate and never makes the verdict NO-SHIP by itself: only a gate that ran and failed does, and a check that started and then crashed, timed out after starting its work, or printed errors ran and failed. Name the gates that did not run in the report.";
+  "A gate recorded as not run because of the time budget, because it has no direct tool, because dependencies are not installed, or because the working tree is not at the head is not a failed gate and never makes the verdict NO-SHIP by itself: only a gate that ran and failed does. A check that started and then failed on its own (crashed, or exited with errors) ran and failed; a check stopped by this review's time budget or tool timeout is not run. Name the gates that did not run in the report.";
 const PROSE_RULE = `A finding about comments, documentation or other prose alone, with no change in behaviour, is at most P2 in this review and never makes the verdict NO-SHIP. ${PROSE_EXCEPTION}`;
 
 const BRANCH_LOST_REPORT =
@@ -532,6 +534,7 @@ function buildReviewPrompt(languageHints, projectRules, timeoutMs, scope = null)
     "   - Scan the changed files for leftover debug output (console.log, print-debugging, debugger statements) and commented-out code blocks.",
     "   - Check whether the diff touches linter/formatter/typechecker config (.eslintrc*, biome.json*, tsconfig*, .prettierrc*, ruff.toml, clippy.toml) in a way that WEAKENS rules.",
     "   Every mechanical failure is an automatic P1 finding. Record them; never fix anything.",
+    ...(scope ? ["   Only a gate that ran makes a mechanical failure: findings the critics report from reading keep their own severity."] : []),
     scope
       ? "3. Delegate the critique to FOUR subagents IN PARALLEL (fire all four task calls in the same message, then wait for all). The critic tasks must run in the FOREGROUND: NEVER launch them as background tasks, and NEVER end your turn while any critique is still pending or the final verdict line is missing. Give each: the mechanical-gate results as context, the project review rules above (if any), and these standing orders: it is strictly read-only, it must not report what a gate that ran already covers; when the gates were recorded as not run, it MUST report the type errors, lint violations and leftover debug output it finds by reading the head (its standing rule about deterministic tooling does not apply then), and it must omit findings it is less than 70% confident are real and material:"
       : "3. Delegate the critique to FOUR subagents IN PARALLEL (fire all four task calls in the same message, then wait for all). The critic tasks must run in the FOREGROUND: NEVER launch them as background tasks, and NEVER end your turn while any critique is still pending or the final verdict line is missing. Give each: the mechanical-gate results as context, the project review rules above (if any), and these standing orders: it is strictly read-only, it must not report anything the mechanical gates already cover, and it must omit findings it is less than 70% confident are real and material:",

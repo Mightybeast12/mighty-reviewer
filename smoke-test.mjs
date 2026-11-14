@@ -2404,8 +2404,18 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     // B21 (the benchmark of 2026-11-13: all four false alarms were an unrun
     // Gradle gate read as a failed one): in a branch review an unrun gate
     // never makes NO-SHIP by itself.
-    const unrunRule = "A gate recorded as not run, for any reason (the time budget, no direct tool for it, dependencies not installed, the working tree not at the head), is not a failed gate and never makes the verdict NO-SHIP by itself: only a gate that ran and failed does. Name the gates that did not run in the report.";
+    const unrunRule = "A gate recorded as not run because of the time budget, because it has no direct tool, because dependencies are not installed, or because the working tree is not at the head is not a failed gate and never makes the verdict NO-SHIP by itself: only a gate that ran and failed does, and a check that started and then crashed, timed out after starting its work, or printed errors ran and failed. Name the gates that did not run in the report.";
     assert.ok(branchPrompt.includes(`   - ${unrunRule}`), "a branch review's verdict rule says an unrun gate is never a failure by itself");
+
+    // With unrun gates no longer blocking, a branch review's critics report
+    // what an unrun gate would have caught (the critic's P2 on
+    // 3c83193..c47e122); the automatic review's standing order stays
+    // byte for byte as it was.
+    const delegateLine = (text) => text.split("\n").find((l) => l.startsWith("3. Delegate the critique")) ?? "";
+    const branchOrder = "it must not report what a gate that ran already covers; when the gates were recorded as not run, it MUST report the type errors, lint violations and leftover debug output it finds by reading the head (its standing rule about deterministic tooling does not apply then)";
+    assert.ok(delegateLine(branchPrompt).includes(branchOrder), `a branch review's critics report what an unrun gate would have caught: ${delegateLine(branchPrompt).slice(-400)}`);
+    assert.ok(!delegateLine(branchPrompt).includes("it must not report anything the mechanical gates already cover"), "and are not told to leave it out");
+    const ordinaryDelegate = "3. Delegate the critique to FOUR subagents IN PARALLEL (fire all four task calls in the same message, then wait for all). The critic tasks must run in the FOREGROUND: NEVER launch them as background tasks, and NEVER end your turn while any critique is still pending or the final verdict line is missing. Give each: the mechanical-gate results as context, the project review rules above (if any), and these standing orders: it is strictly read-only, it must not report anything the mechanical gates already cover, and it must omit findings it is less than 70% confident are real and material:";
 
     // The slop critic's own agent prompt rates prose the same way: P2 at
     // most, P1 only for the behaviour case (the critic's round 2 P3 on
@@ -2426,7 +2436,8 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     assert.ok(ordinaryPrompt.includes(`   - ${proseRule}`) && ordinaryPrompt.includes(slopCap), "the automatic review caps a prose-only finding the same way");
     assert.ok(!ordinaryPrompt.includes("P1 only for chatbot residue"), "and no longer makes false documentation P1 by itself");
     assert.ok(!ordinaryPrompt.includes("verdict line itself"), "but keeps its verdict rules otherwise");
-    assert.ok(!ordinaryPrompt.includes("A gate recorded as not run, for any reason"), "and gets no branch rule about unrun gates");
+    assert.ok(!ordinaryPrompt.includes("A gate recorded as not run because"), "and gets no branch rule about unrun gates");
+    assert.equal(delegateLine(ordinaryPrompt), ordinaryDelegate, "and its critics' standing order is byte for byte what it was");
     ordinary.hooks.dispose();
 
     // A report whose text states the other verdict is flagged on reading.

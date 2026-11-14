@@ -4,8 +4,9 @@
 // start without `worktree` with test/branch-plain.json, which this
 // function recorded: on 0.12.0 first, and again for backlog B16's three
 // prompt lines, for the critic's tightened wording of 2026-11-13 and for
-// B21's unrun-gate rule and B17's trace and residual lines, each diff
-// checked to be exactly those lines).
+// B21's unrun-gate rule, B17's trace and residual lines, and the critic's
+// round on them (the branch critics' standing order, the closed list),
+// each diff checked to be exactly those lines).
 // It takes the plugin factory and the shell
 // maker as arguments, so the same capture runs on any version's files.
 

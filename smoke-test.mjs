@@ -1747,7 +1747,7 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
 //     first, recorded again for B16's three prompt lines, the critic's
 //     tightened wording, B21's unrun-gate rule and B17's two lines, the
 //     critic's round 2 wording, run 10's two lines and its step 3 order,
-//     and B24's merge-base probe, each diff checked to be those lines).
+//     each diff checked to be those lines; B24 adds nothing to it).
 {
   const fs = await import("node:fs");
   const path = await import("node:path");
@@ -2751,6 +2751,11 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
   await h.childIdle("child-1");
   assert.ok((await status.execute({}, { sessionID: "pt-parent" })).includes("2/4"), "two notices in, 2/4 returned");
   assert.ok(h.titles.at(-1).title.includes("critics 2/4"), `the title follows: ${h.titles.at(-1).title}`);
+  // The critic's P3: with every notice in and the review not yet answered,
+  // the phase is verifying.
+  h.setMessages([launch, ...ids.map(deliver)]);
+  await h.childIdle("child-1");
+  assert.ok((await status.execute({}, { sessionID: "pt-parent" })).includes("verifying"), "every notice in: verifying");
   h.setMessages([launch, ...ids.map(deliver), { info: { role: "assistant" }, parts: [{ type: "text", text: "report\n\nSHIP" }] }]);
   await h.childIdle("child-1");
   assert.ok((await status.execute({}, { sessionID: "pt-parent" })).includes("verdict: SHIP"), "and the review ends at the idle after the last notice");
@@ -2818,7 +2823,7 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     assert.ok(moved.includes("   base-x is 1 commit past the merge base: the range is read against the merge base, and the tree lane/x makes once merged into base-x's tip was not built or reviewed. Say so in the mechanical-gates section."), "a review whose base moved says the merged tree was not reviewed");
     assert.ok(moved.includes(`\`oldHelperName\` (feature.js:1, removed in ${renameSha})`), `and names what the head still uses that the base's tip removed: ${moved.split("\n").find((l) => l.includes("no longer has")) ?? "(no line)"}`);
     assert.ok(!moved.includes("`stillThereName`"), "a name the base removed from one file but still has in another is not listed");
-    assert.ok(moved.includes("Each is a likely compile break after the merge: give the list to the risk critic, record each it confirms as a P1 finding at the head's line, and each it refutes in one line."), "for the risk critic to confirm as P1");
+    assert.ok(moved.includes("Each is a likely compile break after the merge: give the list to the risk critic, record each it confirms as a P1 finding at the head's line, and each it refutes in one line. A name the head itself declares, or only mentions in a comment or a string, is not a break."), "for the risk critic to confirm as P1");
 
     assert.ok((await call({ repo, base: "base-x", head: "lane/y" })).includes("Branch review started"));
     const movedClean = prompts.get("stale-review-2");
@@ -2828,6 +2833,50 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     assert.ok((await call({ repo, base: "base-still", head: "lane/x" })).includes("Branch review started"));
     const still = prompts.get("stale-review-3");
     assert.ok(!still.includes("past the merge base") && !still.includes("no longer has anywhere"), "a base at the merge base adds neither line");
+
+    // The critic's round on 320cc6f..3c4edfb. A base that deletes a whole
+    // file the head still uses (P2): its names count as removed.
+    git("checkout", "-q", "-b", "lane/z", "base-still");
+    fs.writeFileSync(path.join(repo, "uses-gone.js"), "import { goneHelperName } from \"./gone.js\";\nexport const z = goneHelperName();\n");
+    git("add", "uses-gone.js");
+    git("commit", "-q", "-m", "lane z");
+    git("checkout", "-q", "-b", "base-del", "base-still");
+    fs.writeFileSync(path.join(repo, "gone.js"), "export function goneHelperName() {\n  return 0;\n}\n");
+    git("add", "gone.js");
+    git("commit", "-q", "-m", "add gone.js");
+    git("checkout", "-q", "lane/z");
+    git("merge", "-q", "--no-edit", "base-del");
+    git("checkout", "-q", "base-del");
+    git("rm", "-q", "gone.js");
+    git("commit", "-q", "-m", "delete gone.js");
+    git("checkout", "-q", "lane/z");
+    assert.ok((await call({ repo, base: "base-del", head: "lane/z" })).includes("Branch review started"));
+    const deleted = prompts.get("stale-review-4");
+    assert.ok(deleted.includes("`goneHelperName` (uses-gone.js:1"), `a name whose whole file the base deleted is listed: ${deleted.split("\n").find((l) => l.includes("no longer has")) ?? "(no line)"}`);
+
+    // A grep that fails (P2): exit 128 is not "no match", so nothing is
+    // flagged; the review says the check could not run.
+    git("checkout", "-q", "-b", "lane/x2", "lane/x");
+    fs.writeFileSync(path.join(repo, "feature2.js"), "export const again = 1;\n");
+    git("add", "feature2.js");
+    git("commit", "-q", "-m", "lane x2");
+    git("config", "grep.threads", "not-a-number");
+    assert.ok((await call({ repo, base: "base-x", head: "lane/x2" })).includes("Branch review started"));
+    const failed = prompts.get("stale-review-5");
+    git("config", "--unset", "grep.threads");
+    assert.ok(failed.includes("   base-x is 1 commit past the merge base:"), "the moved base is still said");
+    assert.ok(!failed.includes("no longer has anywhere"), `a failing grep flags no name: ${failed.split("\n").find((l) => l.includes("no longer has")) ?? ""}`);
+    assert.ok(failed.includes("The check for names lane/x2 still uses that base-x's tip removed could not run"), "and says the check did not run");
+
+    // Caps and the budget (P2, P3): a cut list says so; an exhausted budget
+    // or a check that throws never ends the start.
+    const { staleBaseCheck, safeStaleBaseCheck } = await import("./branch.js");
+    const range = { root: repo, baseSha: git("rev-parse", "base-x"), headSha: git("rev-parse", "lane/x") };
+    const capped = await staleBaseCheck(range, { maxNames: 0 });
+    assert.ok(capped && capped.cut === true && capped.names.length === 0, `a cap that cuts the list says so: ${JSON.stringify(capped)}`);
+    const spent = await staleBaseCheck(range, { budgetMs: 0 });
+    assert.equal(spent, null, "a budget spent before the merge-base probe gives no check");
+    assert.equal(await safeStaleBaseCheck(range, { run: async () => { throw new Error("boom"); } }), null, "a check that throws gives null");
   } finally {
     await hooks?.dispose();
     fs.rmSync(repo, { recursive: true, force: true });

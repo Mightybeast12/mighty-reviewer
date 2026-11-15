@@ -6,6 +6,7 @@
  * session itself; nothing here starts one.
  */
 
+import { execFile } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -92,66 +93,131 @@ export async function resolveBranchRange($, args, { defaultRepo, isIgnoredFile }
 // 2026-11-14 did not compile: its new test called a composable main had
 // renamed after the lane's merge base). When base's tip is ahead of the
 // merge base, the names (identifiers of six or more characters) the head
-// adds in code files that base's commits since the merge base removed and
-// did not add back, and that `git grep -w` no longer finds anywhere in
-// base's tip, are likely compile breaks once merged. Returns null when the
-// base did not move, else { ahead, names: [{ name, file, line, removedIn }] }.
-// Git only (about 3 s on a large repository), no build.
+// adds in code files that base's commits since the merge base removed (in
+// place or with a whole deleted file) and did not add back, and that a `git
+// grep -w` of base's tip no longer finds, are likely compile breaks once
+// merged. Returns null when the base did not move (or the probe could not
+// tell), else { ahead, names: [{ name, file, line, removedIn }], cut, unchecked }:
+// `cut` when a cap or the time budget shortened the list, `unchecked` when
+// git failed, so no name is claimed. Git only, run directly so its exit
+// status is read (a grep error is not "no match"), within a wall-clock
+// budget, before the review session starts.
 const CODE_FILE = /\.(kt|kts|java|scala|groovy|rs|go|swift|m|mm|c|cc|cpp|cxx|h|hh|hpp|cs|fs|ts|tsx|js|jsx|mjs|cjs|py|rb|php|dart|lua|sh|bash|ex|exs|hs|ml|clj|vue|svelte)$/i;
 const IDENTIFIER = /\b[A-Za-z_][A-Za-z0-9_]{5,}\b/g;
-const MAX_STALE_CANDIDATES = 100;
-const MAX_STALE_NAMES = 20;
+const STALE_BUDGET_MS = 20000;
+// Plain patch text whatever the user's git config says (an external diff, a
+// textconv, other prefixes, renames shown as such).
+const STALE_DIFF_FLAGS = ["--no-ext-diff", "--no-textconv", "--no-renames", "--no-color", "--src-prefix=a/", "--dst-prefix=b/", "-U0"];
+
+function runGit(root, args, timeoutMs) {
+  return new Promise((resolve) => {
+    execFile("git", ["-c", "core.quotepath=off", "-C", root, ...args], { maxBuffer: 64 * 1024 * 1024, timeout: Math.max(1, timeoutMs) }, (error, stdout) => {
+      resolve({ code: error ? (typeof error.code === "number" ? error.code : -1) : 0, stdout: String(stdout ?? "") });
+    });
+  });
+}
+
+function patchPath(header) {
+  let target = header.replace(/\t$/, "");
+  if (target.startsWith('"') && target.endsWith('"')) {
+    try {
+      target = JSON.parse(target);
+    } catch {
+      return null;
+    }
+  }
+  if (target === "/dev/null") return null;
+  return target.replace(/^[ab]\//, "");
+}
 
 function diffLines(diff, isIgnoredFile, onLine) {
-  let file = null;
+  const keep = (file) => (file && CODE_FILE.test(file) && !isIgnoredFile(file) ? file : null);
+  let from = null;
+  let to = null;
   let next = 0;
   for (const line of diff.split("\n")) {
-    if (line.startsWith("+++ ")) {
-      const target = line.slice(4).replace(/^b\//, "");
-      file = target === "/dev/null" || isIgnoredFile(target) || !CODE_FILE.test(target) ? null : target;
+    if (line.startsWith("--- ")) {
+      from = keep(patchPath(line.slice(4)));
       continue;
     }
-    if (line.startsWith("--- ")) continue;
+    if (line.startsWith("+++ ")) {
+      to = keep(patchPath(line.slice(4)));
+      continue;
+    }
     const hunk = line.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
     if (hunk) {
       next = parseInt(hunk[1], 10);
       continue;
     }
-    if (!file) continue;
-    if (line.startsWith("+")) onLine(file, "+", next++, line.slice(1));
-    else if (line.startsWith("-")) onLine(file, "-", next, line.slice(1));
+    if (line.startsWith("+")) {
+      if (to) onLine(to, "+", next, line.slice(1));
+      next++;
+    } else if (line.startsWith("-") && from) {
+      onLine(from, "-", next, line.slice(1));
+    }
   }
 }
 
-export async function staleBaseCheck($, range, { isIgnoredFile = () => false } = {}) {
+export async function staleBaseCheck(range, { isIgnoredFile = () => false, budgetMs = STALE_BUDGET_MS, maxCandidates = 100, maxNames = 20, run = runGit } = {}) {
   const { root, baseSha, headSha } = range;
-  const mergeBase = await gitText($`git -C ${root} merge-base ${baseSha} ${headSha}`);
+  const deadline = Date.now() + budgetMs;
+  const left = () => deadline - Date.now();
+  const git = async (args) => (left() > 0 ? run(root, args, left()) : { code: -1, stdout: "" });
+  const probe = await git(["merge-base", baseSha, headSha]);
+  const mergeBase = probe.code === 0 ? probe.stdout.trim() : "";
   if (!mergeBase || mergeBase === baseSha) return null;
-  // Whole arguments built here: the Node fallback of the shell tag splits a
-  // template's literal text, so `${a}..${b}` would reach git as three words.
   const since = `${mergeBase}..${baseSha}`;
-  const ahead = parseInt(await gitText($`git -C ${root} rev-list --count ${since}`), 10) || 0;
+  const counted = await git(["rev-list", "--count", since]);
+  const ahead = counted.code === 0 ? parseInt(counted.stdout.trim(), 10) || 0 : 0;
   if (!ahead) return null;
+  const unchecked = { ahead, names: [], cut: false, unchecked: true };
+  const headDiff = await git(["diff", ...STALE_DIFF_FLAGS, mergeBase, headSha]);
+  const baseDiff = headDiff.code === 0 ? await git(["diff", ...STALE_DIFF_FLAGS, mergeBase, baseSha]) : headDiff;
+  if (headDiff.code !== 0 || baseDiff.code !== 0) return unchecked;
   const added = new Map();
-  diffLines(await gitText($`git -C ${root} diff -U0 --no-color ${mergeBase} ${headSha}`), isIgnoredFile, (file, kind, line, text) => {
+  diffLines(headDiff.stdout, isIgnoredFile, (file, kind, line, text) => {
     if (kind !== "+") return;
     for (const name of text.match(IDENTIFIER) ?? []) if (!added.has(name)) added.set(name, { file, line });
   });
   const removed = new Set();
   const readded = new Set();
-  diffLines(await gitText($`git -C ${root} diff -U0 --no-color ${mergeBase} ${baseSha}`), isIgnoredFile, (file, kind, line, text) => {
+  diffLines(baseDiff.stdout, isIgnoredFile, (file, kind, line, text) => {
     for (const name of text.match(IDENTIFIER) ?? []) (kind === "-" ? removed : readded).add(name);
   });
-  const candidates = [...added.keys()].filter((name) => removed.has(name) && !readded.has(name)).slice(0, MAX_STALE_CANDIDATES);
-  const names = [];
-  for (const name of candidates) {
-    if (await gitText($`git -C ${root} grep -l -w -F -e ${name} ${baseSha}`)) continue;
-    const pickaxe = `-S${name}`;
-    const removedIn = (await gitText($`git -C ${root} log --format=%h --abbrev=12 ${pickaxe} ${since}`)).split("\n")[0] || null;
-    names.push({ name, ...added.get(name), removedIn });
-    if (names.length >= MAX_STALE_NAMES) break;
+  let candidates = [...added.keys()].filter((name) => removed.has(name) && !readded.has(name));
+  let cut = candidates.length > maxCandidates;
+  candidates = candidates.slice(0, maxCandidates);
+  if (!candidates.length) return { ahead, names: [], cut, unchecked: false };
+  // One grep of base's tip for every candidate: exit 0 some found, 1 none,
+  // anything else an error (then no name is claimed).
+  const grep = await git(["grep", "--no-recurse-submodules", "-I", "-o", "-h", "-w", "-F", ...candidates.flatMap((name) => ["-e", name]), baseSha]);
+  if (grep.code !== 0 && grep.code !== 1) return unchecked;
+  const present = new Set(grep.stdout.split("\n").map((token) => token.trim()).filter(Boolean));
+  let gone = candidates.filter((name) => !present.has(name));
+  if (gone.length > maxNames) {
+    cut = true;
+    gone = gone.slice(0, maxNames);
   }
-  return { ahead, names };
+  const names = [];
+  for (const name of gone) {
+    let removedIn = null;
+    if (left() > 0) {
+      const log = await git(["log", "--format=%h", "--abbrev=12", `-S${name}`, since]);
+      if (log.code === 0) removedIn = log.stdout.split("\n")[0].trim() || null;
+    }
+    names.push({ name, ...added.get(name), removedIn });
+  }
+  return { ahead, names, cut, unchecked: false };
+}
+
+// The review's start never waits on or fails with this check: any error
+// reads as no check (the critic's round on 320cc6f..3c4edfb).
+export async function safeStaleBaseCheck(range, options) {
+  try {
+    return await staleBaseCheck(range, options);
+  } catch {
+    return null;
+  }
 }
 
 export function shortRange(range) {

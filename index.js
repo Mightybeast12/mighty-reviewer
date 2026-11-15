@@ -176,7 +176,7 @@ import {
   removeReviewWorktree,
   resolveBranchRange,
   shortRange,
-  staleBaseCheck,
+  safeStaleBaseCheck,
 } from "./branch.js";
 import { defaultBranchStoreDir, forgetBranchReview, loadBranchReview, loadBranchReviews, saveBranchReview } from "./branch-store.js";
 
@@ -550,9 +550,14 @@ function buildReviewPrompt(languageHints, projectRules, timeoutMs, scope = null)
     ...(scope?.stale
       ? [
           `   ${scope.baseRef} is ${scope.stale.ahead} commit${scope.stale.ahead === 1 ? "" : "s"} past the merge base: the range is read against the merge base, and the tree ${scope.headRef} makes once merged into ${scope.baseRef}'s tip was not built or reviewed. Say so in the mechanical-gates section.`,
+          ...(scope.stale.unchecked
+            ? [
+                `   The check for names ${scope.headRef} still uses that ${scope.baseRef}'s tip removed could not run (git failed or the time budget ran out): ask the risk critic to look for such names.`,
+              ]
+            : []),
           ...(scope.stale.names.length
             ? [
-                `   Names ${scope.headRef} adds that ${scope.baseRef}'s tip no longer has anywhere (its commits since the merge base removed or renamed them): ${scope.stale.names.map((entry) => `\`${entry.name}\` (${entry.file}:${entry.line}${entry.removedIn ? `, removed in ${entry.removedIn}` : ""})`).join(", ")}. Each is a likely compile break after the merge: give the list to the risk critic, record each it confirms as a P1 finding at the head's line, and each it refutes in one line.`,
+                `   Names ${scope.headRef} adds that ${scope.baseRef}'s tip no longer has anywhere (its commits since the merge base removed or renamed them)${scope.stale.cut ? `, the first ${scope.stale.names.length} (more may exist)` : ""}: ${scope.stale.names.map((entry) => `\`${entry.name}\` (${entry.file}:${entry.line}${entry.removedIn ? `, removed in ${entry.removedIn}` : ""})`).join(", ")}. Each is a likely compile break after the merge: give the list to the risk critic, record each it confirms as a P1 finding at the head's line, and each it refutes in one line. A name the head itself declares, or only mentions in a comment or a string, is not a break.`,
               ]
             : []),
         ]
@@ -1049,11 +1054,18 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
     const state = parentSessionID ? reviewStates.get(parentSessionID) : undefined;
     if (state?.status !== "running" || state.phase !== "critics") return;
     const total = Math.max(state.criticsTotal, launched);
-    const done = Math.min(total, launched - pending);
+    // Never lower a count the after-hook made for a foreground critic.
+    const done = Math.min(total, Math.max(state.criticsDone, launched - pending));
     if (done === state.criticsDone && total === state.criticsTotal) return;
     state.criticsTotal = total;
     state.criticsDone = done;
     state.updatedAt = Date.now();
+    if (done >= total) {
+      state.phase = "verifying";
+      void setReviewTitle(reviewSessionID, "verifying", parentSessionID);
+      if (progressToasts) void showToast("Review progress: critics done, verifying findings.", "info", parentSessionID, { category: "progress" });
+      return;
+    }
     void setReviewTitle(reviewSessionID, `critics ${done}/${total}`, parentSessionID);
   }
 
@@ -1808,7 +1820,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       }
       const rules = await projectRules(range.root);
       // B24: a base that moved past the merge base (null when it did not).
-      const stale = await staleBaseCheck($, range, { isIgnoredFile });
+      const stale = await safeStaleBaseCheck(range, { isIgnoredFile });
       const reviewPrompt = buildReviewPrompt(languageHintsFor(range.files), rules, branchTimeoutMs, {
         ...range,
         ...(checkout ? { checkout, unlinked } : {}),

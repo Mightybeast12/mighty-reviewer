@@ -26,6 +26,7 @@
   "git -C <REPO> rev-parse --verify --quiet lane/x^{commit}",
   "git -C <REPO> merge-base <BASE> <HEAD>",
   "git -C <REPO> diff --name-only <BASE>...<HEAD>",
-  "git -C <REPO> diff --numstat <BASE>...<HEAD>"
+  "git -C <REPO> diff --numstat <BASE>...<HEAD>",
+  "git -C <REPO> merge-base <BASE> <HEAD>"
  ]
 }

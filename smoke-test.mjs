@@ -778,6 +778,17 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
   await hookCallbacks["tool.execute.before"]({ sessionID: "child-v2", tool: "subagent", input: {} });
   const progress = await tools[0].execute({}, { sessionID: "parent-v2" });
   assert.ok(progress.content.includes("waiting on critics (0/1"), `v2 tool names drive phase tracking: ${progress.content}`);
+  // The owner's yes of 2026-11-15 (the progress-title P3): on OpenCode 2.3
+  // a subagent call returns at once with the critic still running; its
+  // execute.after is not the critic's result.
+  await hookCallbacks["tool.execute.after"]({
+    sessionID: "child-v2",
+    tool: "subagent",
+    status: "completed",
+    result: { metadata: { sessionID: "crit-v2", status: "running" }, content: [{ type: "text", text: "The subagent is working in the background (sessionID: crit-v2)." }] },
+  });
+  const stillRunning = await tools[0].execute({}, { sessionID: "parent-v2" });
+  assert.ok(stillRunning.content.includes("waiting on critics (0/1"), `a background launch's return is not a critic done: ${stillRunning.content}`);
 
   // Child idle with NO-SHIP: findings injected into the parent, notice posted.
   push({ type: "session.execution.succeeded", location: { directory: "/tmp/v2-project" }, data: { sessionID: "child-v2" } });
@@ -1736,7 +1747,7 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
 //     first, recorded again for B16's three prompt lines, the critic's
 //     tightened wording, B21's unrun-gate rule and B17's two lines, the
 //     critic's round 2 wording, run 10's two lines and its step 3 order,
-//     each diff checked to be those lines).
+//     and B24's merge-base probe, each diff checked to be those lines).
 {
   const fs = await import("node:fs");
   const path = await import("node:path");
@@ -2716,6 +2727,110 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     await hooks?.dispose();
     fs.rmSync(repo, { recursive: true, force: true });
     fs.rmSync(wtParent, { recursive: true, force: true });
+  }
+}
+
+// 37b. The automatic review's progress counts a background critic done
+//      when its notice arrives (the owner's yes of 2026-11-15, the
+//      progress-title P3), not when its subagent call returns.
+{
+  const h = await makeHarness("unused");
+  const status = h.hooks.tool.review_status;
+  await h.hooks["command.execute.before"]({ command: "mighty-review", sessionID: "pt-parent" }, { parts: [] });
+  await h.tick();
+  const ids = ["pc-1", "pc-2", "pc-3", "pc-4"];
+  const launch = { info: { role: "assistant" }, parts: ids.map((id) => ({ type: "tool", name: "subagent", state: { status: "completed", metadata: { sessionID: id, status: "running" }, content: [{ type: "text", text: `The subagent is working in the background (sessionID: ${id}).` }] } })) };
+  const deliver = (id) => ({ info: { role: "user" }, parts: [{ type: "text", text: `<subagent sessionID="${id}" state="completed">\nok\n</subagent>` }] });
+  for (const id of ids) {
+    await h.hooks["tool.execute.before"]({ sessionID: "child-1", tool: "task" }, { args: {} });
+    await h.hooks["tool.execute.after"]({ sessionID: "child-1", tool: "task", background: true, childSessionID: id });
+  }
+  assert.ok((await status.execute({}, { sessionID: "pt-parent" })).includes("0/4"), "four background launches leave 0/4 returned");
+  assert.ok(!h.titles.some((t) => t.title.includes("verifying")), "and no title says verifying");
+  h.setMessages([launch, deliver("pc-1"), deliver("pc-2"), { info: { role: "assistant" }, parts: [{ type: "text", text: "two in" }] }]);
+  await h.childIdle("child-1");
+  assert.ok((await status.execute({}, { sessionID: "pt-parent" })).includes("2/4"), "two notices in, 2/4 returned");
+  assert.ok(h.titles.at(-1).title.includes("critics 2/4"), `the title follows: ${h.titles.at(-1).title}`);
+  h.setMessages([launch, ...ids.map(deliver), { info: { role: "assistant" }, parts: [{ type: "text", text: "report\n\nSHIP" }] }]);
+  await h.childIdle("child-1");
+  assert.ok((await status.execute({}, { sessionID: "pt-parent" })).includes("verdict: SHIP"), "and the review ends at the idle after the last notice");
+  h.hooks.dispose();
+}
+
+// 38. A base that moved past the merge base (backlog B24, the owner's yes of
+//     2026-11-15; lane C704's SHIP of 2026-11-14 whose merged tree did not
+//     compile: its new test called a composable main had renamed since the
+//     lane's merge base). The review says the merged tree was not reviewed,
+//     and lists the names the head adds that the base's tip no longer has
+//     anywhere, for the risk critic to confirm as P1.
+{
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const { execFileSync } = await import("node:child_process");
+  const scratch = path.join(os.tmpdir(), "opencode", "reviewer-test");
+  fs.mkdirSync(scratch, { recursive: true });
+  const repo = fs.realpathSync(fs.mkdtempSync(path.join(scratch, "stalebase-")));
+  let hooks;
+  try {
+    const git = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
+    git("init", "-q");
+    git("config", "user.email", "smoke@example.invalid");
+    git("config", "user.name", "smoke");
+    fs.writeFileSync(path.join(repo, "util.js"), "export function oldHelperName() {\n  return 1;\n}\nexport const stillThereName = 3;\n");
+    fs.writeFileSync(path.join(repo, "keep.js"), "export const stillThereName = 3;\n");
+    git("add", "util.js", "keep.js");
+    git("commit", "-q", "-m", "base");
+    git("branch", "base-x");
+    git("branch", "base-still");
+    git("checkout", "-q", "-b", "lane/x");
+    fs.writeFileSync(path.join(repo, "feature.js"), "import { oldHelperName } from \"./util.js\";\n\nexport const feature = () => oldHelperName() + stillThereName;\n");
+    git("add", "feature.js");
+    git("commit", "-q", "-m", "lane x");
+    git("checkout", "-q", "-b", "lane/y", "base-x");
+    fs.writeFileSync(path.join(repo, "other.js"), "export const otherThing = 2;\n");
+    git("add", "other.js");
+    git("commit", "-q", "-m", "lane y");
+    git("checkout", "-q", "base-x");
+    fs.writeFileSync(path.join(repo, "util.js"), "export function newHelperName() {\n  return 1;\n}\n");
+    git("commit", "-q", "-am", "rename the helper");
+    const renameSha = git("rev-parse", "--short=12", "HEAD");
+    git("checkout", "-q", "lane/x");
+    const prompts = new Map();
+    let n = 0;
+    const client = {
+      v2: true,
+      tui: { showToast: async () => {} },
+      app: { log: async () => {} },
+      session: {
+        get: async ({ path: p }) => ({ data: { id: p.id } }),
+        create: async () => ({ data: { id: `stale-review-${++n}` } }),
+        update: async () => {},
+        abort: async () => {},
+        promptAsync: async ({ path: p, body }) => prompts.set(p.id, body.parts[0].text),
+        messages: async () => [],
+      },
+    };
+    hooks = await plugin({ client, directory: repo, worktree: repo, $: makeShell() }, { idleDebounceMs: 0, updateCheck: false });
+    const call = (args) => hooks.tool.review_branch.execute(args, { sessionID: "orch-stale" });
+
+    assert.ok((await call({ repo, base: "base-x", head: "lane/x" })).includes("Branch review started"));
+    const moved = prompts.get("stale-review-1");
+    assert.ok(moved.includes("   base-x is 1 commit past the merge base: the range is read against the merge base, and the tree lane/x makes once merged into base-x's tip was not built or reviewed. Say so in the mechanical-gates section."), "a review whose base moved says the merged tree was not reviewed");
+    assert.ok(moved.includes(`\`oldHelperName\` (feature.js:1, removed in ${renameSha})`), `and names what the head still uses that the base's tip removed: ${moved.split("\n").find((l) => l.includes("no longer has")) ?? "(no line)"}`);
+    assert.ok(!moved.includes("`stillThereName`"), "a name the base removed from one file but still has in another is not listed");
+    assert.ok(moved.includes("Each is a likely compile break after the merge: give the list to the risk critic, record each it confirms as a P1 finding at the head's line, and each it refutes in one line."), "for the risk critic to confirm as P1");
+
+    assert.ok((await call({ repo, base: "base-x", head: "lane/y" })).includes("Branch review started"));
+    const movedClean = prompts.get("stale-review-2");
+    assert.ok(movedClean.includes("   base-x is 1 commit past the merge base:"), "a moved base is said even when no name is stale");
+    assert.ok(!movedClean.includes("no longer has anywhere"), "but no names are listed");
+
+    assert.ok((await call({ repo, base: "base-still", head: "lane/x" })).includes("Branch review started"));
+    const still = prompts.get("stale-review-3");
+    assert.ok(!still.includes("past the merge base") && !still.includes("no longer has anywhere"), "a base at the merge base adds neither line");
+  } finally {
+    await hooks?.dispose();
+    fs.rmSync(repo, { recursive: true, force: true });
   }
 }
 

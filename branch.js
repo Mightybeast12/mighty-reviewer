@@ -88,6 +88,72 @@ export async function resolveBranchRange($, args, { defaultRepo, isIgnoredFile }
   return { root, baseRef, headRef, baseSha, headSha, files, ignoredOnly: allFiles.length > 0 && files.length === 0, lines };
 }
 
+// Backlog B24 (the owner's yes of 2026-11-15; lane C704's merged tree of
+// 2026-11-14 did not compile: its new test called a composable main had
+// renamed after the lane's merge base). When base's tip is ahead of the
+// merge base, the names (identifiers of six or more characters) the head
+// adds in code files that base's commits since the merge base removed and
+// did not add back, and that `git grep -w` no longer finds anywhere in
+// base's tip, are likely compile breaks once merged. Returns null when the
+// base did not move, else { ahead, names: [{ name, file, line, removedIn }] }.
+// Git only (about 3 s on a large repository), no build.
+const CODE_FILE = /\.(kt|kts|java|scala|groovy|rs|go|swift|m|mm|c|cc|cpp|cxx|h|hh|hpp|cs|fs|ts|tsx|js|jsx|mjs|cjs|py|rb|php|dart|lua|sh|bash|ex|exs|hs|ml|clj|vue|svelte)$/i;
+const IDENTIFIER = /\b[A-Za-z_][A-Za-z0-9_]{5,}\b/g;
+const MAX_STALE_CANDIDATES = 100;
+const MAX_STALE_NAMES = 20;
+
+function diffLines(diff, isIgnoredFile, onLine) {
+  let file = null;
+  let next = 0;
+  for (const line of diff.split("\n")) {
+    if (line.startsWith("+++ ")) {
+      const target = line.slice(4).replace(/^b\//, "");
+      file = target === "/dev/null" || isIgnoredFile(target) || !CODE_FILE.test(target) ? null : target;
+      continue;
+    }
+    if (line.startsWith("--- ")) continue;
+    const hunk = line.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (hunk) {
+      next = parseInt(hunk[1], 10);
+      continue;
+    }
+    if (!file) continue;
+    if (line.startsWith("+")) onLine(file, "+", next++, line.slice(1));
+    else if (line.startsWith("-")) onLine(file, "-", next, line.slice(1));
+  }
+}
+
+export async function staleBaseCheck($, range, { isIgnoredFile = () => false } = {}) {
+  const { root, baseSha, headSha } = range;
+  const mergeBase = await gitText($`git -C ${root} merge-base ${baseSha} ${headSha}`);
+  if (!mergeBase || mergeBase === baseSha) return null;
+  // Whole arguments built here: the Node fallback of the shell tag splits a
+  // template's literal text, so `${a}..${b}` would reach git as three words.
+  const since = `${mergeBase}..${baseSha}`;
+  const ahead = parseInt(await gitText($`git -C ${root} rev-list --count ${since}`), 10) || 0;
+  if (!ahead) return null;
+  const added = new Map();
+  diffLines(await gitText($`git -C ${root} diff -U0 --no-color ${mergeBase} ${headSha}`), isIgnoredFile, (file, kind, line, text) => {
+    if (kind !== "+") return;
+    for (const name of text.match(IDENTIFIER) ?? []) if (!added.has(name)) added.set(name, { file, line });
+  });
+  const removed = new Set();
+  const readded = new Set();
+  diffLines(await gitText($`git -C ${root} diff -U0 --no-color ${mergeBase} ${baseSha}`), isIgnoredFile, (file, kind, line, text) => {
+    for (const name of text.match(IDENTIFIER) ?? []) (kind === "-" ? removed : readded).add(name);
+  });
+  const candidates = [...added.keys()].filter((name) => removed.has(name) && !readded.has(name)).slice(0, MAX_STALE_CANDIDATES);
+  const names = [];
+  for (const name of candidates) {
+    if (await gitText($`git -C ${root} grep -l -w -F -e ${name} ${baseSha}`)) continue;
+    const pickaxe = `-S${name}`;
+    const removedIn = (await gitText($`git -C ${root} log --format=%h --abbrev=12 ${pickaxe} ${since}`)).split("\n")[0] || null;
+    names.push({ name, ...added.get(name), removedIn });
+    if (names.length >= MAX_STALE_NAMES) break;
+  }
+  return { ahead, names };
+}
+
 export function shortRange(range) {
   return `${range.baseSha.slice(0, 12)}...${range.headSha.slice(0, 12)}`;
 }

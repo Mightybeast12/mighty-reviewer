@@ -140,7 +140,13 @@ export function createV2Setup(factory) {
     if (hooks["tool.execute.after"]) {
       await register(
         ctx.tool.hook("execute.after", (event) =>
-          hooks["tool.execute.after"]({ sessionID: event.sessionID, tool: toV1ToolName(event.tool) }),
+          hooks["tool.execute.after"]({
+            sessionID: event.sessionID,
+            tool: toV1ToolName(event.tool),
+            // OpenCode 2.3 returns a subagent call at once, the child still
+            // running (its metadata.status "running"): not the critic's result.
+            ...(isBackgroundLaunch(event) ? { background: true } : {}),
+          }),
         ),
       );
     }
@@ -389,6 +395,12 @@ function createLegacyClient(ctx, options) {
       },
     },
   };
+}
+
+function isBackgroundLaunch(event) {
+  if (event?.result?.metadata?.status === "running") return true;
+  const content = Array.isArray(event?.result?.content) ? event.result.content : [];
+  return content.some((part) => typeof part?.text === "string" && part.text.includes("working in the background"));
 }
 
 function toIdleEvent(raw) {

@@ -9,7 +9,8 @@
 // and its round 2 (the stopped-check clause, read findings' severity),
 // run 10's two lines (the critics' line ranges, the background wait) and
 // the critic's round on them (step 3's order no longer says never to end
-// the turn while a critique is pending),
+// the turn while a critique is pending), and B24's merge-base probe (one
+// more git command, the prompt unchanged when the base did not move),
 // each diff checked to be exactly those lines).
 // It takes the plugin factory and the shell
 // maker as arguments, so the same capture runs on any version's files.

@@ -155,6 +155,7 @@ import {
   compareSemver,
   describeInstall,
   extractVerdict,
+  backgroundCritics,
   endsWithCriticNotice,
   pendingBackgroundCritics,
   verdictConflict,
@@ -175,6 +176,7 @@ import {
   removeReviewWorktree,
   resolveBranchRange,
   shortRange,
+  staleBaseCheck,
 } from "./branch.js";
 import { defaultBranchStoreDir, forgetBranchReview, loadBranchReview, loadBranchReviews, saveBranchReview } from "./branch-store.js";
 
@@ -544,6 +546,17 @@ function buildReviewPrompt(languageHints, projectRules, timeoutMs, scope = null)
             `   Run them in ${scope.root} only when \`git -C ${scope.root} rev-parse HEAD\` prints ${scope.headSha} and \`git -C ${scope.root} status --porcelain\` prints nothing; otherwise record every gate as 'not run (the working tree is not the reviewed head)' and go straight to the critics.`,
           ]
         : []),
+    // B24 (the owner's yes of 2026-11-15): the base moved past the merge base.
+    ...(scope?.stale
+      ? [
+          `   ${scope.baseRef} is ${scope.stale.ahead} commit${scope.stale.ahead === 1 ? "" : "s"} past the merge base: the range is read against the merge base, and the tree ${scope.headRef} makes once merged into ${scope.baseRef}'s tip was not built or reviewed. Say so in the mechanical-gates section.`,
+          ...(scope.stale.names.length
+            ? [
+                `   Names ${scope.headRef} adds that ${scope.baseRef}'s tip no longer has anywhere (its commits since the merge base removed or renamed them): ${scope.stale.names.map((entry) => `\`${entry.name}\` (${entry.file}:${entry.line}${entry.removedIn ? `, removed in ${entry.removedIn}` : ""})`).join(", ")}. Each is a likely compile break after the merge: give the list to the risk critic, record each it confirms as a P1 finding at the head's line, and each it refutes in one line.`,
+              ]
+            : []),
+        ]
+      : []),
     "   - Detect the project's own typecheck/lint commands (package.json scripts, tsconfig.json, Makefile, pyproject.toml, go.mod, Cargo.toml) and run the cheapest applicable check (e.g. `tsc --noEmit`, `ruff check`, `go vet`, `cargo check`), scoped to changed files where the tool allows. Only run a check the project itself configures: if the changed files have no project-configured typecheck or lint (for example a standalone script or plugin file with no package.json or tsconfig next to it), record 'no project typecheck configured' and move on immediately.",
     "   - Scan the changed files for leftover debug output (console.log, print-debugging, debugger statements) and commented-out code blocks.",
     "   - Check whether the diff touches linter/formatter/typechecker config (.eslintrc*, biome.json*, tsconfig*, .prettierrc*, ruff.toml, clippy.toml) in a way that WEAKENS rules.",
@@ -1019,10 +1032,29 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
     try {
       const res = await client.session.messages({ path: { id: reviewSessionID } });
       const messages = res?.data ?? res ?? [];
-      return pendingBackgroundCritics(messages).length > 0 || endsWithCriticNotice(messages);
+      const { launched, pending } = backgroundCritics(messages);
+      noteCriticReports(reviewSessionID, launched.length, pending.length);
+      return pending.length > 0 || endsWithCriticNotice(messages);
     } catch {
       return false;
     }
+  }
+
+  // The automatic review's progress counts a background critic done when its
+  // notice is in the transcript (the owner's yes of 2026-11-15): read at
+  // each idle of the review, which the host resumes with every notice.
+  function noteCriticReports(reviewSessionID, launched, pending) {
+    if (!launched) return;
+    const parentSessionID = reviewParents.get(reviewSessionID);
+    const state = parentSessionID ? reviewStates.get(parentSessionID) : undefined;
+    if (state?.status !== "running" || state.phase !== "critics") return;
+    const total = Math.max(state.criticsTotal, launched);
+    const done = Math.min(total, launched - pending);
+    if (done === state.criticsDone && total === state.criticsTotal) return;
+    state.criticsTotal = total;
+    state.criticsDone = done;
+    state.updatedAt = Date.now();
+    void setReviewTitle(reviewSessionID, `critics ${done}/${total}`, parentSessionID);
   }
 
   // At a review's deadline, the critics it launched in the background and
@@ -1161,7 +1193,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
   // dispatches a critic, and once every dispatched task returns the
   // orchestrator is verifying findings. Approximate, but the orchestrator
   // prompt drives exactly this sequence.
-  async function trackReviewProgress(reviewSessionID, toolName, stage) {
+  async function trackReviewProgress(reviewSessionID, toolName, stage, { background = false } = {}) {
     const parentSessionID = reviewParents.get(reviewSessionID);
     if (!parentSessionID) return;
     const state = reviewStates.get(parentSessionID);
@@ -1179,6 +1211,10 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
         toast = "Review progress: mechanical gates done, critics running.";
       }
       title = `critics ${state.criticsDone}/${state.criticsTotal}`;
+    } else if (stage === "after" && toolName === "task" && background) {
+      // A background launch returned; the critic is still running. Its
+      // notice counts it (noteCriticReports).
+      return;
     } else if (stage === "after" && toolName === "task" && state.phase === "critics") {
       state.criticsDone += 1;
       if (state.criticsDone >= state.criticsTotal) {
@@ -1771,7 +1807,13 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
         if (state.status !== "running") throw new Error("the plugin was reloaded during the start.");
       }
       const rules = await projectRules(range.root);
-      const reviewPrompt = buildReviewPrompt(languageHintsFor(range.files), rules, branchTimeoutMs, checkout ? { ...range, checkout, unlinked } : range);
+      // B24: a base that moved past the merge base (null when it did not).
+      const stale = await staleBaseCheck($, range, { isIgnoredFile });
+      const reviewPrompt = buildReviewPrompt(languageHintsFor(range.files), rules, branchTimeoutMs, {
+        ...range,
+        ...(checkout ? { checkout, unlinked } : {}),
+        ...(stale ? { stale } : {}),
+      });
       const created = await client.session.create({
         body: { title: `${BRANCH_TITLE} ${range.baseRef}...${range.headRef}`, ...(checkout ? { externalAllow: [checkout] } : {}) },
       });
@@ -1965,7 +2007,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       const toolName = input?.tool;
       if (!sessionID || !toolName) return;
       if (reviewParents.has(sessionID)) {
-        await trackReviewProgress(sessionID, toolName, "after");
+        await trackReviewProgress(sessionID, toolName, "after", { background: input?.background === true });
         return;
       }
       if (!CODE_WRITING_TOOLS.has(toolName)) return;

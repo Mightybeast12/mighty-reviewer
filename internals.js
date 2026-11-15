@@ -141,6 +141,12 @@ const outputOfState = (state) =>
   typeof state?.output === "string" ? state.output : Array.isArray(state?.content) ? state.content.map(textOfPart).join("\n") : "";
 
 export function pendingBackgroundCritics(messages) {
+  return backgroundCritics(messages).pending;
+}
+
+// The critics a review launched in the background (`launched`) and those of
+// them that have not reported (`pending`), in launch order.
+export function backgroundCritics(messages) {
   const launched = new Set();
   const reported = new Set();
   const noteReports = (text) => {
@@ -161,7 +167,7 @@ export function pendingBackgroundCritics(messages) {
       }
     }
   }
-  return [...launched].filter((id) => !reported.has(id));
+  return { launched: [...launched], pending: [...launched].filter((id) => !reported.has(id)) };
 }
 
 // True when the transcript's last message with any text is a critic's

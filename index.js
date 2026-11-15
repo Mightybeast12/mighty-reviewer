@@ -549,7 +549,7 @@ function buildReviewPrompt(languageHints, projectRules, timeoutMs, scope = null)
     // B24 (the owner's yes of 2026-11-15): the base moved past the merge base.
     ...(scope?.stale
       ? [
-          `   ${scope.baseRef} is ${scope.stale.ahead} commit${scope.stale.ahead === 1 ? "" : "s"} past the merge base: the range is read against the merge base, and the tree ${scope.headRef} makes once merged into ${scope.baseRef}'s tip was not built or reviewed. Say so in the mechanical-gates section.`,
+          `   ${scope.baseRef} ${scope.stale.ahead ? `is ${scope.stale.ahead} commit${scope.stale.ahead === 1 ? "" : "s"}` : "has moved"} past the merge base: the range is read against the merge base, and the tree ${scope.headRef} makes once merged into ${scope.baseRef}'s tip was not built or reviewed. Say so in the mechanical-gates section.`,
           ...(scope.stale.unchecked
             ? [
                 `   The check for names ${scope.headRef} still uses that ${scope.baseRef}'s tip removed could not run (git failed or the time budget ran out): ask the risk critic to look for such names.`,

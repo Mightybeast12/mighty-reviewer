@@ -135,20 +135,32 @@ function diffLines(diff, isIgnoredFile, onLine) {
   let from = null;
   let to = null;
   let next = 0;
+  // A "--- " or "+++ " line is a header only between `diff --git` and the
+  // file's first hunk: inside a hunk it is a removed "-- comment" or an
+  // added "++ ..." line (the critic's round 2 on 3c4edfb..cd419bc).
+  let inHeader = false;
   for (const line of diff.split("\n")) {
-    if (line.startsWith("--- ")) {
+    if (line.startsWith("diff --git ")) {
+      inHeader = true;
+      from = null;
+      to = null;
+      continue;
+    }
+    if (inHeader && line.startsWith("--- ")) {
       from = keep(patchPath(line.slice(4)));
       continue;
     }
-    if (line.startsWith("+++ ")) {
+    if (inHeader && line.startsWith("+++ ")) {
       to = keep(patchPath(line.slice(4)));
       continue;
     }
     const hunk = line.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
     if (hunk) {
+      inHeader = false;
       next = parseInt(hunk[1], 10);
       continue;
     }
+    if (inHeader) continue;
     if (line.startsWith("+")) {
       if (to) onLine(to, "+", next, line.slice(1));
       next++;
@@ -168,7 +180,10 @@ export async function staleBaseCheck(range, { isIgnoredFile = () => false, budge
   if (!mergeBase || mergeBase === baseSha) return null;
   const since = `${mergeBase}..${baseSha}`;
   const counted = await git(["rev-list", "--count", since]);
-  const ahead = counted.code === 0 ? parseInt(counted.stdout.trim(), 10) || 0 : 0;
+  // A count that fails after a known, moved merge base still says the base
+  // moved (ahead null: unknown by how much).
+  if (counted.code !== 0) return { ahead: null, names: [], cut: false, unchecked: true };
+  const ahead = parseInt(counted.stdout.trim(), 10) || 0;
   if (!ahead) return null;
   const unchecked = { ahead, names: [], cut: false, unchecked: true };
   const headDiff = await git(["diff", ...STALE_DIFF_FLAGS, mergeBase, headSha]);
@@ -190,7 +205,9 @@ export async function staleBaseCheck(range, { isIgnoredFile = () => false, budge
   if (!candidates.length) return { ahead, names: [], cut, unchecked: false };
   // One grep of base's tip for every candidate: exit 0 some found, 1 none,
   // anything else an error (then no name is claimed).
-  const grep = await git(["grep", "--no-recurse-submodules", "-I", "-o", "-h", "-w", "-F", ...candidates.flatMap((name) => ["-e", name]), baseSha]);
+  // Bare tokens whatever the user's grep and colour settings (line or column
+  // numbers, headings, breaks, colour would make every name read as gone).
+  const grep = await git(["grep", "--no-recurse-submodules", "--no-line-number", "--no-column", "--no-heading", "--no-break", "--color=never", "-I", "-o", "-h", "-w", "-F", ...candidates.flatMap((name) => ["-e", name]), baseSha]);
   if (grep.code !== 0 && grep.code !== 1) return unchecked;
   const present = new Set(grep.stdout.split("\n").map((token) => token.trim()).filter(Boolean));
   let gone = candidates.filter((name) => !present.has(name));
@@ -202,7 +219,7 @@ export async function staleBaseCheck(range, { isIgnoredFile = () => false, budge
   for (const name of gone) {
     let removedIn = null;
     if (left() > 0) {
-      const log = await git(["log", "--format=%h", "--abbrev=12", `-S${name}`, since]);
+      const log = await git(["log", "--no-color", "--format=%h", "--abbrev=12", `-S${name}`, since]);
       if (log.code === 0) removedIn = log.stdout.split("\n")[0].trim() || null;
     }
     names.push({ name, ...added.get(name), removedIn });

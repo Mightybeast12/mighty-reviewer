@@ -2868,6 +2868,37 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     assert.ok(!failed.includes("no longer has anywhere"), `a failing grep flags no name: ${failed.split("\n").find((l) => l.includes("no longer has")) ?? ""}`);
     assert.ok(failed.includes("The check for names lane/x2 still uses that base-x's tip removed could not run"), "and says the check did not run");
 
+    // The critic's round 2 on 3c4edfb..cd419bc (P3, taken before release):
+    // a user's grep and colour settings must not decorate the grep's tokens
+    // (each then read as gone).
+    git("checkout", "-q", "-b", "lane/x3", "lane/x");
+    fs.writeFileSync(path.join(repo, "feature3.js"), "export const third = 3;\n");
+    git("add", "feature3.js");
+    git("commit", "-q", "-m", "lane x3");
+    for (const [key, value] of [["grep.lineNumber", "true"], ["grep.column", "true"], ["grep.heading", "true"], ["grep.break", "true"], ["color.ui", "always"]]) git("config", key, value);
+    assert.ok((await call({ repo, base: "base-x", head: "lane/x3" })).includes("Branch review started"));
+    const decorated = prompts.get("stale-review-6");
+    for (const key of ["grep.lineNumber", "grep.column", "grep.heading", "grep.break", "color.ui"]) git("config", "--unset", key);
+    const decoratedLine = decorated.split("\n").find((l) => l.includes("no longer has")) ?? "";
+    assert.ok(decoratedLine.includes("`oldHelperName`") && !decoratedLine.includes("`stillThereName`"), `the user's grep and colour settings change nothing: ${decoratedLine}`);
+    // A removed line that reads like a patch header (a Lua or Haskell "--"
+    // comment) does not end the file's removed lines.
+    git("checkout", "-q", "-b", "base-lua", "base-still");
+    fs.writeFileSync(path.join(repo, "helper.lua"), "-- an old helper\nfunction luaGoneHelper()\n  return 1\nend\n");
+    git("add", "helper.lua");
+    git("commit", "-q", "-m", "add helper.lua");
+    git("checkout", "-q", "-b", "lane/lua", "base-lua");
+    fs.writeFileSync(path.join(repo, "uses.lua"), "local x = luaGoneHelper()\n");
+    git("add", "uses.lua");
+    git("commit", "-q", "-m", "lane lua");
+    git("checkout", "-q", "base-lua");
+    fs.writeFileSync(path.join(repo, "helper.lua"), "-- nothing left\n");
+    git("commit", "-q", "-am", "drop the helper");
+    git("checkout", "-q", "lane/lua");
+    assert.ok((await call({ repo, base: "base-lua", head: "lane/lua" })).includes("Branch review started"));
+    const lua = prompts.get("stale-review-7");
+    assert.ok(lua.includes("`luaGoneHelper` (uses.lua:1"), `a removed "-- comment" line does not end the file's removed lines: ${lua.split("\n").find((l) => l.includes("no longer has")) ?? "(no line)"}`);
+
     // Caps and the budget (P2, P3): a cut list says so; an exhausted budget
     // or a check that throws never ends the start.
     const { staleBaseCheck, safeStaleBaseCheck } = await import("./branch.js");
@@ -2877,6 +2908,17 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     const spent = await staleBaseCheck(range, { budgetMs: 0 });
     assert.equal(spent, null, "a budget spent before the merge-base probe gives no check");
     assert.equal(await safeStaleBaseCheck(range, { run: async () => { throw new Error("boom"); } }), null, "a check that throws gives null");
+    // Round 2's P3: a known, moved merge base whose count fails still says
+    // the base moved (unchecked), rather than nothing.
+    const realGit = async (root, args) => {
+      try {
+        return { code: 0, stdout: execFileSync("git", ["-C", root, ...args], { encoding: "utf8" }) };
+      } catch (error) {
+        return { code: error.status ?? -1, stdout: "" };
+      }
+    };
+    const noCount = await staleBaseCheck(range, { run: async (root, args) => (args[0] === "rev-list" ? { code: 128, stdout: "" } : realGit(root, args)) });
+    assert.ok(noCount && noCount.unchecked === true && noCount.ahead === null, `a failed count after a moved merge base reads as unchecked: ${JSON.stringify(noCount)}`);
   } finally {
     await hooks?.dispose();
     fs.rmSync(repo, { recursive: true, force: true });

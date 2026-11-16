@@ -159,6 +159,7 @@ import {
   endsWithCriticNotice,
   pendingBackgroundCritics,
   verdictConflict,
+  unbackedVerdictNote,
   formatFindingsDigest,
   formatNoShipSummary,
   METADATA_KEY,
@@ -1464,6 +1465,8 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
           typeof report === "string" && report.length > MAX_FEEDBACK_CHARS
             ? `${report.slice(0, MAX_FEEDBACK_CHARS)}\n[report truncated]`
             : report,
+        // From the whole report: the stored copy may be cut before a P1.
+        verdictNote: unbackedVerdictNote(report, verdict),
         updatedAt: Date.now(),
       });
       if (verdict === "NO-SHIP") unresolvedNoShip.add(parentSessionID);
@@ -1622,10 +1625,12 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       return `Branch review of ${describeBranchRange(state)} still running (elapsed ${formatElapsed(Date.now() - state.startedAt)}; aborted after ${Math.max(1, Math.round(branchTimeoutMs / 60000))} minutes). Advisory: nothing is blocked or sent back.`;
     }
     const conflict = state.verdict ? verdictConflict(state.report, state.verdict) : null;
+    const unbacked = unbackedVerdictNote(state.report, state.verdict);
     return [
       `Branch review of ${describeBranchRange(state)}, finished after ${formatElapsed((state.finishedAt ?? Date.now()) - state.startedAt)}:`,
       `verdict: ${state.verdict ?? "unknown (no verdict line found)"}`,
       ...(conflict ? [`note: the report's text also states ${state.verdict === "SHIP" ? "NO-SHIP" : "SHIP"} (${JSON.stringify(conflict)}); the verdict is its last line's.`] : []),
+      ...(unbacked ? [unbacked] : []),
       "",
       state.report ?? "(no report captured)",
     ].join("\n");
@@ -1871,6 +1876,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
     }
     return [
       `verdict: ${state.verdict ?? "unknown (no verdict line found)"}`,
+      ...(state.verdictNote ? [state.verdictNote] : []),
       "",
       state.report ?? "(no report captured)",
     ].join("\n");

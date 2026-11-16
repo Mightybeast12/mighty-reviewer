@@ -114,6 +114,95 @@ export function verdictConflict(text, verdict) {
   return null;
 }
 
+// Backlog B27 (benchmark case 17 on 2026-11-15 and lane C739's branch
+// review on 2026-11-16, each NO-SHIP over a P2 and P3s with no gate failed,
+// its own text saying no P0 or P1 survived). The review's rule makes
+// NO-SHIP only on a mechanical gate that failed or a verified P0 or P1.
+// A gate is recorded as failed by a sentence in the report's gates section
+// (a "Mechanical gates", "Gates ...", "Diagnostics" or "Not run" heading, or
+// a line led by a bold "Mechanical gates" label) with a fail or crash word,
+// an exit status other than 0, or a count of errors, unless its own clause
+// denies or supposes it ("not a failure", "would fail") or the sentence
+// before it says the gate never ran ("not installed (`which cargo` exited
+// 1)"). Any doubt reads as failed: a missed note leaves the review as it is.
+// A branch review that cannot read its range ends NO-SHIP by its own rule
+// (buildReviewPrompt's step 1), which backs it too.
+const RANGE_UNREAD = /\bcannot read the range\b/i;
+const GATE_SECTION = /^(?:mechanical\s+gates?|gates?|diagnostics|not\s+run)\b/i;
+const GATE_LABEL_LINE = /^\s*(?:[-*+]\s+)?(?:\*\*|__)\s*mechanical\s+gates?\b/i;
+const GATE_FAILURE =
+  /\b(?:fail(?:ed|s|ing|ures?)?|crash(?:ed|es|ing)?)\b|\bexit(?:ed)?(?:\s+with)?(?:\s+(?:code|status))?\s+[1-9]\d*\b|\bexit(?:ed)?\s+with\s+errors?\b|\b[1-9]\d*\s+(?:\w+\s+)?errors?\b/i;
+const CLAUSE_BREAK = /[,;:()]|\b(?:but|and|so|then|yet|while)\b/i;
+const DENIED = /\b(?:no|not|none|never|nothing|neither|nor|zero|0|without)\b|n't\b/i;
+const SUPPOSED = /\b(?:would|could|might|may|can|cannot|if|unless|whether|should)\b/i;
+const NEVER_RAN = /\bnot\s+(?:be\s+|been\s+)?(?:run|installed|available|executed)\b|n't\s+(?:be\s+|been\s+)?(?:run|installed|available)\b|\bno\s+direct\s+tool\b|\bcommand\s+not\s+found\b|\bunavailable\b/i;
+
+function gateRecordsFailure(line) {
+  for (const sentence of line.replace(/[*_`]/g, "").split(/(?<=[.;!?])\s+/)) {
+    const match = GATE_FAILURE.exec(sentence);
+    if (!match) continue;
+    const before = sentence.slice(0, match.index);
+    const clause = before.split(CLAUSE_BREAK).pop();
+    if (DENIED.test(clause) || SUPPOSED.test(clause) || NEVER_RAN.test(before)) continue;
+    return true;
+  }
+  return false;
+}
+
+function reportRecordsFailedGate(report) {
+  let inSection = false;
+  let sectionLevel = 0;
+  let fenced = false;
+  for (const raw of report.split("\n")) {
+    if (FENCE.test(raw)) {
+      fenced = !fenced;
+      continue;
+    }
+    // A gate's output pasted in a fence is still the gate's record.
+    const label = fenced ? null : headingLabel(raw);
+    if (label !== null) {
+      const level = headingLevel(raw) || 99;
+      if (GATE_SECTION.test(label.replace(/[`*_]/g, ""))) {
+        inSection = true;
+        sectionLevel = level;
+        continue;
+      }
+      if (inSection && (level <= sectionLevel || VERIFIED_START_HEADING.test(label))) inSection = false;
+    }
+    if ((inSection || (!fenced && GATE_LABEL_LINE.test(raw))) && gateRecordsFailure(raw)) return true;
+  }
+  return false;
+}
+
+function describeCounts(counts, severities) {
+  const parts = severities.filter((severity) => counts[severity] > 0).map((severity) => `${counts[severity]} ${severity}`);
+  return parts.length ? parts.join(", ") : null;
+}
+
+/**
+ * A note line for a verdict the report's own findings do not back, or
+ * null: a NO-SHIP whose findings hold no P0 or P1 and whose gates record
+ * no failure, or a SHIP whose findings hold a P0 or P1 not marked
+ * unverified. Shadow: the verdict stays the report's own.
+ */
+export function unbackedVerdictNote(report, verdict) {
+  if (typeof report !== "string" || (verdict !== "SHIP" && verdict !== "NO-SHIP")) return null;
+  const detail = verifiedFindingsDetail(report);
+  if (!detail) return null;
+  const { counts, lines } = detail;
+  if (verdict === "NO-SHIP") {
+    if (counts.P0 + counts.P1 > 0 || RANGE_UNREAD.test(report) || reportRecordsFailedGate(report)) return null;
+    const listed = describeCounts(counts, ["P2", "P3"]);
+    return `note: the verdict is NO-SHIP, but the report names no P0 or P1 finding and no gate that ran and failed (${listed ? `findings: ${listed}` : "no findings"}); by the review's rule only those make NO-SHIP.`;
+  }
+  const verified = { P0: 0, P1: 0 };
+  for (const severity of ["P0", "P1"]) {
+    verified[severity] = lines[severity].filter((line) => !/\bunverified\b|\bnot\s+verified\b/i.test(line)).length;
+  }
+  const listed = describeCounts(verified, ["P0", "P1"]);
+  return listed ? `note: the verdict is SHIP, but the report's findings include ${listed}; by the review's rule a verified P0 or P1 makes NO-SHIP.` : null;
+}
+
 // Critics a review launched in the background that have not reported yet.
 // On OpenCode 2.3 the subagent tool returns at once ("working in the
 // background (sessionID: X)") and each result arrives later as a message

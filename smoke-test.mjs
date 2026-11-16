@@ -2925,4 +2925,217 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
   }
 }
 
+// 39. A verdict its own findings do not back (backlog B27, the owner's yes
+//     of 2026-11-16: benchmark case 17 on 2026-11-15 and lane C739's branch
+//     review on 2026-11-16 each ended NO-SHIP over a P2 and P3s, no gate
+//     failed, the text saying no P0 or P1 survived). Read back, a NO-SHIP
+//     whose findings hold no P0 or P1 and whose gates record no failure, or
+//     a SHIP whose findings hold a P0 or P1, carries a note line. Shadow:
+//     the verdict itself is unchanged. The reports below keep the shapes of
+//     the two live reports and of the benchmark's NO-SHIPs over a gate that
+//     ran and failed, with neutral names.
+{
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const { execFileSync } = await import("node:child_process");
+  const scratch = path.join(os.tmpdir(), "opencode", "reviewer-test");
+  fs.mkdirSync(scratch, { recursive: true });
+  const repo = fs.realpathSync(fs.mkdtempSync(path.join(scratch, "unbacked-")));
+  let hooks;
+  try {
+    const git = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
+    git("init", "-q");
+    git("config", "user.email", "smoke@example.invalid");
+    git("config", "user.name", "smoke");
+    fs.writeFileSync(path.join(repo, "a.js"), "export const a = 1;\n");
+    git("add", "a.js");
+    git("commit", "-q", "-m", "base");
+    git("branch", "base-x");
+    git("checkout", "-q", "-b", "lane/x");
+    fs.writeFileSync(path.join(repo, "x.js"), "export const x = 2;\n");
+    git("add", "x.js");
+    git("commit", "-q", "-m", "x");
+    const reports = new Map();
+    let n = 0;
+    const client = {
+      v2: true,
+      tui: { showToast: async () => {} },
+      app: { log: async () => {} },
+      session: {
+        get: async ({ path: p }) => ({ data: { id: p.id } }),
+        create: async () => ({ data: { id: `unbacked-review-${++n}` } }),
+        update: async () => {},
+        abort: async () => {},
+        promptAsync: async () => {},
+        messages: async ({ path: p }) => [{ info: { role: "assistant" }, parts: [{ type: "text", text: reports.get(p.id) ?? "" }] }],
+      },
+    };
+    hooks = await plugin({ client, directory: repo, worktree: repo, $: makeShell() }, { idleDebounceMs: 0, updateCheck: false });
+    // Each report gets a fresh review of the same range, read back as the
+    // orchestrator reads it.
+    const readBack = async (report, first = false) => {
+      const started = await hooks.tool.review_branch.execute({ repo, base: "base-x", head: "lane/x", ...(first ? {} : { rerun: true }) }, { sessionID: "orch-unbacked" });
+      assert.ok(started.includes("Branch review started"), started);
+      reports.set(`unbacked-review-${n}`, report);
+      await hooks.event({ event: { type: "session.idle", properties: { sessionID: `unbacked-review-${n}` } } });
+      return hooks.tool.review_branch.execute({ repo, base: "base-x", head: "lane/x" }, { sessionID: "orch-unbacked" });
+    };
+    const noteLine = (text) => text.split("\n").find((l) => l.startsWith("note: the verdict is")) ?? null;
+    const unrunGates = [
+      "## Mechanical gates",
+      "- **Rust `cargo check`:** not run. `cargo` is not installed in the review environment.",
+      "- **Kotlin typecheck and lint:** not run (no direct tool). The project builds only through Gradle.",
+      "- **Diagnostics on changed files:** none were run, because neither tool was available.",
+      "",
+      "The critics read the code without compiling it, so a type or build error would not have been caught.",
+      "",
+    ].join("\n");
+
+    // Case 17's shape: one P2, two P3s (one unverified), unrun gates, and
+    // its own "no P0 or P1 survived".
+    const case17 = await readBack([
+      unrunGates,
+      "## Findings",
+      "- P2 `core/src/link_tests.rs:29-94`: shared test helpers live in one test file that a second test file imports. Move them into the support module.",
+      "- P3, unverified: `core/src/link_tests.rs`, `Front::cut`: a pipe spawned but never read may hold its end open.",
+      "- P3 `core/src/places_tests.rs:12`: the import list repeats a module path.",
+      "",
+      "No P0 or P1 findings survived to verify.",
+      "",
+      "NO-SHIP",
+    ].join("\n"), true);
+    assert.ok(case17.includes("verdict: NO-SHIP"), `the verdict stays the report's own: ${case17}`);
+    assert.equal(noteLine(case17), "note: the verdict is NO-SHIP, but the report names no P0 or P1 finding and no gate that ran and failed (findings: 1 P2, 2 P3); by the review's rule only those make NO-SHIP.", `case 17's shape gets the note: ${case17.slice(0, 400)}`);
+
+    // C739's shape: a P2 and a P3, and "read this as SHIP" inside a sentence
+    // after the verdict, which the both-verdicts note does not see.
+    const c739 = await readBack([
+      "## Mechanical gates",
+      "- **Rust (`cargo check`, clippy):** not run (no direct tool).",
+      "- **Kotlin and Gradle:** not run (no direct tool). The critics read the Kotlin by hand and found no errors.",
+      "",
+      "## Findings",
+      "- P2 `crates/daemon/tests/neighbours.rs:36-66`: the helpers are a fourth copy of a shared fixture builder.",
+      "- P3 `crates/git/src/rebase.rs:110`: two call sites read opposite halves of one tuple by position.",
+      "",
+      "NO-SHIP",
+      "",
+      "I'm making the verdict NO-SHIP anyway. The two findings above are only P2 and P3 and no gate failed, so by this review's own rule the verdict should be SHIP. Read this as SHIP.",
+    ].join("\n"));
+    assert.ok(c739.includes("verdict: NO-SHIP") && !c739.includes("note: the report's text also states"), `the both-verdicts note stays quiet on it: ${c739.slice(0, 300)}`);
+    assert.ok((noteLine(c739) ?? "").includes("(findings: 1 P2, 1 P3)"), `C739's shape gets the note: ${c739.slice(0, 400)}`);
+
+    // A gate that ran and failed backs a NO-SHIP (the benchmark's 0.16.0
+    // run 2, case 06), and so does a check that crashed on its own (its
+    // a92b1b9 run 2): no note.
+    const ranAndFailed = await readBack([
+      "### Mechanical gates",
+      "- **Syntax:** `node --check` on the changed files passed.",
+      "- **`node smoke-test.mjs`: ran and failed.**",
+      "  - It stops in an unchanged section with a shell error, so I believe the failure is environmental.",
+      "",
+      "### Findings",
+      "- P2 `branch.js:31-37`: a failed git call reads as an empty diff.",
+      "- P3 `index.js:119`: the comment promises more than the code does.",
+      "",
+      "NO-SHIP",
+    ].join("\n"));
+    assert.equal(noteLine(ranAndFailed), null, `a gate that ran and failed backs NO-SHIP: ${ranAndFailed.slice(0, 300)}`);
+    const crashed = await readBack([
+      "### Mechanical gates",
+      "- **Typecheck and lint:** not run (no direct tool).",
+      "- **`smoke-test.mjs`:** not run to completion. It fails in the review sandbox at `smoke-test.mjs:834` with ENOENT on a fixed path.",
+      "",
+      "### Findings",
+      "- P2 `branch.js:72-85`: a failed merge-base reads as no files.",
+      "",
+      "NO-SHIP",
+    ].join("\n"));
+    assert.equal(noteLine(crashed), null, `a check that crashed on its own backs NO-SHIP: ${crashed.slice(0, 300)}`);
+    // A gates line written inline after a bold label counts too.
+    const inline = await readBack("**Mechanical gates:** `npm test` failed in `x.test.js`.\n\n**Findings**\n- P3 `x.js:1`: a name.\n\nNO-SHIP");
+    assert.equal(noteLine(inline), null, `an inline gates line that failed backs NO-SHIP: ${inline.slice(0, 300)}`);
+
+    // A denial in an earlier clause leaves a later failure standing, and a
+    // gate's output pasted in a fence is still its record.
+    const partly = await readBack("## Mechanical gates\n- **`npm test`:** no new warnings, but 2 tests failed.\n\n## Findings\n- P2 `a.js:9`: a duplicate check.\n\nNO-SHIP");
+    assert.equal(noteLine(partly), null, `a failure after a denied clause backs NO-SHIP: ${partly.slice(0, 300)}`);
+    const fenced = await readBack("## Mechanical gates\n- **`cargo test`:**\n```\ntest result: FAILED. 10 passed; 2 failed\n```\n\n## Findings\n- P2 `a.rs:9`: a duplicate check.\n\nNO-SHIP");
+    assert.equal(noteLine(fenced), null, `a failure in a gate's fenced output backs NO-SHIP: ${fenced.slice(0, 300)}`);
+
+    // A Findings heading ends the gates section, whatever its level.
+    const boldFindings = await readBack("## Mechanical gates\n- **Typecheck:** not run (no direct tool).\n\n**Findings**\n- P2 `a.js:9`: the retry fails on the second call.\n\nNO-SHIP");
+    assert.ok((noteLine(boldFindings) ?? "").includes("(findings: 1 P2)"), `a finding's own fail word is not a gate's: ${boldFindings.slice(0, 300)}`);
+    // A branch review that cannot read its range ends NO-SHIP by its rule.
+    const unread = await readBack("not run: cannot read the range (`git diff` was denied).\n\nNO-SHIP");
+    assert.equal(noteLine(unread), null, `a range the review could not read backs NO-SHIP: ${unread}`);
+    // So does an exit status other than 0 or a count of errors.
+    const exited = await readBack("## Mechanical gates\n- **`tsc --noEmit`:** exited 2.\n\n## Findings\n- P3 `a.ts:1`: a name.\n\nNO-SHIP");
+    assert.equal(noteLine(exited), null, `a gate that exited 2 backs NO-SHIP: ${exited.slice(0, 300)}`);
+    const errored = await readBack("## Mechanical gates\n- **`eslint`:** 3 errors in `a.js`.\n\n## Findings\n- P3 `a.js:1`: a name.\n\nNO-SHIP");
+    assert.equal(noteLine(errored), null, `a gate that reported errors backs NO-SHIP: ${errored.slice(0, 300)}`);
+
+    // A gates section that only says what did not fail does not back it: a
+    // negation, a missing tool's probe, a conditional.
+    const denied = await readBack([
+      "## Mechanical gates",
+      "- **Rust:** `cargo` is not installed in this environment (`which cargo` exited 1).",
+      "- **Kotlin:** not run. That is a missing tool, not a missing dependency, but I did not treat it as a failure.",
+      "- **Lint:** none of these counts as a failure.",
+      "- **Build:** not run; a type error would fail the build.",
+      "- **Tests:** 12 passed, 0 failed.",
+      "",
+      "## Findings",
+      "- P2 `a.kt:3`: a second definition of the same rule.",
+      "",
+      "NO-SHIP",
+    ].join("\n"));
+    assert.ok((noteLine(denied) ?? "").includes("(findings: 1 P2)"), `a gates section that names no failure does not back NO-SHIP: ${denied.slice(0, 500)}`);
+    const empty = await readBack("## Mechanical gates\n- **Typecheck:** not run (no direct tool).\n\n## Findings\nNone.\n\nNO-SHIP");
+    assert.ok((noteLine(empty) ?? "").includes("(no findings)"), `a NO-SHIP with no findings at all gets the note: ${empty}`);
+
+    // A P0 or P1 backs NO-SHIP; on SHIP it is the other contradiction,
+    // unless the report marks it unverified (the rule counts verified ones).
+    const p1NoShip = await readBack("## Findings\n- P1 `a.js:3`: the lock is never released on the error path.\n\nNO-SHIP");
+    assert.equal(noteLine(p1NoShip), null, `a P1 backs NO-SHIP: ${p1NoShip}`);
+    const p1Ship = await readBack("## Mechanical gates\n- **Syntax:** passed.\n\n## Findings\n- P1 `a.js:3`: the lock is never released on the error path.\n- P2 `a.js:9`: a duplicate check.\n\nSHIP");
+    assert.ok(p1Ship.includes("verdict: SHIP"), p1Ship);
+    assert.equal(noteLine(p1Ship), "note: the verdict is SHIP, but the report's findings include 1 P1; by the review's rule a verified P0 or P1 makes NO-SHIP.", `a SHIP over a P1 gets the note: ${p1Ship.slice(0, 300)}`);
+    const unverifiedShip = await readBack("## Findings\n- P1, unverified: `a.js:3`: the lock may not be released on one path.\n\nSHIP");
+    assert.equal(noteLine(unverifiedShip), null, `an unverified P1 does not contradict SHIP: ${unverifiedShip}`);
+    const p2Ship = await readBack("## Findings\n- P2 `a.js:9`: a duplicate check.\n\nSHIP");
+    assert.equal(noteLine(p2Ship), null, `a SHIP over a P2 is backed: ${p2Ship}`);
+
+    // The automatic review's read back (review_status) carries the same
+    // note, taken from the whole report, not the copy cut for feedback.
+    const auto = await makeHarness([
+      "## Mechanical gates",
+      "- **Typecheck:** not run (no direct tool).",
+      "",
+      "## Findings",
+      "- P2 `a.js:9`: a duplicate check.",
+      "- P3 `a.js:1`: a name.",
+      "",
+      "NO-SHIP",
+    ].join("\n"), { options: { updateCheck: false } });
+    await auto.turn("parent-unbacked", "edit");
+    await auto.childIdle("child-1");
+    const autoStatus = await auto.hooks.tool.review_status.execute({}, { sessionID: "parent-unbacked" });
+    assert.ok(autoStatus.includes("verdict: NO-SHIP"), autoStatus);
+    assert.ok((noteLine(autoStatus) ?? "").includes("(findings: 1 P2, 1 P3)"), `the automatic review's read back carries the note: ${autoStatus.slice(0, 300)}`);
+    auto.hooks.dispose();
+    const longGates = Array.from({ length: 400 }, (_, i) => `- **Check ${i}:** clean.`).join("\n");
+    const cut = await makeHarness(`## Mechanical gates\n${longGates}\n\n## Findings\n- P1 \`a.js:3\`: the lock is never released.\n\nNO-SHIP`, { options: { updateCheck: false } });
+    await cut.turn("parent-cut", "edit");
+    await cut.childIdle("child-1");
+    const cutStatus = await cut.hooks.tool.review_status.execute({}, { sessionID: "parent-cut" });
+    assert.ok(cutStatus.includes("[report truncated]") && !cutStatus.includes("the lock is never released"), "the stored copy is cut before its P1");
+    assert.equal(noteLine(cutStatus), null, `a P1 past the cut still backs NO-SHIP: ${cutStatus.slice(-300)}`);
+    cut.hooks.dispose();
+  } finally {
+    await hooks?.dispose();
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+}
+
 console.log("ALL SMOKE TESTS PASSED");

@@ -3106,6 +3106,66 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     const p2Ship = await readBack("## Findings\n- P2 `a.js:9`: a duplicate check.\n\nSHIP");
     assert.equal(noteLine(p2Ship), null, `a SHIP over a P2 is backed: ${p2Ship}`);
 
+    // The critic's P3s on fd9d838, taken before release. (1) A never-ran
+    // clause masks only its own clause, and more failure words count; (2) a
+    // P0 or P1 recorded in the gates section is a failed gate; (3) a P0 or
+    // P1 written as a Severity field or a table cell backs NO-SHIP; (4) on
+    // SHIP, a P1 downgraded or refuted is not a contradiction; (5) a branch
+    // copy cut past its P1 gives no NO-SHIP note.
+    for (const [line, what] of [
+      ["- **Gates:** `cargo` not installed, and `tsc` failed with 2 errors.", "a failure after a never-ran clause"],
+      ["- **`cargo test`:** timed out after 120 s.", "a gate that timed out"],
+      ["- **`npm test`:** aborted by the runner.", "an aborted gate"],
+      ["- **`node smoke-test.mjs`:** killed by signal 9.", "a killed gate"],
+      ["- **`cargo test`:** the thread panicked at `a.rs:3`.", "a gate that panicked"],
+      ["- **`tsc --noEmit`:** exit code: 1.", "an exit code written with a colon"],
+      ["- **`tsc --noEmit`:** error TS2322 in `a.ts:3`.", "a compiler error code"],
+      ["- P1 `tsc --noEmit`: a type mismatch at `a.ts:3`.", "a P1 in the gates section"],
+      ["- **`npm test`:** 3 tests (none of them new) failed.", "a failure after a denying parenthetical"],
+    ]) {
+      const gate = await readBack(`## Mechanical gates\n${line}\n\n## Findings\n- P3 \`a.js:1\`: a name.\n\nNO-SHIP`);
+      assert.equal(noteLine(gate), null, `${what} backs NO-SHIP: ${gate.slice(0, 300)}`);
+    }
+    // A failure word that names a tool or a design is not a result (on the
+    // benchmark: `timeout` missing, a rule that "fails closed", "checked it
+    // for panics").
+    const names = await readBack([
+      "## Mechanical gates",
+      "- **Rust:** not run. `cargo` and `timeout` are missing in the review environment.",
+      "- **Risk critic:** the new rule fails closed for a line it cannot read.",
+      "- **Review:** I read the changed code and checked it for panics.",
+      "",
+      "## Findings",
+      "- P2 `a.rs:9`: a duplicate check.",
+      "",
+      "NO-SHIP",
+    ].join("\n"));
+    assert.ok((noteLine(names) ?? "").includes("(findings: 1 P2)"), `a failure word that names a tool or a design does not back NO-SHIP: ${names.slice(0, 400)}`);
+    for (const [findings, what] of [
+      ["### `a.js:3`: the lock is never released\nSeverity: P1\nFix: release it in `finally`.", "a Severity field"],
+      ["### `a.js:3`: the lock is never released\n- **Severity:** high", "a Severity field of high"],
+      ["| Where | Severity | What |\n| --- | --- | --- |\n| `a.js:3` | P1 | the lock is never released |", "a table cell"],
+    ]) {
+      const field = await readBack(`## Findings\n${findings}\n\nNO-SHIP`);
+      assert.equal(noteLine(field), null, `${what} backs NO-SHIP: ${field.slice(0, 300)}`);
+    }
+    const rangeEcho = await readBack("## Findings\nSeverity (P0-P3) is given per finding.\n- P2 `a.js:9`: a duplicate check.\n\nNO-SHIP");
+    assert.ok((noteLine(rangeEcho) ?? "").includes("(findings: 1 P2)"), `the severity scale named as a range does not back NO-SHIP: ${rangeEcho.slice(0, 300)}`);
+    const refutedField = await readBack("## Findings\n- P2 `a.js:9`: a duplicate check.\n\n### Refuted\n| `a.js:3` | P1 | the lock: released in `finally` |\nSeverity: P1\n\nNO-SHIP");
+    assert.ok((noteLine(refutedField) ?? "").includes("(findings: 1 P2)"), `a P1 in a refuted section does not back NO-SHIP: ${refutedField.slice(0, 300)}`);
+    for (const [line, what] of [
+      ["- P1 -> P2 `a.js:3`: the retry may double a write.", "a P1 shown as moved to P2"],
+      ["- P1 `a.js:3`: the retry may double a write. Downgraded to P3 after reading the caller.", "a downgraded P1"],
+      ["- P1 `a.js:3`: the retry may double a write. Refuted: the caller dedupes.", "a refuted P1"],
+    ]) {
+      const moved = await readBack(`## Findings\n${line}\n\nSHIP`);
+      assert.equal(noteLine(moved), null, `${what} does not contradict SHIP: ${moved.slice(0, 300)}`);
+    }
+    const branchGates = Array.from({ length: 1500 }, (_, i) => `- **Check ${i}:** clean.`).join("\n");
+    const cutBranch = await readBack(`## Mechanical gates\n${branchGates}\n\n## Findings\n- P1 \`a.js:3\`: the lock is never released.\n\nNO-SHIP`);
+    assert.ok(cutBranch.includes("verdict: NO-SHIP") && cutBranch.includes("[report truncated]") && !cutBranch.includes("the lock is never released"), "the branch copy is cut before its P1");
+    assert.equal(noteLine(cutBranch), null, `a P1 past the branch copy's cut still backs NO-SHIP: ${cutBranch.slice(-200)}`);
+
     // The automatic review's read back (review_status) carries the same
     // note, taken from the whole report, not the copy cut for feedback.
     const auto = await makeHarness([

@@ -120,30 +120,36 @@ export function verdictConflict(text, verdict) {
 // NO-SHIP only on a mechanical gate that failed or a verified P0 or P1.
 // A gate is recorded as failed by a sentence in the report's gates section
 // (a "Mechanical gates", "Gates ...", "Diagnostics" or "Not run" heading, or
-// a line led by a bold "Mechanical gates" label) with a fail or crash word,
-// an exit status other than 0, or a count of errors, unless its own clause
-// denies or supposes it ("not a failure", "would fail") or the sentence
-// before it says the gate never ran ("not installed (`which cargo` exited
-// 1)"). Any doubt reads as failed: a missed note leaves the review as it is.
+// a line led by a bold "Mechanical gates" label) with, outside a code span,
+// a failure word (fail but not "fails closed" or "fail-safe", crash, timed
+// out, aborted, killed, panicked), an exit status other than 0, a compiler
+// error code or a count of errors, unless the words before it deny or
+// suppose it ("not a failure", "would fail") or its clause says the gate
+// never ran ("not installed (`which cargo` exited 1)"; a parenthetical
+// belongs to its clause); or by a line there led by a P0 or P1 tag. Any
+// doubt reads as failed: a missed note leaves the review as it is.
 // A branch review that cannot read its range ends NO-SHIP by its own rule
 // (buildReviewPrompt's step 1), which backs it too.
 const RANGE_UNREAD = /\bcannot read the range\b/i;
 const GATE_SECTION = /^(?:mechanical\s+gates?|gates?|diagnostics|not\s+run)\b/i;
 const GATE_LABEL_LINE = /^\s*(?:[-*+]\s+)?(?:\*\*|__)\s*mechanical\s+gates?\b/i;
 const GATE_FAILURE =
-  /\b(?:fail(?:ed|s|ing|ures?)?|crash(?:ed|es|ing)?)\b|\bexit(?:ed)?(?:\s+with)?(?:\s+(?:code|status))?\s+[1-9]\d*\b|\bexit(?:ed)?\s+with\s+errors?\b|\b[1-9]\d*\s+(?:\w+\s+)?errors?\b/i;
-const CLAUSE_BREAK = /[,;:()]|\b(?:but|and|so|then|yet|while)\b/i;
+  /\b(?:fail(?:ed|s|ing|ures?)?(?![- ](?:closed|open|safe|fast|soft)\b)|crash(?:ed|es|ing)?|timed\s+out|time-?outs?|aborted|killed|panicked|segfault(?:ed)?|segmentation\s+fault|non-?zero)\b|\bexit(?:ed)?(?:\s+with)?(?:\s+(?:code|status))?\s*[:=]?\s*[1-9]\d*\b|\bexit(?:ed)?\s+with\s+errors?\b|\b[1-9]\d*\s+(?:\w+\s+)?errors?\b|\berror\s*\[?[A-Z]{1,4}\d{2,5}\b/i;
+const CLAUSE_BREAK = /[,;:]|\b(?:but|and|so|then|yet|while)\b/i;
 const DENIED = /\b(?:no|not|none|never|nothing|neither|nor|zero|0|without)\b|n't\b/i;
 const SUPPOSED = /\b(?:would|could|might|may|can|cannot|if|unless|whether|should)\b/i;
 const NEVER_RAN = /\bnot\s+(?:be\s+|been\s+)?(?:run|installed|available|executed)\b|n't\s+(?:be\s+|been\s+)?(?:run|installed|available)\b|\bno\s+direct\s+tool\b|\bcommand\s+not\s+found\b|\bunavailable\b/i;
 
 function gateRecordsFailure(line) {
-  for (const sentence of line.replace(/[*_`]/g, "").split(/(?<=[.;!?])\s+/)) {
-    const match = GATE_FAILURE.exec(sentence);
+  for (const sentence of line.replace(/[*_]/g, "").split(/(?<=[.;!?])\s+/)) {
+    // A failure word inside a code span is a name (`timeout`, `clippy::panic`,
+    // `SftpTransferState.error` on the benchmark), not a result.
+    const match = GATE_FAILURE.exec(sentence.replace(/`[^`]*`/g, (span) => " ".repeat(span.length)));
     if (!match) continue;
-    const before = sentence.slice(0, match.index);
-    const clause = before.split(CLAUSE_BREAK).pop();
-    if (DENIED.test(clause) || SUPPOSED.test(clause) || NEVER_RAN.test(before)) continue;
+    const clause = sentence.slice(0, match.index).replace(/`/g, "").split(CLAUSE_BREAK).pop();
+    // Inside a parenthetical, only its own words deny or suppose.
+    const words = clause.split(/[()]/).pop();
+    if (DENIED.test(words) || SUPPOSED.test(words) || NEVER_RAN.test(clause)) continue;
     return true;
   }
   return false;
@@ -169,7 +175,39 @@ function reportRecordsFailedGate(report) {
       }
       if (inSection && (level <= sectionLevel || VERIFIED_START_HEADING.test(label))) inSection = false;
     }
+    if (inSection && !fenced && BLOCKING.has(lineSeverity(raw))) return true;
     if ((inSection || (!fenced && GATE_LABEL_LINE.test(raw))) && gateRecordsFailure(raw)) return true;
+  }
+  return false;
+}
+
+// A P0 or P1 the counter's line shapes miss: a Severity field ("Severity:
+// P1", "**Severity:** high") or a table cell holding the tag alone, outside
+// fences and refuted, dropped or skipped sections.
+const BLOCKING = new Set(["P0", "P1"]);
+const BLOCKING_FIELD = /^severity\b[\s*_]*[:=|-]?[\s*_]*[[(`]?\s*(?:P[01](?!\s*[-/\u2013]\s*P?[0-3])|critical|high|blocker)\b/i;
+const BLOCKING_CELL = /\|\s*[*_`]*P[01][*_`]*\s*\|/i;
+
+function namesBlockingSeverity(report) {
+  let fenced = false;
+  let skipLevel = null;
+  for (const raw of report.split("\n")) {
+    if (FENCE.test(raw)) {
+      fenced = !fenced;
+      continue;
+    }
+    if (fenced) continue;
+    const label = headingLabel(raw);
+    if (label !== null) {
+      const level = headingLevel(raw) || 99;
+      if (VERIFIED_STOP_HEADING.test(label) && !GATE_SECTION.test(label)) {
+        skipLevel = level;
+        continue;
+      }
+      if (skipLevel !== null && level <= skipLevel) skipLevel = null;
+    }
+    if (skipLevel !== null) continue;
+    if (BLOCKING_FIELD.test(stripDecoration(raw)) || (/^\s*\|/.test(raw) && BLOCKING_CELL.test(raw))) return true;
   }
   return false;
 }
@@ -183,21 +221,25 @@ function describeCounts(counts, severities) {
  * A note line for a verdict the report's own findings do not back, or
  * null: a NO-SHIP whose findings hold no P0 or P1 and whose gates record
  * no failure, or a SHIP whose findings hold a P0 or P1 not marked
- * unverified. Shadow: the verdict stays the report's own.
+ * unverified, downgraded or refuted. Shadow: the verdict stays the
+ * report's own.
  */
+// A P0 or P1 line on a SHIP that says it no longer stands.
+const NOT_STANDING = /\b(?:unverified|not\s+verified|downgraded|refuted|dropped|withdrawn|rejected)\b|\bP[01]\s*(?:->|=>|\u2192)\s*P[23]\b/i;
+
 export function unbackedVerdictNote(report, verdict) {
   if (typeof report !== "string" || (verdict !== "SHIP" && verdict !== "NO-SHIP")) return null;
   const detail = verifiedFindingsDetail(report);
   if (!detail) return null;
   const { counts, lines } = detail;
   if (verdict === "NO-SHIP") {
-    if (counts.P0 + counts.P1 > 0 || RANGE_UNREAD.test(report) || reportRecordsFailedGate(report)) return null;
+    if (counts.P0 + counts.P1 > 0 || RANGE_UNREAD.test(report) || namesBlockingSeverity(report) || reportRecordsFailedGate(report)) return null;
     const listed = describeCounts(counts, ["P2", "P3"]);
     return `note: the verdict is NO-SHIP, but the report names no P0 or P1 finding and no gate that ran and failed (${listed ? `findings: ${listed}` : "no findings"}); by the review's rule only those make NO-SHIP.`;
   }
   const verified = { P0: 0, P1: 0 };
   for (const severity of ["P0", "P1"]) {
-    verified[severity] = lines[severity].filter((line) => !/\bunverified\b|\bnot\s+verified\b/i.test(line)).length;
+    verified[severity] = lines[severity].filter((line) => !NOT_STANDING.test(line)).length;
   }
   const listed = describeCounts(verified, ["P0", "P1"]);
   return listed ? `note: the verdict is SHIP, but the report's findings include ${listed}; by the review's rule a verified P0 or P1 makes NO-SHIP.` : null;
@@ -678,6 +720,11 @@ function isSubBullet(raw) {
 // Returns the severity ("P0".."P3") when `raw` is such a line, else null.
 function topLevelFindingSeverity(raw) {
   if (isSubBullet(raw) || !STRUCTURAL.test(raw)) return null;
+  return lineSeverity(raw);
+}
+
+// The severity a line leads with (or a bracketed tag in it), else null.
+function lineSeverity(raw) {
   const line = stripDecoration(raw);
   const lead = LEADING_TAG.exec(line);
   if (lead) return NOT_A_FINDING.test(line.slice(lead[0].length)) ? null : lead[1].toUpperCase();

@@ -1625,7 +1625,10 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       return `Branch review of ${describeBranchRange(state)} still running (elapsed ${formatElapsed(Date.now() - state.startedAt)}; aborted after ${Math.max(1, Math.round(branchTimeoutMs / 60000))} minutes). Advisory: nothing is blocked or sent back.`;
     }
     const conflict = state.verdict ? verdictConflict(state.report, state.verdict) : null;
-    const unbacked = unbackedVerdictNote(state.report, state.verdict);
+    // A copy cut at MAX_BRANCH_REPORT_CHARS may have lost a P1 past the
+    // cut, so it gives no NO-SHIP note.
+    const cut = typeof state.report === "string" && state.report.endsWith("\n[report truncated]");
+    const unbacked = cut && state.verdict === "NO-SHIP" ? null : unbackedVerdictNote(state.report, state.verdict);
     return [
       `Branch review of ${describeBranchRange(state)}, finished after ${formatElapsed((state.finishedAt ?? Date.now()) - state.startedAt)}:`,
       `verdict: ${state.verdict ?? "unknown (no verdict line found)"}`,

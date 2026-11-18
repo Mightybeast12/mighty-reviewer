@@ -2680,6 +2680,22 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     assert.ok(h.aborted.indexOf("child-1") >= 0 && h.aborted.indexOf("child-1") < h.aborted.indexOf("crit-5"), `the review is aborted before its critics: ${JSON.stringify(h.aborted)}`);
     h.hooks.dispose();
   }
+  // The critic's round on B29 (P3 4): a critic relaunched after its report
+  // that never reports again holds the review only to the deadline, and is
+  // aborted with it.
+  {
+    const h = await makeHarness("unused", { options: { timeoutMs: 300 } });
+    await h.hooks["command.execute.before"]({ command: "mighty-review", sessionID: "rdl-parent" }, { parts: [] });
+    await h.tick();
+    h.setMessages([prompt0, launch(["crit-5", "crit-6"]), deliver("crit-5"), deliver("crit-6"), launch(["crit-5"])]);
+    await h.childIdle("child-1");
+    assert.ok((await h.hooks.tool.review_status.execute({}, { sessionID: "rdl-parent" })).includes("still in progress"), "waiting on the relaunched crit-5");
+    await new Promise((r) => setTimeout(r, 700));
+    const timedOut = await h.hooks.tool.review_status.execute({}, { sessionID: "rdl-parent" });
+    assert.ok(timedOut.includes("timed out"), `a relaunch that never reports ends at the deadline: ${timedOut}`);
+    assert.ok(h.aborted.includes("crit-5") && !h.aborted.includes("crit-6"), `and the relaunched critic is aborted, the other is not: ${JSON.stringify(h.aborted)}`);
+    h.hooks.dispose();
+  }
 
   // A worktree branch review keeps its checkout until the last critic.
   const scratch = path.join(os.tmpdir(), "opencode", "reviewer-test");
@@ -2786,9 +2802,47 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
   h.setMessages([launch, ...ids.map(deliver)]);
   await h.childIdle("child-1");
   assert.ok((await status.execute({}, { sessionID: "pt-parent" })).includes("verifying"), "every notice in: verifying");
-  h.setMessages([launch, ...ids.map(deliver), { info: { role: "assistant" }, parts: [{ type: "text", text: "report\n\nSHIP" }] }]);
+  // The critic's round on B29 (P3 1): critics relaunched in their own
+  // sessions are the same four critics, out again: the count goes back to
+  // 0/4 rather than 4/8, and verifying comes when they have reported again.
+  for (const id of ids) {
+    await h.hooks["tool.execute.before"]({ sessionID: "child-1", tool: "task" }, { args: {} });
+    await h.hooks["tool.execute.after"]({ sessionID: "child-1", tool: "task", background: true, childSessionID: id });
+  }
+  h.setMessages([launch, ...ids.map(deliver), launch]);
+  await h.childIdle("child-1");
+  const relaunched = await status.execute({}, { sessionID: "pt-parent" });
+  assert.ok(relaunched.includes("0/4") && !relaunched.includes("verifying"), `relaunched critics read 0/4 returned: ${relaunched}`);
+  assert.ok(h.titles.at(-1).title.includes("critics 0/4"), `and the title follows: ${h.titles.at(-1).title}`);
+  h.setMessages([launch, ...ids.map(deliver), launch, ...ids.map(deliver)]);
+  await h.childIdle("child-1");
+  assert.ok((await status.execute({}, { sessionID: "pt-parent" })).includes("verifying"), "every relaunched critic in again: verifying");
+  h.setMessages([launch, ...ids.map(deliver), launch, ...ids.map(deliver), { info: { role: "assistant" }, parts: [{ type: "text", text: "report\n\nSHIP" }] }]);
   await h.childIdle("child-1");
   assert.ok((await status.execute({}, { sessionID: "pt-parent" })).includes("verdict: SHIP"), "and the review ends at the idle after the last notice");
+  h.hooks.dispose();
+}
+// The same count read from the transcript alone, with no tool hook for the
+// relaunch: verifying gives way to the critics again.
+{
+  const h = await makeHarness("unused");
+  const status = h.hooks.tool.review_status;
+  await h.hooks["command.execute.before"]({ command: "mighty-review", sessionID: "pt2-parent" }, { parts: [] });
+  await h.tick();
+  const ids = ["pd-1", "pd-2"];
+  const launch = { info: { role: "assistant" }, parts: ids.map((id) => ({ type: "tool", name: "subagent", state: { status: "completed", metadata: { sessionID: id, status: "running" }, content: [{ type: "text", text: `The subagent is working in the background (sessionID: ${id}).` }] } })) };
+  const deliver = (id) => ({ info: { role: "user" }, parts: [{ type: "text", text: `<subagent sessionID="${id}" state="completed">\nok\n</subagent>` }] });
+  for (const id of ids) {
+    await h.hooks["tool.execute.before"]({ sessionID: "child-1", tool: "task" }, { args: {} });
+    await h.hooks["tool.execute.after"]({ sessionID: "child-1", tool: "task", background: true, childSessionID: id });
+  }
+  h.setMessages([launch, ...ids.map(deliver)]);
+  await h.childIdle("child-1");
+  assert.ok((await status.execute({}, { sessionID: "pt2-parent" })).includes("verifying"), "both in: verifying");
+  h.setMessages([launch, ...ids.map(deliver), launch]);
+  await h.childIdle("child-1");
+  const again = await status.execute({}, { sessionID: "pt2-parent" });
+  assert.ok(again.includes("0/2") && !again.includes("verifying"), `relaunched with no hook: 0/2, not verifying: ${again}`);
   h.hooks.dispose();
 }
 

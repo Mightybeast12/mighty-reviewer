@@ -1048,25 +1048,31 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
 
   // The automatic review's progress counts a background critic done when its
   // notice is in the transcript (the owner's yes of 2026-11-15): read at
-  // each idle of the review, which the host resumes with every notice.
+  // each idle of the review, which the host resumes with every notice. The
+  // transcript's distinct critics are the count, so critics relaunched in
+  // their own sessions are the same critics out again, not new ones (the
+  // critic's round on B29, P3 1); a foreground critic the after-hook
+  // counted is added on top.
   function noteCriticReports(reviewSessionID, launched, pending) {
     if (!launched) return;
     const parentSessionID = reviewParents.get(reviewSessionID);
     const state = parentSessionID ? reviewStates.get(parentSessionID) : undefined;
-    if (state?.status !== "running" || state.phase !== "critics") return;
-    const total = Math.max(state.criticsTotal, launched);
-    // Never lower a count the after-hook made for a foreground critic.
-    const done = Math.min(total, Math.max(state.criticsDone, launched - pending));
+    if (state?.status !== "running" || (state.phase !== "critics" && state.phase !== "verifying")) return;
+    const foreground = state.criticsForeground ?? 0;
+    const total = launched + foreground;
+    const done = launched - pending + foreground;
     if (done === state.criticsDone && total === state.criticsTotal) return;
     state.criticsTotal = total;
     state.criticsDone = done;
     state.updatedAt = Date.now();
     if (done >= total) {
+      if (state.phase === "verifying") return;
       state.phase = "verifying";
       void setReviewTitle(reviewSessionID, "verifying", parentSessionID);
       if (progressToasts) void showToast("Review progress: critics done, verifying findings.", "info", parentSessionID, { category: "progress" });
       return;
     }
+    state.phase = "critics";
     void setReviewTitle(reviewSessionID, `critics ${done}/${total}`, parentSessionID);
   }
 
@@ -1229,6 +1235,7 @@ export const MightyReviewer = async ({ client, directory, worktree, $ }, options
       // notice counts it (noteCriticReports).
       return;
     } else if (stage === "after" && toolName === "task" && state.phase === "critics") {
+      state.criticsForeground = (state.criticsForeground ?? 0) + 1;
       state.criticsDone += 1;
       if (state.criticsDone >= state.criticsTotal) {
         state.phase = "verifying";

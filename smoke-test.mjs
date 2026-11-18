@@ -2592,6 +2592,36 @@ assert.ok(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, "numeric ident
     h.hooks.dispose();
   }
 
+  // A critic sent back to work in its own session after it reported (the
+  // task tool continuing that session id) is out again until its next
+  // report (tooling reviewer run 19: lane C405's branch review, 2026-11-17,
+  // re-dispatched all four critics in their sessions after their first
+  // round could not read a diff, and recorded NO-SHIP 30 s later with all
+  // four still running; their reports came 22 s to 3 min after it).
+  {
+    const h = await makeHarness("unused");
+    const status = h.hooks.tool.review_status;
+    await h.hooks["command.execute.before"]({ command: "mighty-review", sessionID: "rl-parent" }, { parts: [] });
+    await h.tick();
+    const firstRound = [prompt0, launch(crits), ...crits.map((id) => deliver(id))];
+    h.setMessages([...firstRound, launch(crits, "The critics could not read the diff; sending them back with it.")]);
+    await h.childIdle("child-1");
+    assert.equal(h.promptCalls.length, 1, "an idle while relaunched critics run sends no nudge");
+    assert.ok((await status.execute({}, { sessionID: "rl-parent" })).includes("still in progress"), "and the review keeps running");
+    h.setMessages([...firstRound, launch(crits), deliver("crit-1"), deliver("crit-2"), say("report from round 1 only\n\nNO-SHIP")]);
+    await h.childIdle("child-1");
+    assert.ok((await status.execute({}, { sessionID: "rl-parent" })).includes("still in progress"), "a verdict written while two relaunched critics are out is not recorded");
+    h.setMessages([...firstRound, launch(crits), ...crits.map((id) => deliver(id)), say("full report\n- P2 a.js:1 a name\n\nSHIP")]);
+    await h.childIdle("child-1");
+    assert.ok((await status.execute({}, { sessionID: "rl-parent" })).includes("verdict: SHIP"), "once each relaunched critic has reported again, the verdict is recorded");
+    h.hooks.dispose();
+    // A launch whose own output already carries that session's final report
+    // is not out.
+    const { pendingBackgroundCritics } = await import("./internals.js");
+    const both = { info: { role: "assistant" }, parts: [{ type: "tool", name: "subagent", state: { metadata: { sessionID: "crit-7" }, content: [{ type: "text", text: 'The subagent is working in the background (sessionID: crit-7).\n<subagent sessionID="crit-7" state="completed">\ndone\n</subagent>' }] } }] };
+    assert.deepEqual(pendingBackgroundCritics([prompt0, both]), [], "a launch output that carries the final report is not pending");
+  }
+
   // A critic whose result came back in its own tool call (a host that runs
   // subagents in the foreground) is never waited for.
   {

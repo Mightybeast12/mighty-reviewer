@@ -276,7 +276,11 @@ export function pendingBackgroundCritics(messages) {
 }
 
 // The critics a review launched in the background (`launched`) and those of
-// them that have not reported (`pending`), in launch order.
+// them that have not reported (`pending`), in launch order. Read in
+// transcript order: a critic sent back to work in its own session after it
+// reported (the task tool continuing that session id) is out again until
+// its next report (lane C405's branch review, 2026-11-17, recorded its
+// verdict with all four relaunched critics still running).
 export function backgroundCritics(messages) {
   const launched = new Set();
   const reported = new Set();
@@ -289,10 +293,13 @@ export function backgroundCritics(messages) {
       const tool = part?.type === "tool" ? (part.name ?? part.tool) : null;
       if (tool === "subagent" || tool === "task") {
         const output = outputOfState(part.state);
-        noteReports(output);
         const launch = output.match(BACKGROUND_LAUNCH);
         const id = typeof part.state?.metadata?.sessionID === "string" ? part.state.metadata.sessionID : launch?.[1];
-        if (launch && id) launched.add(id);
+        if (launch && id) {
+          launched.add(id);
+          reported.delete(id);
+        }
+        noteReports(output);
       } else if (!fromAssistant && part?.type === "text") {
         noteReports(textOfPart(part));
       }
